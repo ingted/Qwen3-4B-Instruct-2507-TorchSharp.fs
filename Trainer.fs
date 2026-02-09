@@ -75,19 +75,19 @@ module Trainer =
     if not cfg.ResumeFromCheckpoint || not (File.Exists(metaPath)) then
       None
     else
-      let meta = JsonSerializer.Deserialize<CheckpointMeta>(File.ReadAllText(metaPath))
-      if isNull (box meta) then
-        None
-      elif meta.LayerCount <> model.Layers.Length then
-        raise (
-          InvalidOperationException(
-            sprintf
-              "checkpoint layer count mismatch: checkpoint=%d model=%d."
-              meta.LayerCount
-              model.Layers.Length
+      match JsonSerializer.Deserialize<CheckpointMeta>(File.ReadAllText(metaPath)) |> Option.ofObj with
+      | None -> None
+      | Some meta ->
+        if meta.LayerCount <> model.Layers.Length then
+          raise (
+            InvalidOperationException(
+              sprintf
+                "checkpoint layer count mismatch: checkpoint=%d model=%d."
+                meta.LayerCount
+                model.Layers.Length
+            )
           )
-        )
-      else
+
         use _guard = torch.no_grad()
         model.Layers
         |> List.iteri (fun idx layer ->
