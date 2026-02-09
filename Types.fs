@@ -17,6 +17,10 @@ type TrainingConfig =
     OutFeatures: int64
     MaxLayers: int
     SyntheticMode: bool
+    LearningRate: float
+    CheckpointDir: string
+    SaveEverySteps: int
+    ResumeFromCheckpoint: bool
   }
 
 module Defaults =
@@ -39,6 +43,10 @@ module Defaults =
       OutFeatures = 1024L
       MaxLayers = 2
       SyntheticMode = true
+      LearningRate = 1e-3
+      CheckpointDir = "./checkpoints"
+      SaveEverySteps = 0
+      ResumeFromCheckpoint = false
     }
 
 module Q4 =

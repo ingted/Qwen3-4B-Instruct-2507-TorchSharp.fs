@@ -16,11 +16,12 @@
   - v2: real `.dat` parser.
 - `Qwen3Model.fs`
   - `create : TrainingConfig -> Nvfp4ModelState -> Qwen3Nvfp4Model`.
-  - Manage `Q4Session` + `Q4Linear` layers.
+  - Manage `Q4Session` diagnostics + trainable master-weight layers.
+  - Forward path uses `Nvfp4Training.linearSte`.
 - `Trainer.fs`
   - `run : TrainingConfig -> Qwen3Nvfp4Model -> unit`.
-  - v1: forward/loss.
-  - v2: backward/update/checkpoint.
+  - Executes forward/loss/backward/optimizer update.
+  - Supports save/recover checkpoint (metadata + layer tensors).
 - `Program.fs`
   - App entry + exception boundary.
 
@@ -31,16 +32,17 @@
    - CUDA runtime: `KernelOnly` + `nvfp4-kernel`.
    - CPU runtime: `DequantMatmulOnly` + `dequant-matmul` fallback.
 4. Build model layers.
-5. Run training loop.
+5. Run training loop with optimizer update.
+6. Save checkpoint by step/epoch policy.
 
 ## Error Handling
 - Startup failures (config/native/schema): fail fast.
 - Training failures: unified reporting at `Program` boundary.
 
 ## Future Extensions
-- Parser: `.dat` -> tensor bundle mapping.
-- Optimizer: AdamW/SGD.
-- Checkpoint: weights + optimizer state.
+- Parser: `.dat` -> exact Qwen3 full-layer mapping.
+- Optimizer: add optimizer-state serialization and resume.
+- Scheduler: learning-rate schedule and warmup.
 
 ## 設計原則
 - Pure F# at app layer。
@@ -58,11 +60,12 @@
   - v2: real `.dat` parser。
 - `Qwen3Model.fs`
   - `create : TrainingConfig -> Nvfp4ModelState -> Qwen3Nvfp4Model`。
-  - 管理 `Q4Session` + `Q4Linear` layers。
+  - 管理 `Q4Session` diagnostics + 可訓練 master-weight layers。
+  - forward 使用 `Nvfp4Training.linearSte`。
 - `Trainer.fs`
   - `run : TrainingConfig -> Qwen3Nvfp4Model -> unit`。
-  - v1: forward/loss。
-  - v2: backward/update/checkpoint。
+  - 執行 forward/loss/backward/optimizer update。
+  - 支援 checkpoint 儲存與 recover（metadata + layer tensor）。
 - `Program.fs`
   - app entry + exception boundary。
 
@@ -73,13 +76,14 @@
    - CUDA runtime: `KernelOnly` + `nvfp4-kernel`。
    - CPU runtime: `DequantMatmulOnly` + `dequant-matmul` fallback。
 4. 建立模型層。
-5. 跑訓練 loop。
+5. 跑訓練 loop 並更新參數。
+6. 依 step/epoch 政策儲存 checkpoint。
 
 ## 錯誤處理策略
 - 啟動階段（配置、native、schema）失敗：直接 fail fast。
 - 訓練階段失敗：在 `Program` 一層統一回報。
 
 ## 後續擴充點
-- Parser：`.dat` -> tensor bundle mapping。
-- Optimizer：AdamW/SGD。
-- Checkpoint：weights + optimizer state。
+- Parser：`.dat` -> Qwen3 全層精確 mapping。
+- Optimizer：補 optimizer state 序列化與 resume。
+- Scheduler：加入 learning rate schedule/warmup。

@@ -31,6 +31,14 @@ module Cli =
       | true, x -> x
       | _ -> def
 
+  let private parseFloat key def (m: Map<string, string>) =
+    match m.TryFind key with
+    | None -> def
+    | Some v ->
+      match Double.TryParse v with
+      | true, x -> x
+      | _ -> def
+
   let private parseBool key def (m: Map<string, string>) =
     match m.TryFind key with
     | None -> def
@@ -55,6 +63,10 @@ module Cli =
           OutFeatures = parseInt64 "--out-features" Defaults.trainingConfig.OutFeatures kv
           MaxLayers = parseInt "--max-layers" Defaults.trainingConfig.MaxLayers kv
           SyntheticMode = parseBool "--synthetic" Defaults.trainingConfig.SyntheticMode kv
+          LearningRate = parseFloat "--lr" Defaults.trainingConfig.LearningRate kv
+          CheckpointDir = getOrDefault "--checkpoint-dir" Defaults.trainingConfig.CheckpointDir kv
+          SaveEverySteps = parseInt "--save-every-steps" Defaults.trainingConfig.SaveEverySteps kv
+          ResumeFromCheckpoint = parseBool "--resume" Defaults.trainingConfig.ResumeFromCheckpoint kv
     }
 
   let printUsage () =
@@ -72,3 +84,7 @@ module Cli =
     printfn "  --out-features <int64>"
     printfn "  --max-layers <int>"
     printfn "  --synthetic <true|false>"
+    printfn "  --lr <float>"
+    printfn "  --checkpoint-dir <path>"
+    printfn "  --save-every-steps <int>"
+    printfn "  --resume <true|false>"

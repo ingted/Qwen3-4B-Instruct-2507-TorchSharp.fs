@@ -19,12 +19,12 @@ Core goals:
   - Synthetic loader exists.
   - Real `.dat` streaming parser exists and selects layer pairs by requested dimensions.
 - `Qwen3Model.fs`
-  - Build `TorchSharp.Q4.Extension` session.
-  - Convert layer bundles into `Q4Linear`.
-  - Execute forward pass.
+  - Build `TorchSharp.Q4.Extension` session diagnostics.
+  - Convert NVFP4 bundles into trainable master weights.
+  - Execute forward with `Nvfp4Training.linearSte`.
 - `Trainer.fs`
-  - Training loop scaffold (forward + loss currently).
-  - Optimizer/update path is pending.
+  - Training loop with `forward + loss + backward + optimizer`.
+  - Checkpoint save/recover support.
 - `Program.fs`
   - Entry point and error boundary.
 
@@ -41,8 +41,8 @@ Core goals:
 - If native backend is unavailable, fail fast (no silent fallback).
 
 ## Next Steps
-- Implement optimizer + backward + checkpoint.
-- Align real Qwen3 parameter/layer mapping.
+- Align real Qwen3 full-parameter/layer mapping.
+- Add optimizer-state resume and LR scheduler.
 
 ## 目標
 本專案是 `Qwen3-4B-Instruct-2507-TorchSharp-mod` 的純 F# 版訓練骨架，核心目標：
@@ -62,12 +62,12 @@ Core goals:
   - 提供 synthetic loader。
   - 真實 `.dat` streaming parser 已實作，會依請求維度選擇 layer pair。
 - `Qwen3Model.fs`
-  - 建立 `TorchSharp.Q4.Extension` session。
-  - 將 layer bundle 轉成 `Q4Linear`。
-  - 前向傳播（forward）。
+  - 建立 `TorchSharp.Q4.Extension` session diagnostics。
+  - 將 NVFP4 bundle 轉成可訓練 master weight。
+  - 以前向 `Nvfp4Training.linearSte` 執行運算。
 - `Trainer.fs`
-  - 訓練迴圈骨架（目前 forward + loss）。
-  - optimizer/update path 後續補齊。
+  - 訓練迴圈含 `forward + loss + backward + optimizer`。
+  - 支援 checkpoint 儲存與 recover。
 - `Program.fs`
   - 入口與錯誤處理。
 
@@ -84,5 +84,5 @@ Core goals:
 - 若 native 不可用，直接 fail fast（避免 silent fallback）。
 
 ## 下一步
-- 實作 optimizer + backward + checkpoint。
-- 對齊 Qwen3 真實模型層級參數 mapping。
+- 對齊 Qwen3 真實全參數層級 mapping。
+- 補 optimizer state resume 與 LR scheduler。

@@ -16,6 +16,12 @@ module Program =
         printfn "[Init] weight=%s" cfg.WeightPath
         printfn "[Init] device=%s synthetic=%b" cfg.Device cfg.SyntheticMode
         printfn "[Init] maxLayers=%d requested(in=%d,out=%d)" cfg.MaxLayers cfg.InFeatures cfg.OutFeatures
+        printfn
+          "[Init] lr=%f checkpointDir=%s saveEverySteps=%d resume=%b"
+          cfg.LearningRate
+          cfg.CheckpointDir
+          cfg.SaveEverySteps
+          cfg.ResumeFromCheckpoint
 
         let state = Nvfp4State.load cfg
         use model = Qwen3Model.create cfg state

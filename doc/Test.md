@@ -6,9 +6,19 @@ Validate that the pure F# project has a usable minimum closed loop at this stage
 - Synthetic NVFP4 state loading
 - Q4 session/model forward
 - Trainer loop execution
+- Backward + optimizer weight update
+- Checkpoint save/recover
 
 ## Test Script
 - `scripts/Tests.fsx`
+
+## Covered Cases
+- `cli defaults`
+- `synthetic state`
+- `model forward`
+- `trainer loop`
+- `optimizer update`
+- `checkpoint recover`
 
 ## How To Run
 ```bash
@@ -28,9 +38,19 @@ dotnet fsi scripts/Tests.fsx
 - Synthetic NVFP4 state 載入
 - Q4 session/model forward
 - Trainer loop 可執行
+- backward + optimizer 可更新權重
+- checkpoint 可儲存與恢復
 
 ## 測試腳本
 - `scripts/Tests.fsx`
+
+## 測試案例
+- `cli defaults`
+- `synthetic state`
+- `model forward`
+- `trainer loop`
+- `optimizer update`
+- `checkpoint recover`
 
 ## 執行方式
 ```bash

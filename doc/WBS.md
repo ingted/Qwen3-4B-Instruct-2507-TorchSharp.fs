@@ -13,8 +13,8 @@
 | WBS-07 | Create test script | `scripts/Tests.fsx` | Done |
 | WBS-08 | Verify test script execution | test log | Done |
 | WBS-09 | Implement real NVFP4 dat parser | `Nvfp4State.fs` | Done |
-| WBS-10 | Implement backward + optimizer | `Trainer.fs` | Pending |
-| WBS-11 | Checkpoint/recover | code + doc | Pending |
+| WBS-10 | Implement backward + optimizer | `Trainer.fs` | Done |
+| WBS-11 | Checkpoint/recover | code + doc | Done |
 
 ## Milestones
 - M1: Docs and test framework complete (WBS-01~08).
@@ -33,8 +33,8 @@
 | WBS-07 | 建立測試腳本 | `scripts/Tests.fsx` | Done |
 | WBS-08 | 驗證測試腳本可執行 | test log | Done |
 | WBS-09 | 實作 real NVFP4 dat parser | `Nvfp4State.fs` | Done |
-| WBS-10 | 實作 backward + optimizer | `Trainer.fs` | Pending |
-| WBS-11 | checkpoint/recover | code + doc | Pending |
+| WBS-10 | 實作 backward + optimizer | `Trainer.fs` | Done |
+| WBS-11 | checkpoint/recover | code + doc | Done |
 
 ## 里程碑
 - M1: 文件與測試框架完整（WBS-01~08）。
