@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Qwen3_4B_Instruct_2507_TorchSharp_fs</RootNamespace>
+    <LangVersion>preview</LangVersion>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Types.fs" />
+    <Compile Include="Cli.fs" />
+    <Compile Include="Nvfp4State.fs" />
+    <Compile Include="Qwen3Model.fs" />
+    <Compile Include="Trainer.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FAkka.TorchSharp.DGX" Version="26.1.0-py3.6" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension/TorchSharp.Q4.Extension.fsproj" />
+  </ItemGroup>
+</Project>
