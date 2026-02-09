@@ -1,11 +1,14 @@
 namespace Qwen3_4B_Instruct_2507_TorchSharp_fs
 
+open System
 open TorchSharp
 open TorchSharp.Q4.Extension
 
-type Qwen3Nvfp4Model(session: Q4Session, layers: (string * Q4Linear) list) =
+type Qwen3Nvfp4Model(session: Q4Session, layers: (string * Q4Linear) list, inFeatures: int64, outFeatures: int64) =
   member _.Session = session
   member _.Layers = layers
+  member _.InFeatures = inFeatures
+  member _.OutFeatures = outFeatures
 
   member _.Forward(input: TorchSharp.torch.Tensor) : TorchSharp.torch.Tensor =
     let mutable x = input
@@ -21,10 +24,20 @@ type Qwen3Nvfp4Model(session: Q4Session, layers: (string * Q4Linear) list) =
 module Qwen3Model =
   let create (cfg: TrainingConfig) (state: Nvfp4ModelState) : Qwen3Nvfp4Model =
     let runtimeTarget =
-      if cfg.Device.StartsWith("cuda") then Q4RuntimeTarget.Cuda 0 else Q4RuntimeTarget.Cpu
+      if cfg.Device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then Q4RuntimeTarget.Cuda 0 else Q4RuntimeTarget.Cpu
 
     let sessionCfg =
-      { Q4.pureNvfp4SessionConfig with RuntimeTarget = runtimeTarget }
+      match runtimeTarget with
+      | Q4RuntimeTarget.Cpu ->
+        // CPU path cannot execute CUDA-only FP4 kernels; keep functional dequant fallback for tests/tooling.
+        {
+          Q4.pureNvfp4SessionConfig with
+              RuntimeTarget = runtimeTarget
+              BackendOverride = Some "dequant-matmul"
+              ComputePath = Q4ComputePath.DequantMatmulOnly
+        }
+      | _ ->
+        { Q4.pureNvfp4SessionConfig with RuntimeTarget = runtimeTarget }
 
     let diagnostics = Backend.diagnose Q4.pureNvfp4Schema sessionCfg
     printfn "[Q4] backend=%s path=%A native=%s" diagnostics.Backend diagnostics.ComputePath diagnostics.NativeLoadState
@@ -37,4 +50,4 @@ module Qwen3Model =
         let linear = session.CreateLinear(l.Bundle)
         (l.Name, linear))
 
-    new Qwen3Nvfp4Model(session, layers)
+    new Qwen3Nvfp4Model(session, layers, state.InFeatures, state.OutFeatures)

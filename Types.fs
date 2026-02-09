@@ -15,6 +15,7 @@ type TrainingConfig =
     BatchSize: int64
     InFeatures: int64
     OutFeatures: int64
+    MaxLayers: int
     SyntheticMode: bool
   }
 
@@ -36,6 +37,7 @@ module Defaults =
       BatchSize = 2L
       InFeatures = 1024L
       OutFeatures = 1024L
+      MaxLayers = 2
       SyntheticMode = true
     }
 

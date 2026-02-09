@@ -53,6 +53,7 @@ module Cli =
           BatchSize = parseInt64 "--batch-size" Defaults.trainingConfig.BatchSize kv
           InFeatures = parseInt64 "--in-features" Defaults.trainingConfig.InFeatures kv
           OutFeatures = parseInt64 "--out-features" Defaults.trainingConfig.OutFeatures kv
+          MaxLayers = parseInt "--max-layers" Defaults.trainingConfig.MaxLayers kv
           SyntheticMode = parseBool "--synthetic" Defaults.trainingConfig.SyntheticMode kv
     }
 
@@ -69,4 +70,5 @@ module Cli =
     printfn "  --batch-size <int64>"
     printfn "  --in-features <int64>"
     printfn "  --out-features <int64>"
+    printfn "  --max-layers <int>"
     printfn "  --synthetic <true|false>"
