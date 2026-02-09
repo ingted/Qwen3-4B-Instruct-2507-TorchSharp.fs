@@ -16,8 +16,8 @@ Core goals:
   - Define pure NVFP4 defaults for `Q4SessionConfig` and `Q4Schema`.
 - `Nvfp4State.fs`
   - Load NVFP4 weight state.
-  - Synthetic loader exists now.
-  - Real `.dat` parser is planned next.
+  - Synthetic loader exists.
+  - Real `.dat` streaming parser exists and selects layer pairs by requested dimensions.
 - `Qwen3Model.fs`
   - Build `TorchSharp.Q4.Extension` session.
   - Convert layer bundles into `Q4Linear`.
@@ -41,7 +41,6 @@ Core goals:
 - If native backend is unavailable, fail fast (no silent fallback).
 
 ## Next Steps
-- Implement real NVFP4 `.dat` parser.
 - Implement optimizer + backward + checkpoint.
 - Align real Qwen3 parameter/layer mapping.
 
@@ -60,8 +59,8 @@ Core goals:
   - 定義 `Q4SessionConfig` 與 `Q4Schema` 的 pure NVFP4 預設。
 - `Nvfp4State.fs`
   - 載入 NVFP4 權重狀態。
-  - 目前先提供 synthetic loader。
-  - 真實 `.dat` parser 後續補齊。
+  - 提供 synthetic loader。
+  - 真實 `.dat` streaming parser 已實作，會依請求維度選擇 layer pair。
 - `Qwen3Model.fs`
   - 建立 `TorchSharp.Q4.Extension` session。
   - 將 layer bundle 轉成 `Q4Linear`。
@@ -85,6 +84,5 @@ Core goals:
 - 若 native 不可用，直接 fail fast（避免 silent fallback）。
 
 ## 下一步
-- 實作真實 NVFP4 `.dat` parser。
 - 實作 optimizer + backward + checkpoint。
 - 對齊 Qwen3 真實模型層級參數 mapping。

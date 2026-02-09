@@ -27,7 +27,9 @@
 ## Data Flow
 1. Parse CLI config.
 2. Load NVFP4 state.
-3. Create Q4 session (`KernelOnly`, `nvfp4-kernel`).
+3. Create Q4 session.
+   - CUDA runtime: `KernelOnly` + `nvfp4-kernel`.
+   - CPU runtime: `DequantMatmulOnly` + `dequant-matmul` fallback.
 4. Build model layers.
 5. Run training loop.
 
@@ -67,7 +69,9 @@
 ## 資料流
 1. CLI 解析設定。
 2. 載入 NVFP4 state。
-3. 建立 Q4 session (`KernelOnly`, `nvfp4-kernel`)。
+3. 建立 Q4 session。
+   - CUDA runtime: `KernelOnly` + `nvfp4-kernel`。
+   - CPU runtime: `DequantMatmulOnly` + `dequant-matmul` fallback。
 4. 建立模型層。
 5. 跑訓練 loop。
 
