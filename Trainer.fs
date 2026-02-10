@@ -42,10 +42,18 @@ module Trainer =
     input, target
 
   let private scalarLoss (output: TorchSharp.torch.Tensor) (target: TorchSharp.torch.Tensor) =
+    let targetForLossTemp =
+      if target.dtype = output.dtype then None else Some (target.to_type(output.dtype))
     let targetForLoss =
-      if target.dtype = output.dtype then target else target.to_type(output.dtype)
-    let diff = output - targetForLoss
-    diff.abs().mean()
+      match targetForLossTemp with
+      | Some t -> t
+      | None -> target
+
+    use diff = output - targetForLoss
+    use absDiff = diff.abs()
+    let loss = absDiff.mean()
+    targetForLossTemp |> Option.iter (fun t -> t.Dispose())
+    loss
 
   let private saveCheckpoint (cfg: TrainingConfig) (epoch: int) (globalStep: int) (model: Qwen3Nvfp4Model) =
     Directory.CreateDirectory(cfg.CheckpointDir) |> ignore
