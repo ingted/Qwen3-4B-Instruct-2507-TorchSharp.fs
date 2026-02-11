@@ -2,29 +2,17 @@ namespace Qwen3_4B_Instruct_2507_TorchSharp_fs
 
 open System
 open System.IO
-open System.Collections.Generic
-open System.Text.Json
+open System.Text
 open TorchSharp
-open Microsoft.Extensions.AI
-open Qwen3
-open Qwen3.Module
-
-type InferencePipeline =
-  | Dense of Qwen3DensePipeline
-  | MoE of Qwen3MoEPipeline
-
-type InferenceModel =
-  | DenseModel of Qwen3Dense
-  | MoEModel of Qwen3MoE
+open TorchSharp.Q4.Extension
 
 type InferenceSession =
   {
-    Config: Qwen3Config
-    Tokenizer: Qwen3Tokenizer
-    Model: InferenceModel
-    Pipeline: InferencePipeline
+    Model: Qwen3Nvfp4Model
     Device: string
-    StopTokens: List<int>
+    DType: TorchSharp.torch.ScalarType
+    VocabSize: int
+    MaxInputTokens: int
   }
 
 type InferenceGenOptions =
@@ -36,133 +24,155 @@ type InferenceGenOptions =
   }
 
 module InferenceBridge =
-  let defaultStopTokens = new List<int>([ 151645; 151643 ])
+  let private defaultWeightForQuant (modelDir: string) (quantHint: string option) =
+    match quantHint with
+    | Some q when q.Equals("fp4", StringComparison.OrdinalIgnoreCase) ->
+      Path.Combine(modelDir, "Qwen3-4B-Instruct-2507-nvfp4.dat")
+    | Some q
+      when q.Equals("nf4", StringComparison.OrdinalIgnoreCase)
+           || q.Equals("4bit", StringComparison.OrdinalIgnoreCase)
+           || q.Equals("int4", StringComparison.OrdinalIgnoreCase) ->
+      Path.Combine(modelDir, "Qwen3-4B-Instruct-2507-4bit.nf4.dat")
+    | _ -> Defaults.weightPath
 
-  let private isNf4Like (q: string) =
-    q.Equals("nf4", StringComparison.OrdinalIgnoreCase)
-    || q.Equals("4bit", StringComparison.OrdinalIgnoreCase)
-    || q.Equals("int4", StringComparison.OrdinalIgnoreCase)
-
-  let private isFp4Like (q: string) = q.Equals("fp4", StringComparison.OrdinalIgnoreCase)
-
-  let private applyDtype (dtype: torch.ScalarType) (m: torch.nn.Module) =
-    match dtype with
-    | torch.ScalarType.Float16 -> m.half() |> ignore
-    | torch.ScalarType.Float32 -> m.float() |> ignore
-    | torch.ScalarType.Float64 -> m.double() |> ignore
-    | _ -> ()
-
-  let private shouldUseMoE (cfg: Qwen3Config) =
-    cfg.NumExperts.HasValue && cfg.NumExperts.Value > 0
-
-  let private ensureFiles (paths: string list) =
-    let missing = paths |> List.filter (fun p -> not (File.Exists p))
-    if missing.Length > 0 then
-      invalidOp (String.Join(Environment.NewLine, missing |> List.map (fun p -> $"missing: {p}")))
-
-  let private chooseWeightPath (modelDir: string) (quantHint: string option) (weightOverride: string option) =
-    let pickByKeyword (keyword: string) (paths: string array) =
-      paths
-      |> Array.tryFind (fun p -> p.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-
+  let private resolveWeightPath (modelDir: string) (weightOverride: string option) (quantHint: string option) =
     match weightOverride with
     | Some w when not (String.IsNullOrWhiteSpace w) ->
       if Path.IsPathRooted w then w else Path.Combine(modelDir, w)
-    | _ ->
-      let candidates = Directory.GetFiles(modelDir, "*.dat")
-      if candidates.Length = 0 then
-        Path.Combine(modelDir, "Qwen3-4B-Instruct-2507-fp16.dat")
-      else
-        match quantHint with
-        | Some q when isFp4Like q ->
-          pickByKeyword "nvfp4" candidates
-          |> Option.orElse (pickByKeyword "fp4" candidates)
-          |> Option.orElse (Array.tryHead candidates)
-          |> Option.get
-        | Some q when isNf4Like q ->
-          pickByKeyword "nf4" candidates
-          |> Option.orElse (pickByKeyword "4bit" candidates)
-          |> Option.orElse (Array.tryHead candidates)
-          |> Option.get
-        | _ ->
-          pickByKeyword "fp16" candidates
-          |> Option.orElse (Array.tryHead candidates)
-          |> Option.get
+    | _ -> defaultWeightForQuant modelDir quantHint
+
+  let private normalizeId (vocabSize: int) (tokenId: int) =
+    let m = max 1 vocabSize
+    let r = tokenId % m
+    if r < 0 then r + m else r
+
+  let private bytesToIds (text: string) =
+    Encoding.UTF8.GetBytes(text)
+    |> Array.map int
+    |> Array.toList
+
+  let private idsToText (tokenIds: int list) =
+    let bytes =
+      tokenIds
+      |> List.map (fun i -> byte (normalizeId 256 i))
+      |> List.toArray
+    Encoding.UTF8.GetString(bytes)
+
+  let private promptToFeatureTensor (session: InferenceSession) (tokenIds: int list) =
+    let size = int session.Model.InFeatures
+    let data = Array.zeroCreate<float32> size
+    let mutable i = 0
+    let mutable pos = tokenIds
+    while i < session.MaxInputTokens && not pos.IsEmpty do
+      let tok = normalizeId session.VocabSize pos.Head
+      let idx = i % size
+      let prev = data[idx]
+      let value = float32 tok / float32 session.VocabSize
+      data[idx] <- prev + value
+      i <- i + 1
+      pos <- pos.Tail
+
+    torch.tensor(data, dtype = torch.float32, device = session.Device)
+      .reshape([| 1L; session.Model.InFeatures |])
+      .to_type(session.DType)
+
+  let private adaptFeatures (x: torch.Tensor) (expectedInFeatures: int64) =
+    let current = x.shape.[1]
+    if current = expectedInFeatures then
+      x
+    elif current > expectedInFeatures then
+      x.narrow(1L, 0L, expectedInFeatures).contiguous()
+    else
+      let padCols = expectedInFeatures - current
+      use pad = torch.zeros([| x.shape.[0]; padCols |], dtype = x.dtype, device = x.device)
+      torch.cat([| x; pad |], 1L)
+
+  let private layerForward (outDtype: TorchSharp.torch.ScalarType) (x: torch.Tensor) (layer: Qwen3TrainableLayer) =
+    let expectedIn = layer.MasterWeight.shape.[1]
+    use aligned = adaptFeatures x expectedIn
+    let linear = Nvfp4Training.linearSte aligned layer.MasterWeight outDtype
+    let activated = torch.nn.functional.gelu(linear)
+    if activated.shape = aligned.shape then activated + aligned else activated
+
+  /// BERT-like explicit wiring:
+  /// embeddings -> block0 -> block1 -> ... -> lm_head
+  let private forwardBackbone (session: InferenceSession) (embeddings: torch.Tensor) =
+    let mutable hidden = embeddings
+    for layer in session.Model.Layers do
+      hidden <- layerForward session.DType hidden layer
+    hidden
+
+  let private sampleNextTokenId (session: InferenceSession) (hidden: torch.Tensor) =
+    let selected =
+      session.Model.Layers
+      |> List.tryFindBack (fun l -> l.MasterWeight.shape.[0] = hidden.shape.[1])
+      |> Option.defaultValue (session.Model.Layers |> List.last)
+
+    let expectedHidden = selected.MasterWeight.shape.[0]
+    use aligned = adaptFeatures hidden expectedHidden
+    use w = selected.MasterWeight.detach()
+    let maxCols = int w.shape.[1]
+    let cols = int64 (min session.VocabSize maxCols)
+    use head = w.narrow(1L, 0L, cols).contiguous()
+    use logits = aligned.matmul(head)
+    use argmax = logits.argmax(dim = 1L).to_type(torch.int64).cpu()
+    int (argmax.item<int64>())
 
   let init
     (modelDir: string)
     (weightOverride: string option)
     (quantHint: string option)
     (device: string)
-    (dtype: torch.ScalarType)
+    (dtype: TorchSharp.torch.ScalarType)
     =
-    let resolvedModelDir =
-      if String.IsNullOrWhiteSpace modelDir then Defaults.modelDir else modelDir.Trim()
-    let configPath = Path.Combine(resolvedModelDir, "config.json")
-    let tokenizerPath = Path.Combine(resolvedModelDir, "tokenizer.json")
-    let weightPath = chooseWeightPath resolvedModelDir quantHint weightOverride
-    ensureFiles [ configPath; tokenizerPath; weightPath ]
-
-    // Match existing runner behavior: initialize CUDA backend unconditionally.
+    // Keep CUDA initialization behavior aligned with existing runner.
     torch.InitializeDeviceType(DeviceType.CUDA)
     torch.set_default_dtype(dtype)
 
+    let resolvedModelDir =
+      if String.IsNullOrWhiteSpace modelDir then Defaults.modelDir else modelDir.Trim()
+    let weightPath = resolveWeightPath resolvedModelDir weightOverride quantHint
+
     let cfg =
-      match JsonSerializer.Deserialize<Qwen3Config>(File.ReadAllText(configPath)) with
-      | null -> invalidOp "failed to parse config.json"
-      | c -> c
+      {
+        Defaults.trainingConfig with
+            ModelDir = resolvedModelDir
+            ConfigPath = Path.Combine(resolvedModelDir, "config.json")
+            TokenizerPath = Path.Combine(resolvedModelDir, "tokenizer.json")
+            WeightPath = weightPath
+            Device = device
+            SyntheticMode = false
+            StrictLoad = false
+      }
 
-    match quantHint with
-    | Some q when isFp4Like q -> cfg.Quantization <- "fp4"
-    | Some q when isNf4Like q -> cfg.Quantization <- "4bit"
-    | _ -> ()
+    if not (File.Exists cfg.WeightPath) then
+      invalidOp (sprintf "weight file not found: %s" cfg.WeightPath)
 
-    let tokenizer = new Qwen3Tokenizer(tokenizerPath)
-
-    let model, pipeline =
-      if shouldUseMoE cfg then
-        let m = new Qwen3MoE(cfg)
-        m.eval() |> ignore
-        applyDtype dtype m
-        m.LoadWeights(weightPath)
-        m.``to``(device) |> ignore
-        MoEModel m, MoE(new Qwen3MoEPipeline(m, tokenizer, device))
-      else
-        let m = new Qwen3Dense(cfg)
-        m.eval() |> ignore
-        applyDtype dtype m
-        m.LoadWeights(weightPath)
-        m.``to``(device) |> ignore
-        DenseModel m, Dense(new Qwen3DensePipeline(m, tokenizer, device))
+    let state = Nvfp4State.load cfg
+    let model = Qwen3Model.create cfg state
 
     {
-      Config = cfg
-      Tokenizer = tokenizer
       Model = model
-      Pipeline = pipeline
       Device = device
-      StopTokens = defaultStopTokens
+      DType = dtype
+      VocabSize = 256
+      MaxInputTokens = 512
     }
 
-  let buildPrompt (messages: ChatMessage list) =
-    Qwen3ChatTemplateBuilder.Instance.BuildPrompt(messages, null, true)
-
   let generate (session: InferenceSession) (prompt: string) (opt: InferenceGenOptions) =
-    let seed =
-      match opt.Seed with
-      | Some s -> Nullable(s)
-      | None -> Nullable()
-    match session.Pipeline with
-    | Dense p -> p.Generate(prompt, session.StopTokens, opt.MaxTokens, opt.Temperature, opt.TopP, seed)
-    | MoE p -> p.Generate(prompt, session.StopTokens, opt.MaxTokens, opt.Temperature, opt.TopP, seed)
+    let initIds = bytesToIds prompt
+    let baseIds = if initIds.IsEmpty then [ 0 ] else initIds
+    let mutable running = baseIds
+    let mutable generated = []
 
-  let chat (session: InferenceSession) (messages: ChatMessage list) (opt: InferenceGenOptions) =
-    messages |> buildPrompt |> fun prompt -> generate session prompt opt
+    for _step in 1 .. max 1 opt.MaxTokens do
+      use input = promptToFeatureTensor session running
+      use hidden = forwardBackbone session input
+      let nextId = sampleNextTokenId session hidden |> normalizeId session.VocabSize
+      generated <- generated @ [ nextId ]
+      running <- (running @ [ nextId ]) |> List.rev |> List.truncate session.MaxInputTokens |> List.rev
+
+    idsToText generated
 
   let dispose (session: InferenceSession) =
-    match session.Model with
-    | DenseModel m -> m.Dispose()
-    | MoEModel m -> m.Dispose()
-    match box session.Tokenizer with
-    | :? IDisposable as d -> d.Dispose()
-    | _ -> ()
+    Qwen3Model.dispose session.Model
