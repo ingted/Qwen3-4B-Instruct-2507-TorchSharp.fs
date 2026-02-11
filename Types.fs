@@ -21,6 +21,7 @@ type TrainingConfig =
     CheckpointDir: string
     SaveEverySteps: int
     ResumeFromCheckpoint: bool
+    StrictLoad: bool
   }
 
 module Defaults =
@@ -47,6 +48,7 @@ module Defaults =
       CheckpointDir = "./checkpoints"
       SaveEverySteps = 0
       ResumeFromCheckpoint = false
+      StrictLoad = true
     }
 
 module Q4 =

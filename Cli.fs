@@ -3,7 +3,7 @@ namespace Qwen3_4B_Instruct_2507_TorchSharp_fs
 open System
 
 module Cli =
-  let private readMap (args: string array) =
+  let readMap (args: string array) =
     args
     |> Array.toList
     |> List.chunkBySize 2
@@ -12,10 +12,10 @@ module Cli =
       | _ -> None)
     |> Map.ofList
 
-  let private getOrDefault key def (m: Map<string, string>) =
+  let getOrDefault key def (m: Map<string, string>) =
     m.TryFind(key) |> Option.defaultValue def
 
-  let private parseInt key def (m: Map<string, string>) =
+  let parseInt key def (m: Map<string, string>) =
     match m.TryFind key with
     | None -> def
     | Some v ->
@@ -23,7 +23,7 @@ module Cli =
       | true, x -> x
       | _ -> def
 
-  let private parseInt64 key def (m: Map<string, string>) =
+  let parseInt64 key def (m: Map<string, string>) =
     match m.TryFind key with
     | None -> def
     | Some v ->
@@ -31,7 +31,7 @@ module Cli =
       | true, x -> x
       | _ -> def
 
-  let private parseFloat key def (m: Map<string, string>) =
+  let parseFloat key def (m: Map<string, string>) =
     match m.TryFind key with
     | None -> def
     | Some v ->
@@ -39,13 +39,24 @@ module Cli =
       | true, x -> x
       | _ -> def
 
-  let private parseBool key def (m: Map<string, string>) =
+  let parseBool key def (m: Map<string, string>) =
     match m.TryFind key with
     | None -> def
     | Some v ->
       match Boolean.TryParse v with
       | true, x -> x
       | _ -> def
+
+  let parseBoolAny (keys: string list) def (m: Map<string, string>) =
+    keys
+    |> List.tryPick (fun key ->
+      match m.TryFind key with
+      | None -> None
+      | Some v ->
+        match Boolean.TryParse v with
+        | true, x -> Some x
+        | _ -> None)
+    |> Option.defaultValue def
 
   let parse (args: string array) : TrainingConfig =
     let kv = readMap args
@@ -67,6 +78,11 @@ module Cli =
           CheckpointDir = getOrDefault "--checkpoint-dir" Defaults.trainingConfig.CheckpointDir kv
           SaveEverySteps = parseInt "--save-every-steps" Defaults.trainingConfig.SaveEverySteps kv
           ResumeFromCheckpoint = parseBool "--resume" Defaults.trainingConfig.ResumeFromCheckpoint kv
+          StrictLoad =
+            parseBoolAny
+              [ "--strict-load"; "--restrict-load" ]
+              Defaults.trainingConfig.StrictLoad
+              kv
     }
 
   let printUsage () =
@@ -88,3 +104,4 @@ module Cli =
     printfn "  --checkpoint-dir <path>"
     printfn "  --save-every-steps <int>"
     printfn "  --resume <true|false>"
+    printfn "  --strict-load <true|false> (alias: --restrict-load)"

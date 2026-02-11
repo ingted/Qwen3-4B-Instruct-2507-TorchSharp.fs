@@ -21,28 +21,28 @@ type Nvfp4ModelState =
 
 module Nvfp4State =
   [<Literal>]
-  let private WeightQDataSuffix = ".weight.qdata"
+  let WeightQDataSuffix = ".weight.qdata"
 
   [<Literal>]
-  let private WeightScaleSuffix = ".weight.scale"
+  let WeightScaleSuffix = ".weight.scale"
 
   [<Literal>]
-  let private QDataSuffix = ".qdata"
+  let QDataSuffix = ".qdata"
 
   [<Literal>]
-  let private ScaleSuffix = ".scale"
+  let ScaleSuffix = ".scale"
 
-  type private QuantKind =
+  type QuantKind =
     | QData
     | Scale
 
-  type private PendingPair =
+  type PendingPair =
     {
       mutable QData: torch.Tensor option
       mutable Scale: torch.Tensor option
     }
 
-  type private LoadedLayer =
+  type LoadedLayer =
     {
       Name: string
       QData: torch.Tensor
@@ -51,7 +51,7 @@ module Nvfp4State =
       OutFeatures: int64
     }
 
-  let private mkSyntheticBundle (outFeatures: int64) (inFeatures: int64) (device: string) =
+  let mkSyntheticBundle (outFeatures: int64) (inFeatures: int64) (device: string) =
     let kPacked = max 1L (inFeatures / 2L)
     let scaleCols = max 1L (inFeatures / 16L)
     {
@@ -61,7 +61,7 @@ module Nvfp4State =
       QuantMap = None
     }
 
-  let private readLeb128 (br: BinaryReader) : uint64 =
+  let readLeb128 (br: BinaryReader) : uint64 =
     let mutable result = 0UL
     let mutable shift = 0
     let mutable keepReading = true
@@ -74,7 +74,7 @@ module Nvfp4State =
 
     result
 
-  let private elementSize (elemType: int) =
+  let elementSize (elemType: int) =
     match elemType with
     | 0
     | 1
@@ -91,7 +91,7 @@ module Nvfp4State =
     | _ ->
       raise (NotSupportedException(sprintf "unsupported element type id: %d" elemType))
 
-  let private checkedByteCount (shape: int64 array) (elemSize: int) =
+  let checkedByteCount (shape: int64 array) (elemSize: int) =
     let mutable numel = 1L
     for dim in shape do
       if dim < 0L then
@@ -100,7 +100,7 @@ module Nvfp4State =
 
     numel * int64 elemSize
 
-  let private skipBytes (br: BinaryReader) (byteCount: int64) =
+  let skipBytes (br: BinaryReader) (byteCount: int64) =
     if byteCount < 0L then
       raise (InvalidOperationException(sprintf "invalid byte count: %d" byteCount))
 
@@ -117,7 +117,7 @@ module Nvfp4State =
           raise (EndOfStreamException("unexpected EOF while skipping tensor payload"))
         remaining <- remaining - int64 read.Length
 
-  let private readTensorAsByte (br: BinaryReader) (shape: int64 array) (byteCount: int64) (device: string) =
+  let readTensorAsByte (br: BinaryReader) (shape: int64 array) (byteCount: int64) (device: string) =
     if byteCount > int64 Int32.MaxValue then
       raise (InvalidOperationException(sprintf "tensor payload too large: %d bytes" byteCount))
 
@@ -131,7 +131,7 @@ module Nvfp4State =
     else
       cpu
 
-  let private tryParseQuantKey (key: string) : (string * QuantKind) option =
+  let tryParseQuantKey (key: string) : (string * QuantKind) option =
     if key.EndsWith(WeightQDataSuffix, StringComparison.Ordinal) then
       Some(key.Substring(0, key.Length - WeightQDataSuffix.Length), QuantKind.QData)
     elif key.EndsWith(QDataSuffix, StringComparison.Ordinal) then
@@ -143,7 +143,7 @@ module Nvfp4State =
     else
       None
 
-  let private tryBuildLayer (name: string) (qData: torch.Tensor) (scale: torch.Tensor) : LoadedLayer option =
+  let tryBuildLayer (name: string) (qData: torch.Tensor) (scale: torch.Tensor) : LoadedLayer option =
     if qData.shape.Length <> 2 || scale.shape.Length <> 2 then
       None
     else
@@ -166,11 +166,11 @@ module Nvfp4State =
               OutFeatures = outFeatures
             }
 
-  let private disposeLayer (layer: LoadedLayer) =
+  let disposeLayer (layer: LoadedLayer) =
     layer.QData.Dispose()
     layer.Scale.Dispose()
 
-  let private loadFromDat (cfg: TrainingConfig) : Nvfp4ModelState =
+  let loadFromDat (cfg: TrainingConfig) : Nvfp4ModelState =
     let maxLayers = max 1 cfg.MaxLayers
     let desiredDims = Some(cfg.InFeatures, cfg.OutFeatures)
 
@@ -256,14 +256,34 @@ module Nvfp4State =
       kv.QData |> Option.iter (fun t -> t.Dispose())
       kv.Scale |> Option.iter (fun t -> t.Dispose())
 
+    let disposeCollected (collected: ResizeArray<LoadedLayer>) =
+      for layer in collected do
+        disposeLayer layer
+
     let chosen =
       if preferredLayers.Count > 0 then
         preferredLayers |> Seq.toList
+      elif cfg.StrictLoad then
+        []
       else
         fallbackLayers |> Seq.toList
 
     if preferredLayers.Count = 0 then
       match desiredDims, fallbackDims with
+      | Some (inWanted, outWanted), Some (inFallback, outFallback) when cfg.StrictLoad ->
+        disposeCollected preferredLayers
+        disposeCollected fallbackLayers
+        raise (
+          InvalidOperationException(
+            sprintf
+              "Strict load rejected fallback dims in=%d,out=%d (requested in=%d,out=%d) from %s."
+              inFallback
+              outFallback
+              inWanted
+              outWanted
+              cfg.WeightPath
+          )
+        )
       | Some (inWanted, outWanted), Some (inFallback, outFallback) ->
         printfn
           "[Load] requested dims (in=%d,out=%d) not found; fallback to (in=%d,out=%d)."
@@ -271,16 +291,31 @@ module Nvfp4State =
           outWanted
           inFallback
           outFallback
+      | Some (inWanted, outWanted), None when cfg.StrictLoad ->
+        disposeCollected preferredLayers
+        disposeCollected fallbackLayers
+        raise (
+          InvalidOperationException(
+            sprintf
+              "Strict load found no matching dims in=%d,out=%d in %s."
+              inWanted
+              outWanted
+              cfg.WeightPath
+          )
+        )
       | _ -> ()
 
     if chosen.IsEmpty then
+      disposeCollected preferredLayers
+      disposeCollected fallbackLayers
       raise (
         InvalidOperationException(
           sprintf
-            "No valid NVFP4 (qdata+scale) pairs found in %s for requested dims in=%d out=%d."
+            "No valid NVFP4 (qdata+scale) pairs found in %s for requested dims in=%d out=%d (strict=%b)."
             cfg.WeightPath
             cfg.InFeatures
             cfg.OutFeatures
+            cfg.StrictLoad
         )
       )
 

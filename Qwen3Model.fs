@@ -11,33 +11,22 @@ type Qwen3TrainableLayer =
     MasterWeight: Parameter
   }
 
-type Qwen3Nvfp4Model(session: Q4Session, layers: Qwen3TrainableLayer list, inFeatures: int64, outFeatures: int64) =
-  member _.Session = session
-  member _.Layers = layers
-  member _.InFeatures = inFeatures
-  member _.OutFeatures = outFeatures
-  member _.Parameters = layers |> List.map (fun l -> l.MasterWeight)
-
-  member _.Forward(input: TorchSharp.torch.Tensor, ?outDtype: TorchSharp.torch.ScalarType) : TorchSharp.torch.Tensor =
-    let targetOutDtype = defaultArg outDtype input.dtype
-    let mutable x = input
-    for layer in layers do
-      x <- Nvfp4Training.linearSte x layer.MasterWeight targetOutDtype
-    x
-
-  interface IDisposable with
-    member _.Dispose() =
-      for layer in layers do
-        layer.MasterWeight.Dispose()
+type Qwen3Nvfp4Model =
+  {
+    Session: Q4Session
+    Layers: Qwen3TrainableLayer list
+    InFeatures: int64
+    OutFeatures: int64
+  }
 
 module Qwen3Model =
-  let private isFloatingDtype (dtype: TorchSharp.torch.ScalarType) =
+  let isFloatingDtype (dtype: TorchSharp.torch.ScalarType) =
     dtype = torch.float16
     || dtype = torch.float32
     || dtype = torch.float64
     || dtype = torch.bfloat16
 
-  let private materializeMasterWeight
+  let materializeMasterWeight
     (bundle: Q4TensorBundle)
     (device: string)
     (targetDtype: TorchSharp.torch.ScalarType)
@@ -56,6 +45,29 @@ module Qwen3Model =
     let onTarget =
       if dense.device.ToString() = device then dense else dense.``to``(device = device)
     onTarget.contiguous().clone()
+
+  let parameters (model: Qwen3Nvfp4Model) =
+    model.Layers |> List.map (fun l -> l.MasterWeight)
+
+  let forward
+    (model: Qwen3Nvfp4Model)
+    (input: TorchSharp.torch.Tensor)
+    (outDtype: TorchSharp.torch.ScalarType option)
+    : TorchSharp.torch.Tensor
+    =
+    let targetOutDtype = outDtype |> Option.defaultValue input.dtype
+    model.Layers
+    |> List.fold (fun x layer -> Nvfp4Training.linearSte x layer.MasterWeight targetOutDtype) input
+
+  let disposeSession (session: Q4Session) =
+    match box session with
+    | :? IDisposable as disposable -> disposable.Dispose()
+    | _ -> ()
+
+  let dispose (model: Qwen3Nvfp4Model) =
+    for layer in model.Layers do
+      layer.MasterWeight.Dispose()
+    disposeSession model.Session
 
   let create (cfg: TrainingConfig) (state: Nvfp4ModelState) : Qwen3Nvfp4Model =
     let runtimeTarget =
@@ -92,4 +104,9 @@ module Qwen3Model =
           MasterWeight = p
         })
 
-    new Qwen3Nvfp4Model(session, layers, state.InFeatures, state.OutFeatures)
+    {
+      Session = session
+      Layers = layers
+      InFeatures = state.InFeatures
+      OutFeatures = state.OutFeatures
+    }

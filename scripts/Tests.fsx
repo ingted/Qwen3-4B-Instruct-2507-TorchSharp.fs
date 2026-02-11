@@ -11,11 +11,107 @@ let ensure cond msg =
   if not cond then
     failwith msg
 
+let writeLeb128 (bw: BinaryWriter) (value: uint64) =
+  let mutable remaining = value
+  let mutable continueWrite = true
+  while continueWrite do
+    let mutable b = byte (remaining &&& 0x7FUL)
+    remaining <- remaining >>> 7
+    if remaining <> 0UL then
+      b <- b ||| 0x80uy
+      bw.Write b
+    else
+      bw.Write b
+      continueWrite <- false
+
+let writeEntry (bw: BinaryWriter) (key: string) (elemType: uint64) (shape: int64 array) (payload: byte array) =
+  let keyBytes = Text.Encoding.UTF8.GetBytes key
+  writeLeb128 bw (uint64 keyBytes.LongLength)
+  bw.Write keyBytes
+  writeLeb128 bw elemType
+  writeLeb128 bw (uint64 shape.LongLength)
+  shape |> Array.iter (fun d -> writeLeb128 bw (uint64 d))
+  bw.Write payload
+
+let createSingleLayerDat (path: string) (outFeatures: int64) (inFeatures: int64) =
+  let packedCols = inFeatures / 2L
+  let scaleCols = inFeatures / 16L
+  let qDataBytes = Array.zeroCreate<byte> (int (outFeatures * packedCols))
+  let scaleBytes = Array.init (int (outFeatures * scaleCols)) (fun i -> byte ((i % 7) + 1))
+  use fs = File.Create path
+  use bw = new BinaryWriter(fs)
+  writeLeb128 bw 2UL
+  writeEntry bw "layer.0.weight.qdata" 0UL [| outFeatures; packedCols |] qDataBytes
+  writeEntry bw "layer.0.weight.scale" 0UL [| outFeatures; scaleCols |] scaleBytes
+
+let disposeState (state: Nvfp4ModelState) =
+  state.Layers
+  |> List.iter (fun layer ->
+    layer.Bundle.Weight.Dispose()
+    layer.Bundle.Scale |> Option.iter (fun s -> s.Dispose()))
+
+let withModel cfg state f =
+  let model = Qwen3Model.create cfg state
+  try
+    f model
+  finally
+    Qwen3Model.dispose model
+
 let testCliDefaults () =
   let cfg = Cli.parse [||]
   ensure (cfg.Device = Defaults.trainingConfig.Device) "cli default device mismatch"
   ensure (cfg.SyntheticMode = Defaults.trainingConfig.SyntheticMode) "cli default synthetic mismatch"
   ensure (cfg.ResumeFromCheckpoint = Defaults.trainingConfig.ResumeFromCheckpoint) "cli default resume mismatch"
+  ensure cfg.StrictLoad "cli default strict-load should be true"
+
+let testCliRestrictAlias () =
+  let cfg = Cli.parse [| "--restrict-load"; "false" |]
+  ensure (cfg.StrictLoad = false) "--restrict-load alias parse failed"
+
+let testStrictLoadRejectsFallback () =
+  let datPath = Path.Combine(Path.GetTempPath(), "qwen3-fs-tests-strict.dat")
+  createSingleLayerDat datPath 32L 64L
+  let cfg =
+    {
+      Defaults.trainingConfig with
+          SyntheticMode = false
+          Device = "cpu"
+          WeightPath = datPath
+          InFeatures = 128L
+          OutFeatures = 128L
+          MaxLayers = 1
+          StrictLoad = true
+    }
+
+  let mutable gotError = false
+  try
+    let _ = Nvfp4State.load cfg
+    ()
+  with
+  | :? InvalidOperationException as ex ->
+    gotError <- ex.Message.Contains("Strict load", StringComparison.Ordinal)
+  ensure gotError "strict-load should reject dimension fallback"
+
+let testNonStrictLoadAllowsFallback () =
+  let datPath = Path.Combine(Path.GetTempPath(), "qwen3-fs-tests-nonstrict.dat")
+  createSingleLayerDat datPath 32L 64L
+  let cfg =
+    {
+      Defaults.trainingConfig with
+          SyntheticMode = false
+          Device = "cpu"
+          WeightPath = datPath
+          InFeatures = 128L
+          OutFeatures = 128L
+          MaxLayers = 1
+          StrictLoad = false
+    }
+
+  let st = Nvfp4State.load cfg
+  ensure (st.Layers.Length = 1) "nonstrict fallback layer count mismatch"
+  ensure (st.InFeatures = 64L) "nonstrict fallback in_features mismatch"
+  ensure (st.OutFeatures = 32L) "nonstrict fallback out_features mismatch"
+  disposeState st
 
 let testSyntheticState () =
   let cfg =
@@ -29,6 +125,7 @@ let testSyntheticState () =
     }
   let st = Nvfp4State.load cfg
   ensure (st.Layers.Length = 2) "synthetic layer count mismatch"
+  disposeState st
 
 let testModelForward () =
   let cfg =
@@ -41,10 +138,13 @@ let testModelForward () =
           CheckpointDir = Path.Combine(Path.GetTempPath(), "qwen3-fs-tests-forward")
     }
   let st = Nvfp4State.load cfg
-  use model = Qwen3Model.create cfg st
-  use x = torch.randn([| 1L; 64L |], dtype = torch.float16, device = "cpu")
-  use y = model.Forward(x, outDtype = torch.float16)
-  ensure (y.shape = [| 1L; 64L |]) "forward output shape mismatch"
+  try
+    withModel cfg st (fun model ->
+      use x = torch.randn([| 1L; 64L |], dtype = torch.float16, device = "cpu")
+      use y = Qwen3Model.forward model x (Some torch.float16)
+      ensure (y.shape = [| 1L; 64L |]) "forward output shape mismatch")
+  finally
+    disposeState st
 
 let testTrainerLoop () =
   let ckptDir = Path.Combine(Path.GetTempPath(), "qwen3-fs-tests-loop")
@@ -64,9 +164,11 @@ let testTrainerLoop () =
           SaveEverySteps = 1
     }
   let st = Nvfp4State.load cfg
-  use model = Qwen3Model.create cfg st
-  Trainer.run cfg model
-  ensure (File.Exists(Path.Combine(ckptDir, "meta.json"))) "trainer did not create checkpoint meta"
+  try
+    withModel cfg st (fun model -> Trainer.run cfg model)
+    ensure (File.Exists(Path.Combine(ckptDir, "meta.json"))) "trainer did not create checkpoint meta"
+  finally
+    disposeState st
 
 let testOptimizerUpdatesWeights () =
   let ckptDir = Path.Combine(Path.GetTempPath(), "qwen3-fs-tests-opt")
@@ -86,13 +188,16 @@ let testOptimizerUpdatesWeights () =
           SaveEverySteps = 0
     }
   let st = Nvfp4State.load cfg
-  use model = Qwen3Model.create cfg st
-  use before = model.Layers.Head.MasterWeight.detach().to_type(torch.float32).cpu().clone()
-  Trainer.run cfg model
-  use after = model.Layers.Head.MasterWeight.detach().to_type(torch.float32).cpu().clone()
-  use delta = (after - before).abs().sum()
-  let changed = delta.item<float32>()
-  ensure (changed > 0.0f) "optimizer did not update weights"
+  try
+    withModel cfg st (fun model ->
+      use before = model.Layers.Head.MasterWeight.detach().to_type(torch.float32).cpu().clone()
+      Trainer.run cfg model
+      use after = model.Layers.Head.MasterWeight.detach().to_type(torch.float32).cpu().clone()
+      use delta = (after - before).abs().sum()
+      let changed = delta.item<float32>()
+      ensure (changed > 0.0f) "optimizer did not update weights")
+  finally
+    disposeState st
 
 let testCheckpointRecover () =
   let ckptDir = Path.Combine(Path.GetTempPath(), "qwen3-fs-tests-ckpt")
@@ -115,31 +220,35 @@ let testCheckpointRecover () =
     }
 
   let st = Nvfp4State.load cfgBase
-  use model1 = Qwen3Model.create cfgBase st
-  Trainer.run cfgBase model1
+  try
+    withModel cfgBase st (fun model1 -> Trainer.run cfgBase model1)
 
-  let layer0Path = Path.Combine(ckptDir, "layer_0000.pt")
-  ensure (File.Exists(layer0Path)) "checkpoint layer file missing"
-  use saved = torch.load(layer0Path)
+    let layer0Path = Path.Combine(ckptDir, "layer_0000.pt")
+    ensure (File.Exists(layer0Path)) "checkpoint layer file missing"
+    use saved = torch.load(layer0Path)
 
-  let cfgResume = { cfgBase with ResumeFromCheckpoint = true }
-  use model2 = Qwen3Model.create cfgResume st
+    let cfgResume = { cfgBase with ResumeFromCheckpoint = true }
+    withModel cfgResume st (fun model2 ->
+      match Trainer.tryLoadCheckpoint cfgResume model2 with
+      | None -> failwith "checkpoint not loaded"
+      | Some state ->
+        ensure (state.Epoch = 1) "checkpoint epoch mismatch"
+        ensure (state.GlobalStep = 1) "checkpoint global step mismatch"
 
-  match Trainer.tryLoadCheckpoint cfgResume model2 with
-  | None -> failwith "checkpoint not loaded"
-  | Some state ->
-    ensure (state.Epoch = 1) "checkpoint epoch mismatch"
-    ensure (state.GlobalStep = 1) "checkpoint global step mismatch"
-
-  use loaded = model2.Layers.Head.MasterWeight.detach().to_type(torch.float32).cpu()
-  use savedF = saved.to_type(torch.float32).cpu()
-  use diff = (loaded - savedF).abs().mean()
-  let err = diff.item<float32>()
-  ensure (err < 1e-5f) (sprintf "checkpoint recover mismatch: %f" err)
+      use loaded = model2.Layers.Head.MasterWeight.detach().to_type(torch.float32).cpu()
+      use savedF = saved.to_type(torch.float32).cpu()
+      use diff = (loaded - savedF).abs().mean()
+      let err = diff.item<float32>()
+      ensure (err < 1e-5f) (sprintf "checkpoint recover mismatch: %f" err))
+  finally
+    disposeState st
 
 let tests : (string * (unit -> unit)) list =
   [
     "cli defaults", testCliDefaults
+    "cli restrict alias", testCliRestrictAlias
+    "strict-load rejects fallback", testStrictLoadRejectsFallback
+    "nonstrict fallback", testNonStrictLoadAllowsFallback
     "synthetic state", testSyntheticState
     "model forward", testModelForward
     "trainer loop", testTrainerLoop

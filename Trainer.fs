@@ -24,13 +24,13 @@ type CheckpointMeta =
   }
 
 module Trainer =
-  let private checkpointMetaPath (cfg: TrainingConfig) =
+  let checkpointMetaPath (cfg: TrainingConfig) =
     Path.Combine(cfg.CheckpointDir, "meta.json")
 
-  let private checkpointWeightPath (cfg: TrainingConfig) (layerIndex: int) =
+  let checkpointWeightPath (cfg: TrainingConfig) (layerIndex: int) =
     Path.Combine(cfg.CheckpointDir, sprintf "layer_%04d.pt" layerIndex)
 
-  let private createBatch
+  let createBatch
     (batchSize: int64)
     (inFeatures: int64)
     (outFeatures: int64)
@@ -41,7 +41,7 @@ module Trainer =
     let target = torch.randn([| batchSize; outFeatures |], dtype = dtype, device = device)
     input, target
 
-  let private scalarLoss (output: TorchSharp.torch.Tensor) (target: TorchSharp.torch.Tensor) =
+  let scalarLoss (output: TorchSharp.torch.Tensor) (target: TorchSharp.torch.Tensor) =
     let targetForLossTemp =
       if target.dtype = output.dtype then None else Some (target.to_type(output.dtype))
     let targetForLoss =
@@ -55,7 +55,7 @@ module Trainer =
     targetForLossTemp |> Option.iter (fun t -> t.Dispose())
     loss
 
-  let private saveCheckpoint (cfg: TrainingConfig) (epoch: int) (globalStep: int) (model: Qwen3Nvfp4Model) =
+  let saveCheckpoint (cfg: TrainingConfig) (epoch: int) (globalStep: int) (model: Qwen3Nvfp4Model) =
     Directory.CreateDirectory(cfg.CheckpointDir) |> ignore
 
     use _guard = torch.no_grad()
@@ -133,7 +133,7 @@ module Trainer =
       cfg.LearningRate
     printfn "[Train] features in=%d out=%d layers=%d" model.InFeatures model.OutFeatures model.Layers.Length
 
-    use optimizer = torch.optim.Adam(model.Parameters, cfg.LearningRate, 0.9, 0.999, 1e-8, 0.0, false, false)
+    use optimizer = torch.optim.Adam(Qwen3Model.parameters model, cfg.LearningRate, 0.9, 0.999, 1e-8, 0.0, false, false)
     let computeDtype =
       if cfg.Device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then torch.float16 else torch.float32
 
@@ -155,7 +155,7 @@ module Trainer =
         use inputTensor = input
         use targetTensor = target
         optimizer.zero_grad()
-        use output = model.Forward(inputTensor, outDtype = computeDtype)
+        use output = Qwen3Model.forward model inputTensor (Some computeDtype)
         use loss = scalarLoss output targetTensor
         loss.backward()
         optimizer.step() |> ignore
