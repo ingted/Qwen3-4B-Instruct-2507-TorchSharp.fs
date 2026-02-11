@@ -2,6 +2,12 @@
 
 Pure F# project scaffold for Qwen3 NVFP4 training workflow.
 
+## What "Scaffold" Means
+- The current project started as a training scaffold: a minimum runnable structure to validate NVFP4 loading, STE backward, optimizer update, and checkpoint loop before full Qwen3 block wiring is migrated.
+- In scaffold mode, `Qwen3Model.forward` uses a simplified linear stack (`List.fold + Nvfp4Training.linearSte`) to reduce variables during kernel/backend bring-up.
+- This reduced architecture was chosen first to isolate low-level issues (layout, scale mapping, kernel fallback, CUDA init, checkpoint safety) before introducing full attention/MLP/RoPE complexity.
+- For inference parity with existing C# wiring, use `InferenceBridge` in this project: it calls `Qwen3Dense` / `Qwen3MoE` and pipeline classes from `Qwen3.dll`, so layer connections follow the same runtime path as the original C# inference project.
+
 ## Goals
 - F# only (no C# project dependency in this app layer)
 - Use `FAkka.TorchSharp.DGX` `26.1.0-py3.6`
@@ -52,5 +58,6 @@ dotnet run -c Release -- \
 - `Cli.fs`: command-line parsing
 - `Nvfp4State.fs`: NVFP4 state loading (synthetic + real `.dat` streaming parser)
 - `Qwen3Model.fs`: trainable NVFP4 layer stack (master weights + STE forward)
+- `InferenceBridge.fs`: inference bridge with original `Qwen3Dense/Qwen3MoE` wiring
 - `Trainer.fs`: training loop with optimizer + checkpoint/recover
 - `Program.fs`: app entrypoint
