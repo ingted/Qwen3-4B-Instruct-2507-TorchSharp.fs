@@ -107,8 +107,10 @@ module InferenceBridge =
     torch.InitializeDeviceType(DeviceType.CUDA)
     torch.set_default_dtype(dtype)
 
-    let cfg = JsonSerializer.Deserialize<Qwen3Config>(File.ReadAllText(configPath))
-    if isNull cfg then invalidOp "failed to parse config.json"
+    let cfg =
+      match JsonSerializer.Deserialize<Qwen3Config>(File.ReadAllText(configPath)) with
+      | null -> invalidOp "failed to parse config.json"
+      | c -> c
 
     match quantHint with
     | Some q when isFp4Like q -> cfg.Quantization <- "fp4"
