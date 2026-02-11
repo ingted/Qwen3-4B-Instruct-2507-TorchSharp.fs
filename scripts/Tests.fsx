@@ -57,6 +57,36 @@ let withModel cfg state f =
   finally
     Qwen3Model.dispose model
 
+let ensureTensorEquivalentWithSpecials (left: torch.Tensor) (right: torch.Tensor) (tol: float32) (name: string) =
+  ensure (left.shape = right.shape) (sprintf "%s shape mismatch" name)
+
+  use left32 = left.to_type(torch.float32).cpu()
+  use right32 = right.to_type(torch.float32).cpu()
+
+  use leftNaN = torch.isnan(left32)
+  use rightNaN = torch.isnan(right32)
+  use nanMismatch = torch.logical_xor(leftNaN, rightNaN)
+  ensure (not (nanMismatch.any().item<bool>())) (sprintf "%s NaN mask mismatch" name)
+
+  use leftInf = torch.isinf(left32)
+  use rightInf = torch.isinf(right32)
+  use infMaskMismatch = torch.logical_xor(leftInf, rightInf)
+  ensure (not (infMaskMismatch.any().item<bool>())) (sprintf "%s Inf mask mismatch" name)
+
+  use infEq = left32.eq(right32)
+  use infValueMismatchMask = torch.logical_and(leftInf, torch.logical_not(infEq))
+  ensure (not (infValueMismatchMask.any().item<bool>())) (sprintf "%s Inf sign/value mismatch" name)
+
+  use finiteMask = torch.logical_not(torch.logical_or(leftNaN, leftInf))
+  let finiteCount = finiteMask.sum().item<int64>()
+  if finiteCount > 0L then
+    use leftFinite = left32.masked_select(finiteMask)
+    use rightFinite = right32.masked_select(finiteMask)
+    use maxDiff = (leftFinite - rightFinite).abs().max()
+    let err = maxDiff.item<float32>()
+    ensure (Single.IsFinite err) (sprintf "%s finite diff is not finite: %f" name err)
+    ensure (err < tol) (sprintf "%s finite diff too large: %f" name err)
+
 let testCliDefaults () =
   let cfg = Cli.parse [||]
   ensure (cfg.Device = Defaults.trainingConfig.Device) "cli default device mismatch"
@@ -235,11 +265,8 @@ let testCheckpointRecover () =
         ensure (state.Epoch = 1) "checkpoint epoch mismatch"
         ensure (state.GlobalStep = 1) "checkpoint global step mismatch"
 
-      use loaded = model2.Layers.Head.MasterWeight.detach().to_type(torch.float32).cpu()
-      use savedF = saved.to_type(torch.float32).cpu()
-      use diff = (loaded - savedF).abs().mean()
-      let err = diff.item<float32>()
-      ensure (err < 1e-5f) (sprintf "checkpoint recover mismatch: %f" err))
+      use loaded = model2.Layers.Head.MasterWeight.detach()
+      ensureTensorEquivalentWithSpecials loaded saved 1e-5f "checkpoint recover")
   finally
     disposeState st
 
