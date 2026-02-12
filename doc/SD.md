@@ -44,6 +44,45 @@
 - Optimizer: add optimizer-state serialization and resume.
 - Scheduler: learning-rate schedule and warmup.
 
+## Inference Parity Design (2026-02-12)
+### Scope
+- Build a pure F# inference path with no `Qwen3.dll` dependency.
+- Align runtime semantics with `run2.fsx` directionally by matching tokenizer, layer families, and decode flow.
+
+### Components
+- `InferenceBridge.fs`
+  - `ModelConfigLite`: parse `config.json` fields (`hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `head_dim`, `vocab_size`, `eos_token_id`).
+  - `Q4WeightBank`: load required NVFP4 tensors by layer family:
+    - `self_attn.q_proj`, `self_attn.k_proj`, `self_attn.v_proj`, `self_attn.o_proj`
+    - `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj`
+    - `lm_head`
+  - `TokenizerBridge`: use `Tokenizers.DotNet` over `tokenizer.json`.
+  - `ForwardEngine`: explicit block wiring (`embedding -> attn projections -> mlp projections -> lm_head`).
+
+### Data Flow (Inference)
+1. Load config/tokenizer/weights.
+2. Encode prompt using `tokenizer.json`.
+3. Build token embeddings from tied `lm_head` rows.
+4. Run per-layer Qwen3-like projection flow.
+5. Compute logits with `lm_head`.
+6. Decode generated token ids using tokenizer.
+
+### Validation Strategy
+- Compare `run-training.fsx` output with `run2.fsx` under same prompt/seed/device/quant.
+- Track parity at two levels:
+  - lexical readability (non-garbled decode)
+  - semantic closeness (manual/spot-check before full metric automation)
+
+### Implementation Status Snapshot
+- Implemented:
+  - tokenizer-based encode/decode (`tokenizer.json`)
+  - raw fp16 tensor loading for `embed_tokens` and norm weights
+  - 36-layer projection wiring (`q/k/v/o`, `gate/up/down`) with causal attention skeleton
+- Not yet implemented:
+  - RoPE position encoding (critical for attention semantics)
+  - exact Qwen3 KV-cache execution path
+  - full parity sampler behavior
+
 ## 設計原則
 - Pure F# at app layer。
 - NVFP4-first。
@@ -87,3 +126,42 @@
 - Parser：`.dat` -> Qwen3 全層精確 mapping。
 - Optimizer：補 optimizer state 序列化與 resume。
 - Scheduler：加入 learning rate schedule/warmup。
+
+## 推論一致性設計（2026-02-12）
+### 範圍
+- 建立 pure F# 推論路徑，不依賴 `Qwen3.dll`。
+- 透過對齊 tokenizer、權重族群、解碼流程，讓語意品質方向性接近 `run2.fsx`。
+
+### 元件
+- `InferenceBridge.fs`
+  - `ModelConfigLite`：解析 `config.json` 必要欄位（`hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `head_dim`, `vocab_size`, `eos_token_id`）。
+  - `Q4WeightBank`：按 layer family 載入 NVFP4 權重：
+    - `self_attn.q_proj`, `self_attn.k_proj`, `self_attn.v_proj`, `self_attn.o_proj`
+    - `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj`
+    - `lm_head`
+  - `TokenizerBridge`：使用 `Tokenizers.DotNet` 讀取 `tokenizer.json`。
+  - `ForwardEngine`：明確接線（`embedding -> attn projections -> mlp projections -> lm_head`）。
+
+### 推論資料流
+1. 載入 config/tokenizer/weights。
+2. 使用 `tokenizer.json` 編碼 prompt。
+3. 由 tied `lm_head` 權重列建立 token embeddings。
+4. 跑逐層 Qwen3-like projection 流程。
+5. 以 `lm_head` 計算 logits。
+6. 用 tokenizer 解碼生成 token ids。
+
+### 驗證策略
+- 在相同 prompt/seed/device/quant 下，對照 `run-training.fsx` 與 `run2.fsx` 輸出。
+- 分兩層追蹤：
+  - 可讀性（非亂碼）
+  - 語意接近度（先人工 spot-check，後續再補指標化）
+
+### 目前實作狀態
+- 已完成：
+  - 使用 `tokenizer.json` 的 encode/decode
+  - 載入 `embed_tokens` 與 norm 類 raw fp16 權重
+  - 36 層投影接線（`q/k/v/o`, `gate/up/down`）與 causal attention 骨架
+- 尚未完成：
+  - RoPE 位置編碼（對注意力語意至關重要）
+  - 完整對齊 Qwen3 的 KV-cache 執行路徑
+  - 取樣器細節與 parity 完整對齊

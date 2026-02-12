@@ -33,6 +33,26 @@ A runnable NVFP4 training scaffold exists, but the following are still missing:
 ## Current Conclusion
 The current scaffold can be iterated directly, with priority on real parser and full training update path.
 
+## Inference Parity Gap (2026-02-12)
+- GAP-01 Tokenizer mismatch:
+  - Current `run-training.fsx` path used UTF-8 byte-token fallback instead of `tokenizer.json`.
+  - Impact: token ids and decoded text diverge from `run2.fsx`, making semantic parity impossible.
+- GAP-02 Embedding mismatch:
+  - Current path used handcrafted feature projection rather than model-consistent embedding lookup.
+  - Impact: hidden-state distribution is not aligned with trained weights.
+- GAP-03 Block wiring mismatch:
+  - Current path was scaffold-style (`linearSte + gelu + residual`) and did not represent full Qwen3 block semantics.
+  - Impact: output quality collapses even when weight file is correct.
+- GAP-04 Layer coverage mismatch:
+  - Default config limited load to 2 layers and relied on fallback dimensions.
+  - Impact: forward path under-utilizes model capacity and shifts behavior.
+
+## Updated Requirements For Inference Parity
+- FR-05: Use `tokenizer.json` for encode/decode, no byte-token fallback in normal inference path.
+- FR-06: Replace handcrafted input features with model-consistent token embedding lookup.
+- FR-07: Implement explicit Qwen3-like block wiring in pure F# (`attn projections + mlp projections + lm_head`), no `Qwen3.dll`.
+- FR-08: Load all required layer families (`q/k/v/o`, `gate/up/down`, `lm_head`) and avoid 2-layer fallback behavior.
+
 ## 背景
 目標是建立一個純 F# 的 Qwen3-4B 訓練工程，避免在應用層混入 C#，並統一使用：
 - `FAkka.TorchSharp.DGX 26.1.0-py3.6`
@@ -65,3 +85,23 @@ The current scaffold can be iterated directly, with priority on real parser and 
 
 ## 當前結論
 可以先在目前骨架上迭代，優先補齊 real parser 與 full training update path。
+
+## 推論一致性缺口（2026-02-12）
+- GAP-01 Tokenizer 不一致：
+  - `run-training.fsx` 目前走 UTF-8 byte-token fallback，未使用 `tokenizer.json`。
+  - 影響：token id 與解碼文字會和 `run2.fsx` 偏離，無法達成語意一致。
+- GAP-02 Embedding 不一致：
+  - 目前用手工 feature 投影，不是模型一致的 embedding lookup。
+  - 影響：hidden state 分佈與訓練權重不對齊。
+- GAP-03 Block 接線不一致：
+  - 目前是 scaffold 形式（`linearSte + gelu + residual`），不是完整 Qwen3 block 語意。
+  - 影響：即使權重正確，輸出語意品質仍會崩解。
+- GAP-04 層覆蓋不一致：
+  - 預設僅載入 2 層且依賴 fallback 維度。
+  - 影響：forward 只用到模型少量容量，行為偏移。
+
+## 推論一致性更新需求
+- FR-05：正常推論路徑必須使用 `tokenizer.json` encode/decode，不再使用 byte-token fallback。
+- FR-06：移除手工輸入特徵，改為模型一致的 token embedding lookup。
+- FR-07：以 pure F# 實作明確 Qwen3-like block 接線（`attn projections + mlp projections + lm_head`），不得依賴 `Qwen3.dll`。
+- FR-08：完整載入必要權重族群（`q/k/v/o`, `gate/up/down`, `lm_head`），不再停留在 2 層 fallback。

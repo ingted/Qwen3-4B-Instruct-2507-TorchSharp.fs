@@ -32,6 +32,19 @@ dotnet fsi scripts/Tests.fsx
 - No unhandled exception.
 - Final line shows `[Tests] all checks passed`.
 
+## Inference Parity Test Addendum (2026-02-12)
+### New Cases
+- `tokenizer parity smoke`
+  - input: fixed prompt
+  - check: encode/decode roundtrip is non-empty and stable
+- `weight bank integrity`
+  - check: each required family (`q/k/v/o`, `gate/up/down`, `lm_head`) is loaded
+  - check: per-layer index continuity for `0..num_hidden_layers-1`
+- `run-training readability`
+  - check: generated output does not collapse to null bytes
+- `run-training vs run2 spot-check`
+  - check: same prompt produces readable and topic-related response on both scripts
+
 ## 測試目標
 驗證純 F# 專案在目前階段具備可用的最小閉環：
 - CLI 解析
@@ -63,3 +76,16 @@ dotnet fsi scripts/Tests.fsx
 - 腳本輸出所有測試案例 `PASS`。
 - 無未捕捉例外。
 - 結尾輸出 `[Tests] all checks passed`。
+
+## 推論一致性補充測試（2026-02-12）
+### 新增案例
+- `tokenizer parity smoke`
+  - 輸入：固定 prompt
+  - 檢查：encode/decode roundtrip 非空且可重現
+- `weight bank integrity`
+  - 檢查：必要 family（`q/k/v/o`, `gate/up/down`, `lm_head`）皆已載入
+  - 檢查：`0..num_hidden_layers-1` 的 layer index 連續
+- `run-training readability`
+  - 檢查：輸出不再退化為 null bytes
+- `run-training vs run2 spot-check`
+  - 檢查：同 prompt 下兩者皆可輸出可讀且主題相關內容
