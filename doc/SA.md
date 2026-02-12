@@ -63,6 +63,15 @@ The current scaffold can be iterated directly, with priority on real parser and 
 - FR-10: Reduce repeated full-file `.dat` scans for same-dimension layer groups.
 - FR-11: Add repeated-run stress validation for both `KVCacheOut=true/false` before marking KVC stable.
 
+## UM Path Gap (2026-02-12)
+- GAP-06 Existing UM policy toggle did not guarantee managed allocator usage for persistent inference tensors.
+- GAP-07 `TS_Q4_DISABLE_UM=0` needed an explicit runtime contract to verify managed-memory coverage.
+
+## Additional Requirements (UM)
+- FR-12: Under `TS_Q4_DISABLE_UM=0`, persistent inference tensors must be promoted through managed allocator path.
+- FR-13: Runtime init must emit managed coverage diagnostics for raw tensors.
+- FR-14: Keep default behavior unchanged when UM is disabled (compatibility first).
+
 ## 背景
 目標是建立一個純 F# 的 Qwen3-4B 訓練工程，避免在應用層混入 C#，並統一使用：
 - `FAkka.TorchSharp.DGX 26.1.0-py3.6`
@@ -125,3 +134,12 @@ The current scaffold can be iterated directly, with priority on real parser and 
 - FR-09：`.dat` 載入路徑必須嚴格釋放暫存 tensor（特別是 CPU->CUDA 轉移後的 CPU 暫存）。
 - FR-10：同維度層群的 `.dat` 全檔掃描要去重，避免重複掃描。
 - FR-11：在宣告 KVC 穩定前，需完成 `KVCacheOut=true/false` 的 repeated-run 壓力驗證。
+
+## UM 路徑缺口（2026-02-12）
+- GAP-06 現有 UM policy 開關不保證持久推論 tensors 真正走 managed allocator。
+- GAP-07 `TS_Q4_DISABLE_UM=0` 需要明確 runtime 契約與可觀測的 managed 覆蓋率。
+
+## 新增 UM 需求
+- FR-12：在 `TS_Q4_DISABLE_UM=0` 下，持久推論 tensors 必須經 managed allocator 升級。
+- FR-13：runtime init 必須輸出 raw tensor 的 managed 覆蓋率診斷。
+- FR-14：UM 關閉時維持既有行為（相容性優先）。

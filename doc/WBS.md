@@ -25,12 +25,17 @@
 | WBS-19 | Reduce duplicate `.dat` scans in inference init (`k/v`, `gate/up`) | `InferenceBridge.fs` | Done |
 | WBS-20 | Add repeated-run KVC stability stress test matrix (`KVC on/off`) | `doc/Test.md`, `scripts/Tests*.fsx` | Done |
 | WBS-21 | Correlate intermittent SIGSEGV evidence and mitigation in docs | `doc/DevLog.md`, `doc/SA.md`, `doc/SD.md` | Done |
+| WBS-22 | Create UM branch for `TS_Q4_DISABLE_UM=0` full-path integration | git branch | Done |
+| WBS-23 | Promote inference raw tensors to managed memory under UM policy | `InferenceBridge.fs` | Done |
+| WBS-24 | Integrate managed allocator capability from TorchSharp.Q4.Extension in runtime path | `InferenceBridge.fs` + dependency update | Done |
+| WBS-25 | Validate `TS_Q4_DISABLE_UM=0` E2E path and log managed coverage | runtime log + `doc/DevLog.md` | Done |
 
 ## Milestones
 - M1: Docs and test framework complete (WBS-01~08).
 - M2: Minimum full-parameter training loop runnable (WBS-09~11).
 - M3: Inference parity foundation complete (WBS-12~17).
 - M4: Runtime stability hardening baseline (WBS-18~21).
+- M5: Managed-UM runtime path baseline (WBS-22~25).
 
 ## 追蹤表
 
@@ -57,9 +62,14 @@
 | WBS-19 | 減少推論初始化重複 `.dat` 掃描（`k/v`, `gate/up`） | `InferenceBridge.fs` | Done |
 | WBS-20 | 新增 KVC 穩定性壓力測試矩陣（`KVC on/off`） | `doc/Test.md`, `scripts/Tests*.fsx` | Done |
 | WBS-21 | 將間歇性 SIGSEGV 證據與修補策略對齊文件 | `doc/DevLog.md`, `doc/SA.md`, `doc/SD.md` | Done |
+| WBS-22 | 建立 `TS_Q4_DISABLE_UM=0` 完整路徑整合分支 | git branch | Done |
+| WBS-23 | 在 UM policy 下將推論 raw tensors 升級為 managed memory | `InferenceBridge.fs` | Done |
+| WBS-24 | 串接 TorchSharp.Q4.Extension managed allocator 能力到 runtime 路徑 | `InferenceBridge.fs` + 依賴更新 | Done |
+| WBS-25 | 驗證 `TS_Q4_DISABLE_UM=0` E2E 路徑並記錄 managed 覆蓋率 | runtime log + `doc/DevLog.md` | Done |
 
 ## 里程碑
 - M1: 文件與測試框架完整（WBS-01~08）。
 - M2: 可跑 full-parameter 訓練最小閉環（WBS-09~11）。
 - M3: 推論一致性基礎完成（WBS-12~17）。
 - M4: 執行期穩定性強化基線（WBS-18~21）。
+- M5: Managed-UM 執行路徑基線（WBS-22~25）。

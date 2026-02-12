@@ -221,6 +221,17 @@ module InferenceBridge =
 
     results |> Seq.map (fun kv -> kv.Key, kv.Value) |> Map.ofSeq
 
+  let private applyUnifiedPolicyToRawMap
+    (policy: UnifiedMemoryPolicy)
+    (rawMap: Map<string, torch.Tensor>)
+    =
+    rawMap
+    |> Map.map (fun _ tensor ->
+      let promoted = UnifiedMemory.applyMutablePolicy policy tensor
+      if not (Object.ReferenceEquals(promoted, tensor)) then
+        tensor.Dispose()
+      promoted)
+
   let private parseLayerIndex (name: string) =
     let marker = "model.layers."
     if name.StartsWith(marker, StringComparison.Ordinal) then
@@ -655,7 +666,9 @@ module InferenceBridge =
       }
       |> Set.ofSeq
 
-    let rawMap = loadRawTensorMap weightPath device rawKeys
+    let rawMap =
+      loadRawTensorMap weightPath device rawKeys
+      |> applyUnifiedPolicyToRawMap q4cfg.UnifiedMemoryPolicy
 
     let qMap =
       loadByDims baseCfg cfgLite.HiddenSize (int64 (cfgLite.NumAttentionHeads * cfgLite.HeadDim)) cfgLite.NumHiddenLayers
@@ -714,6 +727,12 @@ module InferenceBridge =
       cfgLite.NumKeyValueHeads
       cfgLite.HeadDim
       cfgLite.VocabSize
+
+    if q4cfg.UnifiedMemoryPolicy <> UnifiedMemoryPolicy.Disabled then
+      let managedCount =
+        rawMap
+        |> Seq.sumBy (fun kv -> if NativeInterop.isManagedTensor kv.Value then 1 else 0)
+      printfn "[InferInit] UM(raw tensors): managed=%d total=%d" managedCount rawMap.Count
 
     {
       Device = device

@@ -188,6 +188,38 @@
 - Reduce allocator fragmentation pressure and intermittent native crash probability.
 - Faster model init due to fewer `.dat` passes.
 
+## Managed-UM Runtime Path (2026-02-12)
+### Design
+- Keep default path unchanged (`TS_Q4_DISABLE_UM` unset => existing defaults apply).
+- When `TS_Q4_DISABLE_UM=0`:
+  - `Types.fs` enables `PreferUnified`.
+  - `InferenceBridge.fs` promotes persistent raw tensors (`embed/norm family`) via `UnifiedMemory.applyMutablePolicy`.
+  - `Q4Linear` path (inside Q4 extension) promotes quantized weight bundles through managed allocator policy.
+
+### Observability
+- Init prints:
+  - `[InferInit] UM(raw tensors): managed=<n> total=<m>`
+- This provides direct runtime evidence that raw tensor promotion happened.
+
+### Compatibility
+- If UM capability is unavailable, policy falls back without changing non-UM behavior.
+
+## Managed-UM 執行路徑（2026-02-12）
+### 設計
+- 預設路徑不變（`TS_Q4_DISABLE_UM` 未設定時維持既有預設）。
+- 當 `TS_Q4_DISABLE_UM=0`：
+  - `Types.fs` 啟用 `PreferUnified`。
+  - `InferenceBridge.fs` 會將持久 raw tensors（`embed/norm` 族群）透過 `UnifiedMemory.applyMutablePolicy` 升級。
+  - `Q4Linear` 路徑（Q4 extension 內）會依 policy 將量化權重 bundle 升級為 managed allocator 路徑。
+
+### 可觀測性
+- init 輸出：
+  - `[InferInit] UM(raw tensors): managed=<n> total=<m>`
+- 可直接確認 raw tensor 升級是否發生。
+
+### 相容性
+- 若 UM 能力不可用，policy 可 fallback，不改變非 UM 行為。
+
 ## 執行期穩定性強化（2026-02-12）
 ### 問題
 - `run-training2.fsx` 重複執行時出現間歇性 SIGSEGV，特別是 `KVCacheOut false -> true` 切換後。

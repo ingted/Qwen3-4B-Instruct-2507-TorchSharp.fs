@@ -362,3 +362,51 @@
   - PASS（`run2` 與 `run-training2` 第一個 `out:` 可讀、無 segfault、到達設計 stop）
 - `dotnet fsi scripts/Tests.KVCStress.fsx`
   - PASS（`cases=3`、`iterations=3`、`total=9`，無 segfault）
+
+## 2026-02-12 (Managed-UM branch for `TS_Q4_DISABLE_UM=0`)
+### Branch
+- `feature/um-managed-path-ts-q4-disable-um-0`
+
+### Scope
+- Keep existing runtime logic.
+- Add managed-memory promotion for persistent inference raw tensors when UM policy is enabled.
+- Integrate with upgraded `TorchSharp.Q4.Extension` managed allocator path.
+
+### Code changes
+- `InferenceBridge.fs`
+  - added `applyUnifiedPolicyToRawMap`.
+  - raw tensors from `.dat` now pass through `UnifiedMemory.applyMutablePolicy` under session policy.
+  - added init diagnostic line:
+    - `[InferInit] UM(raw tensors): managed=<n> total=<m>`
+
+### Validation
+- Command:
+  - `TS_Q4_DISABLE_UM=0 dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-training2.fsx --max-tokens 1 --timing true`
+- Result:
+  - PASS to designed `stop here`.
+  - Init emitted:
+    - `[InferInit] UM(raw tensors): managed=146 total=146`
+
+## 2026-02-12（`TS_Q4_DISABLE_UM=0` 的 Managed-UM 分支）
+### 分支
+- `feature/um-managed-path-ts-q4-disable-um-0`
+
+### 範圍
+- 保留既有 runtime 主邏輯。
+- 在 UM policy 啟用時，將持久推論 raw tensors 升級為 managed memory。
+- 串接升級後的 `TorchSharp.Q4.Extension` managed allocator 路徑。
+
+### 程式調整
+- `InferenceBridge.fs`
+  - 新增 `applyUnifiedPolicyToRawMap`。
+  - `.dat` 載入的 raw tensors 會依 session policy 走 `UnifiedMemory.applyMutablePolicy`。
+  - 新增 init 診斷輸出：
+    - `[InferInit] UM(raw tensors): managed=<n> total=<m>`
+
+### 驗證
+- 指令：
+  - `TS_Q4_DISABLE_UM=0 dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-training2.fsx --max-tokens 1 --timing true`
+- 結果：
+  - 可跑到設計的 `stop here`。
+  - init 輸出：
+    - `[InferInit] UM(raw tensors): managed=146 total=146`
