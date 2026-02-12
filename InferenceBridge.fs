@@ -653,6 +653,10 @@ module InferenceBridge =
             ComputePath = computePath
             BackendOverride = Some backendName
       }
+    let umEnabled = q4cfg.UnifiedMemoryPolicy <> UnifiedMemoryPolicy.Disabled
+    // On true-UM platforms, load raw tensors on CPU first and promote once via UM policy
+    // to avoid CPU->CUDA copy followed by managed re-copy.
+    let weightLoadDevice = if umEnabled then "cpu" else device
 
     let rawKeys =
       seq {
@@ -667,32 +671,34 @@ module InferenceBridge =
       |> Set.ofSeq
 
     let rawMap =
-      loadRawTensorMap weightPath device rawKeys
+      loadRawTensorMap weightPath weightLoadDevice rawKeys
       |> applyUnifiedPolicyToRawMap q4cfg.UnifiedMemoryPolicy
 
     let qMap =
-      loadByDims baseCfg cfgLite.HiddenSize (int64 (cfgLite.NumAttentionHeads * cfgLite.HeadDim)) cfgLite.NumHiddenLayers
+      let cfg = { baseCfg with Device = weightLoadDevice }
+      loadByDims cfg cfgLite.HiddenSize (int64 (cfgLite.NumAttentionHeads * cfgLite.HeadDim)) cfgLite.NumHiddenLayers
       |> buildLayerLinearMap q4cfg ".self_attn.q_proj"
 
     let kvCount = cfgLite.NumHiddenLayers * 2
-    let kvState = loadByDims baseCfg cfgLite.HiddenSize (int64 (cfgLite.NumKeyValueHeads * cfgLite.HeadDim)) kvCount
+    let baseCfgForQ4 = { baseCfg with Device = weightLoadDevice }
+    let kvState = loadByDims baseCfgForQ4 cfgLite.HiddenSize (int64 (cfgLite.NumKeyValueHeads * cfgLite.HeadDim)) kvCount
     let kMap = buildLayerLinearMap q4cfg ".self_attn.k_proj" kvState
     let vMap = buildLayerLinearMap q4cfg ".self_attn.v_proj" kvState
 
     let oMap =
-      loadByDims baseCfg (int64 (cfgLite.NumAttentionHeads * cfgLite.HeadDim)) cfgLite.HiddenSize cfgLite.NumHiddenLayers
+      loadByDims baseCfgForQ4 (int64 (cfgLite.NumAttentionHeads * cfgLite.HeadDim)) cfgLite.HiddenSize cfgLite.NumHiddenLayers
       |> buildLayerLinearMap q4cfg ".self_attn.o_proj"
 
     let guCount = cfgLite.NumHiddenLayers * 2
-    let guState = loadByDims baseCfg cfgLite.HiddenSize 9728L guCount
+    let guState = loadByDims baseCfgForQ4 cfgLite.HiddenSize 9728L guCount
     let gateMap = buildLayerLinearMap q4cfg ".mlp.gate_proj" guState
     let upMap = buildLayerLinearMap q4cfg ".mlp.up_proj" guState
 
     let downMap =
-      loadByDims baseCfg 9728L cfgLite.HiddenSize cfgLite.NumHiddenLayers
+      loadByDims baseCfgForQ4 9728L cfgLite.HiddenSize cfgLite.NumHiddenLayers
       |> buildLayerLinearMap q4cfg ".mlp.down_proj"
 
-    let lmState = loadByDims baseCfg cfgLite.HiddenSize (int64 cfgLite.VocabSize) 1
+    let lmState = loadByDims baseCfgForQ4 cfgLite.HiddenSize (int64 cfgLite.VocabSize) 1
     let lmHead =
       match lmState.Layers |> List.tryFind (fun l -> l.Name = "lm_head") with
       | Some l -> new Q4Linear(q4cfg, Q4.pureNvfp4Schema, l.Bundle)

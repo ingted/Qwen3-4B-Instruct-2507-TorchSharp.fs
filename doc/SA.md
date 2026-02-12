@@ -2,7 +2,7 @@
 
 ## Background
 The target is a pure F# Qwen3-4B training project, avoiding C# in the application layer, and standardizing on:
-- `FAkka.TorchSharp.DGX 26.1.0-py3.6`
+- `FAkka.TorchSharp.DGX 26.1.0-py3.7`
 - `TorchSharp.Q4.Extension`
 
 ## Problem Statement
@@ -74,7 +74,7 @@ The current scaffold can be iterated directly, with priority on real parser and 
 
 ## 背景
 目標是建立一個純 F# 的 Qwen3-4B 訓練工程，避免在應用層混入 C#，並統一使用：
-- `FAkka.TorchSharp.DGX 26.1.0-py3.6`
+- `FAkka.TorchSharp.DGX 26.1.0-py3.7`
 - `TorchSharp.Q4.Extension`
 
 ## 問題定義
