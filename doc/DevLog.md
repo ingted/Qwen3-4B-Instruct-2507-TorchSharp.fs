@@ -198,3 +198,59 @@
 ### 變更追蹤
 - `8d7af00`（`Qwen3-4B-Instruct-2507-TorchSharp.fs`）：穩定 rendered prompt 生成與 stop token 行為。
 - `c988023`（`fsann`）：修正 `run-training2` 使 FP4 路徑可穩定完成。
+
+## 2026-02-12 (memory fluctuation review from `notes/00002.txt`)
+### Symptom
+- `run-training2.fsx` showed large and unstable GPU memory footprint (roughly `96~116 GiB` observed by `nvidia-smi` in the reported environment).
+
+### Review Conclusion
+- Not all growth indicates a hard leak; a significant part can be CUDA allocator reservation behavior.
+- Still, there were identifiable lifecycle gaps that could amplify peak/reserved memory drift.
+
+### Fixes Applied
+- NVFP4 kernel temp tensor lifecycle hardening:
+  - explicitly scoped `qweight.t()` with `use`.
+  - explicitly disposed temporary `inputOnDevice` when created via `.to(...)`.
+  - disposed intermediate reshaped tensor on dtype conversion branch.
+- Added native cache control hook:
+  - exposed `NVFP4_empty_cache` via `NativeInterop.tryEmptyNvfp4Cache()`.
+- Added runner-level mitigation:
+  - `run-training2.fsx` now supports `--empty-cache-each-turn` (default `true`) to clear allocator cache between turns.
+  - KV flags remain available (`--KVCacheOut`, `--TokenByTokenOrPromptByPrompt`).
+
+### Residual Risk
+- `run-training2` still rebuilds full prompt history each turn; even with per-turn KV path, long-history prefill pressure can still raise memory peaks.
+- A persistent cross-turn KV-cache architecture is still recommended for tighter memory stability.
+
+### Change Tracking
+- Q4 extension commit: `7cbed57` (`TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension`)
+- Runner commit: `45bdfbf` (`fsann`)
+- Note: push status in that execution window was blocked by DNS resolution failure (`github.com` unresolved).
+
+## 2026-02-12（`notes/00002.txt` 記憶體波動審閱）
+### 現象
+- `run-training2.fsx` 在回報環境中出現明顯且不穩定的顯存占用（`nvidia-smi` 觀測約 `96~116 GiB` 區間）。
+
+### 審閱結論
+- 並非所有成長都代表硬性 leak；相當部分可能是 CUDA allocator 的保留策略。
+- 但程式確實存在會放大峰值/保留量波動的生命週期缺口，已進行修補。
+
+### 已套用修正
+- NVFP4 kernel 暫存 tensor 生命週期強化：
+  - `qweight.t()` 明確以 `use` 受控。
+  - `.to(...)` 產生的 `inputOnDevice` 在必要時顯式釋放。
+  - dtype 轉換分支中的中間 `reshaped` 顯式釋放。
+- native cache 控制介面補齊：
+  - 透過 `NativeInterop.tryEmptyNvfp4Cache()` 暴露 `NVFP4_empty_cache`。
+- runner 緩解機制：
+  - `run-training2.fsx` 新增 `--empty-cache-each-turn`（預設 `true`），每輪後可清 allocator cache。
+  - 同時保留 KV 參數路徑（`--KVCacheOut`、`--TokenByTokenOrPromptByPrompt`）。
+
+### 殘餘風險
+- `run-training2` 仍是「每輪重建 full prompt history」腳本；即便單輪使用 KV，長歷史 prefill 壓力仍可能推高峰值。
+- 若要更穩定壓峰值，仍建議改為跨輪持久 KV-cache 架構。
+
+### 變更追蹤
+- Q4 extension commit：`7cbed57`（`TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension`）
+- runner commit：`45bdfbf`（`fsann`）
+- 備註：該次執行窗口因 DNS 解析失敗（`github.com` 無法解析）導致 push 阻塞。
