@@ -59,6 +59,9 @@ type InferenceSession =
   }
 
 module InferenceBridge =
+  let private imEndTokenId = 151645
+  let private endOfTextTokenId = 151643
+
   let private renderPrompt (prompt: string) =
     $"<|im_start|>user\n{prompt}\n<|im_end|>\n<|im_start|>assistant\n"
 
@@ -595,9 +598,13 @@ module InferenceBridge =
       LmHead = lmHead
     }
 
-  let generate (session: InferenceSession) (prompt: string) (opt: InferenceGenOptions) =
+  let generateFromRenderedPromptWithStopTokens
+    (session: InferenceSession)
+    (renderedPrompt: string)
+    (opt: InferenceGenOptions)
+    (stopTokens: int list)
+    =
     use _noGrad = torch.no_grad()
-    let renderedPrompt = renderPrompt prompt
 
     let encoded =
       session.Tokenizer.Encode(renderedPrompt)
@@ -609,33 +616,47 @@ module InferenceBridge =
     if inputIds.IsEmpty then
       invalidOp "prompt encoded to empty token sequence"
 
-    let mutable running = inputIds
-    let mutable generated: int list = []
+    let running = ResizeArray<int>(inputIds.Length + max 1 opt.MaxTokens)
+    for id in inputIds do
+      running.Add(id)
+
+    let generated = ResizeArray<int>(max 1 opt.MaxTokens)
     let mutable step = 0
     let targetSteps = max 1 opt.MaxTokens
     let mutable stop = false
+    let stopSet = stopTokens |> Set.ofList
 
     match opt.Seed with
     | Some s when s >= 0 -> torch.manual_seed(int64 s) |> ignore
     | _ -> ()
 
     while step < targetSteps && not stop do
-      use hidden = forwardModel session (running |> List.toArray)
+      use hidden = forwardModel session (running.ToArray())
       let nextId = selectNextTokenId session hidden opt.Temperature opt.TopP
-      generated <- generated @ [ nextId ]
-      running <- running @ [ nextId ]
-      step <- step + 1
-
-      match session.Config.EosTokenId with
-      | Some eos when nextId = eos -> stop <- true
-      | _ -> ()
+      if stopSet.Contains(nextId) then
+        stop <- true
+      else
+        generated.Add(nextId)
+        running.Add(nextId)
+        step <- step + 1
 
     match Environment.GetEnvironmentVariable("QWEN3_FS_DEBUG_TOKENS") with
     | "1" ->
-      printfn "[InferDebug] generated token ids: %A" generated
+      printfn "[InferDebug] generated token ids: %A" (generated |> Seq.toList)
     | _ -> ()
 
-    decodeTokens session.Tokenizer generated
+    decodeTokens session.Tokenizer (generated |> Seq.toList)
+
+  let generateFromRenderedPrompt (session: InferenceSession) (renderedPrompt: string) (opt: InferenceGenOptions) =
+    let stopTokens =
+      [ imEndTokenId; endOfTextTokenId ]
+      @ ([ session.Config.EosTokenId ] |> List.choose id)
+      |> List.distinct
+    generateFromRenderedPromptWithStopTokens session renderedPrompt opt stopTokens
+
+  let generate (session: InferenceSession) (prompt: string) (opt: InferenceGenOptions) =
+    let renderedPrompt = renderPrompt prompt
+    generateFromRenderedPrompt session renderedPrompt opt
 
   let checkLogits (session: InferenceSession) (prompt: string) =
     use _noGrad = torch.no_grad()
