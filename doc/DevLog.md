@@ -336,3 +336,29 @@
 ### 殘餘風險
 - SIGSEGV 屬間歇性 native crash，單次驗證不能宣告完全結案。
 - 需補 `N>=10` 壓力回歸（同 prompt、`KVC on/off` 各一組）。
+
+## 2026-02-12 (WBS-16 / WBS-20 closure)
+### Deliverables
+- Added parity smoke script: `scripts/Tests.Parity.fsx`
+- Added KVC stress matrix script: `scripts/Tests.KVCStress.fsx`
+- Updated `doc/Test.md` with execution commands and acceptance criteria.
+- Updated `doc/WBS.md`: set WBS-16 and WBS-20 to `Done`.
+
+### Results
+- `dotnet fsi scripts/Tests.Parity.fsx`
+  - PASS (`run2` + `run-training2` first `out:` readable, no segfault, reached designed stop marker)
+- `dotnet fsi scripts/Tests.KVCStress.fsx`
+  - PASS (`cases=3`, `iterations=3`, `total=9`, no segfault)
+
+## 2026-02-12（WBS-16 / WBS-20 完工）
+### 交付內容
+- 新增 parity smoke 腳本：`scripts/Tests.Parity.fsx`
+- 新增 KVC 壓力矩陣腳本：`scripts/Tests.KVCStress.fsx`
+- 更新 `doc/Test.md` 執行方式與驗收標準。
+- 更新 `doc/WBS.md`：WBS-16 與 WBS-20 改為 `Done`。
+
+### 驗證結果
+- `dotnet fsi scripts/Tests.Parity.fsx`
+  - PASS（`run2` 與 `run-training2` 第一個 `out:` 可讀、無 segfault、到達設計 stop）
+- `dotnet fsi scripts/Tests.KVCStress.fsx`
+  - PASS（`cases=3`、`iterations=3`、`total=9`，無 segfault）

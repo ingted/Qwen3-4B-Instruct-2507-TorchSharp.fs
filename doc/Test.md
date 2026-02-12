@@ -45,6 +45,33 @@ dotnet fsi scripts/Tests.fsx
 - `run-training vs run2 spot-check`
   - check: same prompt produces readable and topic-related response on both scripts
 
+### Automation Scripts
+- `scripts/Tests.Parity.fsx`
+  - runs `run2.fsx` and `run-training2.fsx` with aligned flags
+  - checks:
+    - no `Segmentation fault`
+    - reaches designed `stop here`
+    - first `out:` from both paths is non-empty/readable
+- `scripts/Tests.KVCStress.fsx`
+  - matrix:
+    - `KVCacheOut=false, pbp`
+    - `KVCacheOut=true, pbp`
+    - `KVCacheOut=true, tbt`
+  - repeated run (`3` iterations each), checks:
+    - no `Segmentation fault`
+    - reaches designed `stop here`
+
+### Run Commands
+```bash
+cd /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs
+dotnet fsi scripts/Tests.Parity.fsx
+dotnet fsi scripts/Tests.KVCStress.fsx
+```
+
+### Acceptance
+- `Tests.Parity.fsx` prints `[PASS] parity smoke checks passed`.
+- `Tests.KVCStress.fsx` prints `[PASS] KVC stress matrix passed`.
+
 ## 測試目標
 驗證純 F# 專案在目前階段具備可用的最小閉環：
 - CLI 解析
@@ -89,3 +116,30 @@ dotnet fsi scripts/Tests.fsx
   - 檢查：輸出不再退化為 null bytes
 - `run-training vs run2 spot-check`
   - 檢查：同 prompt 下兩者皆可輸出可讀且主題相關內容
+
+### 自動化腳本
+- `scripts/Tests.Parity.fsx`
+  - 以對齊參數執行 `run2.fsx` 與 `run-training2.fsx`
+  - 檢查：
+    - 無 `Segmentation fault`
+    - 能到設計的 `stop here`
+    - 兩邊第一個 `out:` 皆非空且可讀
+- `scripts/Tests.KVCStress.fsx`
+  - 測試矩陣：
+    - `KVCacheOut=false, pbp`
+    - `KVCacheOut=true, pbp`
+    - `KVCacheOut=true, tbt`
+  - 每組連跑 `3` 次，檢查：
+    - 無 `Segmentation fault`
+    - 能到設計的 `stop here`
+
+### 執行指令
+```bash
+cd /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs
+dotnet fsi scripts/Tests.Parity.fsx
+dotnet fsi scripts/Tests.KVCStress.fsx
+```
+
+### 驗收標準
+- `Tests.Parity.fsx` 輸出 `[PASS] parity smoke checks passed`。
+- `Tests.KVCStress.fsx` 輸出 `[PASS] KVC stress matrix passed`。
