@@ -136,3 +136,65 @@
   - `run2.fsx`: 維持可讀語意輸出。
   - `run-training.fsx`: 已從亂碼/多語碎片提升為可讀且語意合理句子：
     - `I’ve never seen a UFO, but I’ve spent countless nights wondering what it would be like to encounter one.`
+
+## 2026-02-12 (run-training2 stall analysis and fix)
+### Symptom
+- `run-training2.fsx` could appear to "hang" around turn `[3]` or `[5]` when using default settings.
+
+### Root Cause (combined factors)
+- Full-prompt replay decode path in `run-training2`: each token step re-runs the entire accumulated prompt, so latency grows per turn.
+- Stop token mismatch: generation did not consistently stop on `<|im_end|>` (`151645`) and `<|endoftext|>` (`151643`), increasing long-tail decode.
+- Timeout model with `Task.Run + Wait(timeout)`: timeout could throw while the background task kept running, leaving residual CPU/GPU load.
+- Host-side append overhead: repeated list concatenation (`list @`) in the generation loop created avoidable O(n^2)-style overhead.
+
+### Changes
+- `InferenceBridge.fs`
+  - Added explicit stop-token flow for rendered prompt generation.
+  - Aligned default stop tokens to `151645/151643`.
+  - Replaced per-step list append with `ResizeArray` for running/generated token buffers.
+- `run-training2.fsx`
+  - Replaced background timeout wrapper with same-thread execution and over-budget warning.
+  - Aligned rendered prompt path and stop tokens to `151645/151643`.
+  - Reduced default `--max-tokens` from `64` to `20` for full-prompt replay stability.
+  - Added per-turn prompt token count timing output.
+
+### Validation
+- Condition: `--KVCacheOut false --timing true --max-tokens 20`
+- `run2.fsx`: `ELAPSED=28.407s`
+- `run-training2.fsx`: `ELAPSED=36.835s`
+- Outcome: `[5]` no longer stalls; script runs through `[6]` and exits at designed `stop  here`.
+
+### Change Tracking
+- `8d7af00` (`Qwen3-4B-Instruct-2507-TorchSharp.fs`): stabilize rendered prompt generation + stop token behavior.
+- `c988023` (`fsann`): make `run-training2` complete reliably on FP4 path.
+
+## 2026-02-12（run-training2 卡住分析與修正）
+### 現象
+- `run-training2.fsx` 在預設設定下，可能在第 `[3]` 或 `[5]` 輪看起來「卡住」。
+
+### 根因（多因素疊加）
+- `run-training2` 採 full-prompt replay：每個 token 都重跑整段累積 prompt，輪次越後面越慢。
+- stop token 不一致：未穩定以 `<|im_end|>`（`151645`）與 `<|endoftext|>`（`151643`）停止，增加長尾生成。
+- `Task.Run + Wait(timeout)` 超時模型：拋例外後背景任務可能仍在執行，造成 CPU/GPU 殘留負載。
+- host 端 append 開銷：生成迴圈反覆 `list @`，帶來可避免的 O(n^2) 級開銷。
+
+### 修正內容
+- `InferenceBridge.fs`
+  - 新增 rendered prompt 生成的 stop-token 控制流程。
+  - 預設 stop token 對齊為 `151645/151643`。
+  - 生成 token buffer 由 list append 改為 `ResizeArray`。
+- `run-training2.fsx`
+  - timeout 包裝改為同執行緒執行，超時只警告不留下背景殘留任務。
+  - rendered prompt 與 stop token 對齊為 `151645/151643`。
+  - full-prompt replay 預設 `--max-tokens` 由 `64` 降至 `20`。
+  - 新增每輪 prompt token 數與時間輸出。
+
+### 驗證
+- 條件：`--KVCacheOut false --timing true --max-tokens 20`
+- `run2.fsx`：`ELAPSED=28.407s`
+- `run-training2.fsx`：`ELAPSED=36.835s`
+- 結果：`[5]` 不再卡住，可跑到 `[6]`，並在設計的 `stop  here` 結束。
+
+### 變更追蹤
+- `8d7af00`（`Qwen3-4B-Instruct-2507-TorchSharp.fs`）：穩定 rendered prompt 生成與 stop token 行為。
+- `c988023`（`fsann`）：修正 `run-training2` 使 FP4 路徑可穩定完成。
