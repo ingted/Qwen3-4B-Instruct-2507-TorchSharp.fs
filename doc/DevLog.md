@@ -386,6 +386,7 @@
   - PASS to designed `stop here`.
   - Init emitted:
     - `[InferInit] UM(raw tensors): managed=146 total=146`
+  - Compatibility check (UM disabled / env unset): PASS to designed `stop here`.
 
 ## 2026-02-12（`TS_Q4_DISABLE_UM=0` 的 Managed-UM 分支）
 ### 分支
@@ -410,3 +411,4 @@
   - 可跑到設計的 `stop here`。
   - init 輸出：
     - `[InferInit] UM(raw tensors): managed=146 total=146`
+  - 相容性檢查（UM 關閉 / env 未設定）：可跑到設計的 `stop here`。
