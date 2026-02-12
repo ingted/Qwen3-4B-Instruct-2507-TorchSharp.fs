@@ -59,6 +59,9 @@ type InferenceSession =
   }
 
 module InferenceBridge =
+  let private renderPrompt (prompt: string) =
+    $"<|im_start|>user\n{prompt}\n<|im_end|>\n<|im_start|>assistant\n"
+
   let private defaultWeightForQuant (modelDir: string) (quantHint: string option) =
     match quantHint with
     | Some q when q.Equals("fp4", StringComparison.OrdinalIgnoreCase) ->
@@ -593,8 +596,7 @@ module InferenceBridge =
     }
 
   let generate (session: InferenceSession) (prompt: string) (opt: InferenceGenOptions) =
-    let renderedPrompt =
-      $"<|im_start|>user\n{prompt}\n<|im_end|>\n<|im_start|>assistant\n"
+    let renderedPrompt = renderPrompt prompt
 
     let encoded =
       session.Tokenizer.Encode(renderedPrompt)
@@ -633,6 +635,25 @@ module InferenceBridge =
     | _ -> ()
 
     decodeTokens session.Tokenizer generated
+
+  let checkLogits (session: InferenceSession) (prompt: string) =
+    let renderedPrompt = renderPrompt prompt
+    let inputIds =
+      session.Tokenizer.Encode(renderedPrompt)
+      |> Seq.map int
+      |> Seq.toList
+
+    if inputIds.IsEmpty then
+      invalidOp "prompt encoded to empty token sequence"
+
+    use hidden = forwardModel session (inputIds |> List.toArray)
+    use last = hidden.narrow(1L, hidden.shape.[1] - 1L, 1L)
+    use lastNorm = rmsNormWeighted last session.FinalNorm session.Config.RmsNormEps
+    use logits0 = session.LmHead.Forward(lastNorm, outDtype = session.DType)
+    use logits = if logits0.dtype = torch.float32 then logits0 else logits0.to_type(torch.float32)
+    let hasNan = torch.isnan(logits).any().ToBoolean()
+    let hasInf = torch.isinf(logits).any().ToBoolean()
+    hasNan, hasInf
 
   let dispose (session: InferenceSession) =
     for layer in session.Layers do
