@@ -21,11 +21,16 @@
 | WBS-15 | Remove 2-layer fallback behavior for run-training path | `InferenceBridge.fs`, `Types.fs` | Done |
 | WBS-16 | Add run-training vs run2 parity smoke checks | `doc/Test.md`, `scripts/Tests*.fsx` | Pending |
 | WBS-17 | Track inference parity changes and commits in DevLog | `doc/DevLog.md` | Done |
+| WBS-18 | Fix `.dat` loader CPU temp tensor disposal on CUDA path | `Nvfp4State.fs` | Done |
+| WBS-19 | Reduce duplicate `.dat` scans in inference init (`k/v`, `gate/up`) | `InferenceBridge.fs` | Done |
+| WBS-20 | Add repeated-run KVC stability stress test matrix (`KVC on/off`) | `doc/Test.md`, `scripts/Tests*.fsx` | Pending |
+| WBS-21 | Correlate intermittent SIGSEGV evidence and mitigation in docs | `doc/DevLog.md`, `doc/SA.md`, `doc/SD.md` | Done |
 
 ## Milestones
 - M1: Docs and test framework complete (WBS-01~08).
 - M2: Minimum full-parameter training loop runnable (WBS-09~11).
 - M3: Inference parity foundation complete (WBS-12~17).
+- M4: Runtime stability hardening baseline (WBS-18~21).
 
 ## 追蹤表
 
@@ -48,8 +53,13 @@
 | WBS-15 | 移除 run-training 路徑的 2 層 fallback 行為 | `InferenceBridge.fs`, `Types.fs` | Done |
 | WBS-16 | 補 run-training 與 run2 的 parity smoke 測試 | `doc/Test.md`, `scripts/Tests*.fsx` | Pending |
 | WBS-17 | 在 DevLog 追蹤推論一致性變更與 commit | `doc/DevLog.md` | Done |
+| WBS-18 | 修正 `.dat` 載入在 CUDA 路徑的 CPU 暫存 tensor 釋放 | `Nvfp4State.fs` | Done |
+| WBS-19 | 減少推論初始化重複 `.dat` 掃描（`k/v`, `gate/up`） | `InferenceBridge.fs` | Done |
+| WBS-20 | 新增 KVC 穩定性壓力測試矩陣（`KVC on/off`） | `doc/Test.md`, `scripts/Tests*.fsx` | Pending |
+| WBS-21 | 將間歇性 SIGSEGV 證據與修補策略對齊文件 | `doc/DevLog.md`, `doc/SA.md`, `doc/SD.md` | Done |
 
 ## 里程碑
 - M1: 文件與測試框架完整（WBS-01~08）。
 - M2: 可跑 full-parameter 訓練最小閉環（WBS-09~11）。
 - M3: 推論一致性基礎完成（WBS-12~17）。
+- M4: 執行期穩定性強化基線（WBS-18~21）。

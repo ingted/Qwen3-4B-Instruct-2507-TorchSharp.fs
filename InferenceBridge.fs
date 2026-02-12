@@ -664,21 +664,16 @@ module InferenceBridge =
     let kvCount = cfgLite.NumHiddenLayers * 2
     let kvState = loadByDims baseCfg cfgLite.HiddenSize (int64 (cfgLite.NumKeyValueHeads * cfgLite.HeadDim)) kvCount
     let kMap = buildLayerLinearMap q4cfg ".self_attn.k_proj" kvState
-    let vMap =
-      loadByDims baseCfg cfgLite.HiddenSize (int64 (cfgLite.NumKeyValueHeads * cfgLite.HeadDim)) kvCount
-      |> buildLayerLinearMap q4cfg ".self_attn.v_proj"
+    let vMap = buildLayerLinearMap q4cfg ".self_attn.v_proj" kvState
 
     let oMap =
       loadByDims baseCfg (int64 (cfgLite.NumAttentionHeads * cfgLite.HeadDim)) cfgLite.HiddenSize cfgLite.NumHiddenLayers
       |> buildLayerLinearMap q4cfg ".self_attn.o_proj"
 
     let guCount = cfgLite.NumHiddenLayers * 2
-    let gateMap =
-      loadByDims baseCfg cfgLite.HiddenSize 9728L guCount
-      |> buildLayerLinearMap q4cfg ".mlp.gate_proj"
-    let upMap =
-      loadByDims baseCfg cfgLite.HiddenSize 9728L guCount
-      |> buildLayerLinearMap q4cfg ".mlp.up_proj"
+    let guState = loadByDims baseCfg cfgLite.HiddenSize 9728L guCount
+    let gateMap = buildLayerLinearMap q4cfg ".mlp.gate_proj" guState
+    let upMap = buildLayerLinearMap q4cfg ".mlp.up_proj" guState
 
     let downMap =
       loadByDims baseCfg 9728L cfgLite.HiddenSize cfgLite.NumHiddenLayers

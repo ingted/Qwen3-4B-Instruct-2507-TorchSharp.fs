@@ -165,3 +165,47 @@
   - RoPE 位置編碼（對注意力語意至關重要）
   - 完整對齊 Qwen3 的 KV-cache 執行路徑
   - 取樣器細節與 parity 完整對齊
+
+## Runtime Stability Hardening (2026-02-12)
+### Problem
+- Intermittent SIGSEGV in repeated `run-training2.fsx` runs, especially around mode switches (`KVCacheOut false -> true`).
+- Native stack indicates crash in tensor host->device transfer path (`THSTensor_to_device` / `at::to_copy`).
+
+### Design adjustments
+- Loader lifecycle discipline:
+  - release temporary CPU tensors immediately after CUDA copy in `.dat` parser path.
+- Init scan reduction:
+  - avoid duplicate full-file scans for same dimension groups.
+  - reuse one parsed state for:
+    - `k_proj` + `v_proj`
+    - `gate_proj` + `up_proj`
+- Operational guardrails:
+  - keep `--empty-cache-each-turn` as explicit runtime switch.
+  - require stress test matrix (`KVC on/off`, repeated runs) before declaring stable.
+
+### Expected effect
+- Lower allocation spikes during init.
+- Reduce allocator fragmentation pressure and intermittent native crash probability.
+- Faster model init due to fewer `.dat` passes.
+
+## 執行期穩定性強化（2026-02-12）
+### 問題
+- `run-training2.fsx` 重複執行時出現間歇性 SIGSEGV，特別是 `KVCacheOut false -> true` 切換後。
+- native stack 指向 host->device 張量搬移路徑（`THSTensor_to_device` / `at::to_copy`）。
+
+### 設計調整
+- Loader 生命週期約束：
+  - `.dat` parser 在 CUDA copy 後立即釋放 CPU 暫存 tensor。
+- Init 掃描減量：
+  - 避免同維度群組的重複全檔掃描。
+  - 下列群組改共用一次解析結果：
+    - `k_proj` + `v_proj`
+    - `gate_proj` + `up_proj`
+- 執行防護：
+  - `--empty-cache-each-turn` 維持顯式參數控制。
+  - 在宣告穩定前，要求壓力測試矩陣（`KVC on/off` + repeated runs）。
+
+### 預期效果
+- 降低 init 階段配置尖峰。
+- 降低 allocator fragmentation 壓力與間歇性 native crash 機率。
+- 減少 `.dat` 掃描次數，加快初始化。

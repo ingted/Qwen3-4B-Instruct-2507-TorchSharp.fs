@@ -254,3 +254,85 @@
 - Q4 extension commit：`7cbed57`（`TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension`）
 - runner commit：`45bdfbf`（`fsann`）
 - 備註：該次執行窗口因 DNS 解析失敗（`github.com` 無法解析）導致 push 阻塞。
+
+## 2026-02-12 (KVC instability / intermittent segfault follow-up)
+### User-reported symptom
+- Sequence observed:
+  1. run `run-training2.fsx` with `--KVCacheOut false` (often completes to designed `stop here`)
+  2. immediately run again (or switch to `--KVCacheOut true`)
+  3. intermittently stalls around `[5]` or crashes with SIGSEGV
+- Crash signature: stack in `libtorch_cpu.so` (`at::to_copy/copy_`) via `THSTensor_to_device`.
+
+### What changed recently (scope)
+- `Qwen3-4B-Instruct-2507-TorchSharp.fs`:
+  - `1679c7d`: introduced KV-cache generation path (`generate...KvCache`) and default UM disabled behavior.
+- `fsann`:
+  - `647f2c3`: wired `run-training2.fsx` to support `KVCacheOut` + prefill mode.
+  - `45bdfbf`: enabled per-turn `NVFP4_empty_cache` switch (default true).
+  - `30d24c3`: removed reflection workaround; direct `TorchSharp.Q4.Extension` reference.
+
+### Root-cause analysis (current confidence)
+- Most likely issue is native allocator pressure/fragility during repeated large tensor host->device transfers in init/load path, not a deterministic KVC logic bug alone.
+- Specific defect fixed:
+  - `Nvfp4State.readTensorAsByte` created a temporary CPU tensor, copied to CUDA, but did not dispose the CPU temporary in CUDA path.
+  - Repeated full-file scans in init can amplify this pressure.
+
+### Fixes applied now
+- `Nvfp4State.fs`
+  - release temporary CPU tensor immediately after `.to(device)` copy.
+- `InferenceBridge.fs`
+  - reduce repeated `.dat` scans during init:
+    - reuse one load result for `k_proj/v_proj` map extraction.
+    - reuse one load result for `gate_proj/up_proj` map extraction.
+  - expected impact: fewer allocation spikes and less init-time instability.
+
+### Verification snapshot
+- `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj`: PASS.
+- `run-training2.fsx` smoke:
+  - `--KVCacheOut false --timing true`: PASS to designed `stop here`.
+  - `--KVCacheOut true --timing true`: PASS to designed `stop here`.
+
+### Open risk
+- SIGSEGV is intermittent and native-side; cannot claim complete closure from one pass.
+- Need stress loop validation (`N>=10`) for both `KVC on/off` with same prompt set.
+
+## 2026-02-12（KVC 不穩定 / 間歇性 segfault 追蹤）
+### 使用者回報現象
+- 觀察序列：
+  1. 先跑 `run-training2.fsx --KVCacheOut false`（通常可到設計的 `stop here`）
+  2. 立即再跑一次（或改成 `--KVCacheOut true`）
+  3. 偶發在 `[5]` 卡住，或直接 SIGSEGV
+- crash 特徵：`libtorch_cpu.so`（`at::to_copy/copy_`）經由 `THSTensor_to_device`。
+
+### 最近變更範圍
+- `Qwen3-4B-Instruct-2507-TorchSharp.fs`：
+  - `1679c7d`：加入 KV-cache 生成路徑（`generate...KvCache`）與預設關閉 UM。
+- `fsann`：
+  - `647f2c3`：`run-training2.fsx` 接入 `KVCacheOut` 與 prefill mode。
+  - `45bdfbf`：加入 per-turn `NVFP4_empty_cache`（預設 true）。
+  - `30d24c3`：移除反射 workaround，改為直接引用 `TorchSharp.Q4.Extension`。
+
+### 目前根因判斷（信心等級：中）
+- 較可能是 init/load 階段重複大量 host->device 轉移帶來的 native allocator 壓力/脆弱性，不是單一可重現的 KVC 邏輯錯誤。
+- 已確認並修正的缺陷：
+  - `Nvfp4State.readTensorAsByte` 在 CUDA 路徑中，CPU 暫存 tensor `.to(device)` 後未立即釋放。
+  - init 期間多次全檔掃描會放大此壓力。
+
+### 本次已套用修正
+- `Nvfp4State.fs`
+  - `.to(device)` 後立即 `Dispose` CPU 暫存 tensor。
+- `InferenceBridge.fs`
+  - 減少 init 時重複 `.dat` 掃描：
+    - `k_proj/v_proj` 共用一次載入結果再分別抽 map。
+    - `gate_proj/up_proj` 共用一次載入結果再分別抽 map。
+  - 預期效益：降低配置尖峰與 init 不穩定性。
+
+### 驗證快照
+- `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj`：PASS。
+- `run-training2.fsx` smoke：
+  - `--KVCacheOut false --timing true`：可跑到設計的 `stop here`。
+  - `--KVCacheOut true --timing true`：可跑到設計的 `stop here`。
+
+### 殘餘風險
+- SIGSEGV 屬間歇性 native crash，單次驗證不能宣告完全結案。
+- 需補 `N>=10` 壓力回歸（同 prompt、`KVC on/off` 各一組）。

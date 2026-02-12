@@ -127,7 +127,12 @@ module Nvfp4State =
 
     let cpu = torch.tensor(bytes, dtype = torch.uint8).reshape(shape)
     if device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then
-      cpu.``to``(device = device)
+      // Important: release temporary CPU tensor right after host->device copy.
+      // This loader runs multiple full-file scans during init; keeping CPU temps alive
+      // increases allocator pressure and makes native init less stable under repeated runs.
+      let gpu = cpu.``to``(device = device)
+      cpu.Dispose()
+      gpu
     else
       cpu
 

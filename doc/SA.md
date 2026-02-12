@@ -53,6 +53,16 @@ The current scaffold can be iterated directly, with priority on real parser and 
 - FR-07: Implement explicit Qwen3-like block wiring in pure F# (`attn projections + mlp projections + lm_head`), no `Qwen3.dll`.
 - FR-08: Load all required layer families (`q/k/v/o`, `gate/up/down`, `lm_head`) and avoid 2-layer fallback behavior.
 
+## Runtime Stability Gap (2026-02-12)
+- GAP-05 Intermittent native crash under repeated runs:
+  - Symptom: occasional SIGSEGV after back-to-back `run-training2.fsx` runs, often near KVC mode switches.
+  - Signal path: native tensor transfer (`THSTensor_to_device` / `at::to_copy`).
+
+## Additional Requirements (Stability)
+- FR-09: Enforce strict temporary tensor disposal in `.dat` load path (especially CPU->CUDA conversion temps).
+- FR-10: Reduce repeated full-file `.dat` scans for same-dimension layer groups.
+- FR-11: Add repeated-run stress validation for both `KVCacheOut=true/false` before marking KVC stable.
+
 ## 背景
 目標是建立一個純 F# 的 Qwen3-4B 訓練工程，避免在應用層混入 C#，並統一使用：
 - `FAkka.TorchSharp.DGX 26.1.0-py3.6`
@@ -105,3 +115,13 @@ The current scaffold can be iterated directly, with priority on real parser and 
 - FR-06：移除手工輸入特徵，改為模型一致的 token embedding lookup。
 - FR-07：以 pure F# 實作明確 Qwen3-like block 接線（`attn projections + mlp projections + lm_head`），不得依賴 `Qwen3.dll`。
 - FR-08：完整載入必要權重族群（`q/k/v/o`, `gate/up/down`, `lm_head`），不再停留在 2 層 fallback。
+
+## 執行期穩定性缺口（2026-02-12）
+- GAP-05 重複執行下的間歇性 native crash：
+  - 現象：`run-training2.fsx` 連跑時偶發 SIGSEGV，常見於 KVC 模式切換後。
+  - 訊號路徑：native tensor transfer（`THSTensor_to_device` / `at::to_copy`）。
+
+## 新增穩定性需求
+- FR-09：`.dat` 載入路徑必須嚴格釋放暫存 tensor（特別是 CPU->CUDA 轉移後的 CPU 暫存）。
+- FR-10：同維度層群的 `.dat` 全檔掃描要去重，避免重複掃描。
+- FR-11：在宣告 KVC 穩定前，需完成 `KVCacheOut=true/false` 的 repeated-run 壓力驗證。
