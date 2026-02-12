@@ -596,6 +596,7 @@ module InferenceBridge =
     }
 
   let generate (session: InferenceSession) (prompt: string) (opt: InferenceGenOptions) =
+    use _noGrad = torch.no_grad()
     let renderedPrompt = renderPrompt prompt
 
     let encoded =
@@ -637,6 +638,7 @@ module InferenceBridge =
     decodeTokens session.Tokenizer generated
 
   let checkLogits (session: InferenceSession) (prompt: string) =
+    use _noGrad = torch.no_grad()
     let renderedPrompt = renderPrompt prompt
     let inputIds =
       session.Tokenizer.Encode(renderedPrompt)
