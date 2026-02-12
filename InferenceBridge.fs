@@ -282,18 +282,21 @@ module InferenceBridge =
     use normalized = rmsNorm x eps
     normalized * weight
 
-  let private rmsNormHeadWeighted (x: torch.Tensor) (weight: torch.Tensor) (eps: float) =
-    use normalized = rmsNorm x eps
-    use w = weight.reshape([| 1L; 1L; weight.shape.[0] |])
-    normalized * w
+  let private rotateHalf (x: torch.Tensor) =
+    let lastDim = int64 (x.shape.Length - 1)
+    let headDim = x.shape.[int lastDim]
+    let halfDim = headDim / 2L
+    use x1 = x.slice(lastDim, 0L, halfDim, 1L)
+    use x2 = x.slice(lastDim, halfDim, headDim, 1L)
+    torch.cat([| -x2; x1 |], dim = lastDim)
 
   let private applyRoPE (x: torch.Tensor) (theta: float) =
-    // x: [heads, seq, head_dim]
-    let headDim = int x.shape.[2]
+    // x: [batch, heads, seq, head_dim]
+    let headDim = int x.shape.[3]
     if headDim % 2 <> 0 then
       invalidOp (sprintf "head_dim must be even for RoPE, got %d" headDim)
 
-    let seqLen = int x.shape.[1]
+    let seqLen = int x.shape.[2]
     let halfDim = headDim / 2
     let invFreqData =
       [|
@@ -303,38 +306,35 @@ module InferenceBridge =
       |]
 
     use invFreq = torch.tensor(invFreqData, dtype = torch.float32, device = x.device)
-    use positions = torch.arange(int64 seqLen, dtype = torch.float32, device = x.device)
-    use angles = positions.unsqueeze(1L) * invFreq.unsqueeze(0L) // [seq, half]
-    use cosPart = torch.cos(angles).unsqueeze(0L).to_type(x.dtype) // [1, seq, half]
-    use sinPart = torch.sin(angles).unsqueeze(0L).to_type(x.dtype)
-
-    use xEven = x.slice(2L, 0L, int64 headDim, 2L)
-    use xOdd = x.slice(2L, 1L, int64 headDim, 2L)
-    use yEven = xEven * cosPart - xOdd * sinPart
-    use yOdd = xEven * sinPart + xOdd * cosPart
-    use stacked = torch.stack([| yEven; yOdd |], -1L) // [heads, seq, half, 2]
-    stacked.reshape([| x.shape.[0]; x.shape.[1]; int64 headDim |]).contiguous()
+    use positions = torch.arange(int64 seqLen, dtype = torch.float32, device = x.device).unsqueeze(0L)
+    use freqs = positions.unsqueeze(-1L) * invFreq
+    use emb = torch.cat([| freqs; freqs |], dim = -1L)
+    use cos = torch.cos(emb).to_type(x.dtype).unsqueeze(1L)
+    use sin = torch.sin(emb).to_type(x.dtype).unsqueeze(1L)
+    use rotated = rotateHalf x
+    (x * cos + rotated * sin).contiguous()
 
   let private expandKvHeads (numHeads: int) (numKvHeads: int) (kv: torch.Tensor) =
-    let seqLen = kv.shape.[1]
-    let headDim = kv.shape.[2]
+    let batchSize = kv.shape.[0]
+    let seqLen = kv.shape.[2]
+    let headDim = kv.shape.[3]
     let repeatFactor = numHeads / numKvHeads
     kv
-      .unsqueeze(1L)
-      .expand([| int64 numKvHeads; int64 repeatFactor; seqLen; headDim |])
-      .reshape([| int64 numHeads; seqLen; headDim |])
+      .unsqueeze(2L)
+      .expand([| batchSize; int64 numKvHeads; int64 repeatFactor; seqLen; headDim |])
+      .reshape([| batchSize; int64 numHeads; seqLen; headDim |])
 
   let private buildTokenEmbeddings (session: InferenceSession) (tokenIds: int array) =
     use tokenTensor =
       torch.tensor(tokenIds, dtype = torch.int64, device = session.Device)
-    session.EmbedTokens.index_select(0L, tokenTensor).contiguous()
+    session.EmbedTokens.index_select(0L, tokenTensor).unsqueeze(0L).contiguous()
 
   let private forwardLayer (session: InferenceSession) (layer: LayerWeights) (hidden: torch.Tensor) =
     let numHeads = session.Config.NumAttentionHeads
     let numKvHeads = session.Config.NumKeyValueHeads
     let headDim = session.Config.HeadDim
-    let seqLen = hidden.shape.[0]
-    let sqrtHead = sqrt (float32 headDim)
+    let batchSize = hidden.shape.[0]
+    let seqLen = hidden.shape.[1]
 
     use normed0 = rmsNormWeighted hidden layer.InputNorm session.Config.RmsNormEps
     use q = linearQ4 normed0 layer.QProj session.DType
@@ -343,42 +343,37 @@ module InferenceBridge =
 
     use qh =
       q
-        .reshape([| seqLen; int64 numHeads; int64 headDim |])
-        .permute([| 1L; 0L; 2L |])
+        .reshape([| batchSize; seqLen; int64 numHeads; int64 headDim |])
+        .transpose(1L, 2L)
         .contiguous()
 
     use kh0 =
       k
-        .reshape([| seqLen; int64 numKvHeads; int64 headDim |])
-        .permute([| 1L; 0L; 2L |])
+        .reshape([| batchSize; seqLen; int64 numKvHeads; int64 headDim |])
+        .transpose(1L, 2L)
         .contiguous()
 
     use vh0 =
       v
-        .reshape([| seqLen; int64 numKvHeads; int64 headDim |])
-        .permute([| 1L; 0L; 2L |])
+        .reshape([| batchSize; seqLen; int64 numKvHeads; int64 headDim |])
+        .transpose(1L, 2L)
         .contiguous()
 
-    use qhNorm = rmsNormHeadWeighted qh layer.QNorm session.Config.RmsNormEps
-    use kh0Norm = rmsNormHeadWeighted kh0 layer.KNorm session.Config.RmsNormEps
-    use qhRope = applyRoPE qhNorm session.Config.RopeTheta
-    use kh0Rope = applyRoPE kh0Norm session.Config.RopeTheta
+    use qhNorm = rmsNormWeighted (qh.transpose(1L, 2L)) layer.QNorm session.Config.RmsNormEps
+    use kh0Norm = rmsNormWeighted (kh0.transpose(1L, 2L)) layer.KNorm session.Config.RmsNormEps
+    use qhNormT = qhNorm.transpose(1L, 2L).contiguous()
+    use kh0NormT = kh0Norm.transpose(1L, 2L).contiguous()
+    use qhRope = applyRoPE qhNormT session.Config.RopeTheta
+    use kh0Rope = applyRoPE kh0NormT session.Config.RopeTheta
     use kh = expandKvHeads numHeads numKvHeads kh0Rope
     use vh = expandKvHeads numHeads numKvHeads vh0
 
-    use attnScores = qhRope.matmul(kh.transpose(1L, 2L)) / sqrtHead
-    use attnScoresF = attnScores.to_type(torch.float32)
-    use mask2d = torch.triu(torch.ones([| seqLen; seqLen |], dtype = torch.bool, device = session.Device), 1L)
-    use mask = mask2d.unsqueeze(0L).expand([| int64 numHeads; seqLen; seqLen |])
-    use negInf = torch.zeros_like(attnScoresF) - 1e9f
-    use masked = torch.where(mask, negInf, attnScoresF)
-    use probs = torch.nn.functional.softmax(masked, dim = -1).to_type(session.DType)
-    use ctxHeads = probs.matmul(vh)
+    use ctxHeads = torch.nn.functional.scaled_dot_product_attention(qhRope, kh, vh, is_casual = true)
     use ctx =
       ctxHeads
-        .permute([| 1L; 0L; 2L |])
+        .transpose(1L, 2L)
         .contiguous()
-        .reshape([| seqLen; int64 (numHeads * headDim) |])
+        .reshape([| batchSize; seqLen; int64 (numHeads * headDim) |])
 
     use attnOut = linearQ4 ctx layer.OProj session.DType
     let resid1 = (hidden + attnOut).contiguous()
@@ -400,17 +395,44 @@ module InferenceBridge =
       hidden <- next
     hidden
 
-  let private selectNextTokenId (session: InferenceSession) (hidden: torch.Tensor) (temperature: float32) =
-    use last = hidden.narrow(0L, hidden.shape.[0] - 1L, 1L)
-    use lastNorm = rmsNormWeighted last session.FinalNorm session.Config.RmsNormEps
-    use logits = session.LmHead.Forward(lastNorm, outDtype = torch.float32)
-    use scaled =
-      if temperature > 0.0f then
-        logits / temperature
+  let private sampleFromLogits (logits: torch.Tensor) (temperature: float32) (topP: float32) =
+    if temperature <= 0.0f then
+      use next = logits.argmax(dim = -1L)
+      next.to_type(torch.int32).item<int>()
+    else
+      use scaled = if temperature <> 1.0f then logits / temperature else logits
+      use probs0 = torch.nn.functional.softmax(scaled, dim = -1L)
+      use probs = torch.nan_to_num(probs0, nan = 0.0, posinf = 0.0, neginf = 0.0)
+
+      if topP > 0.0f && topP < 1.0f then
+        let struct (sorted, indices) = torch.sort(probs, dim = -1L, descending = true)
+        use sorted = sorted
+        use indices = indices
+        use cumsum = torch.cumsum(sorted, dim = -1L)
+        use mask = torch.gt(cumsum, topP)
+        use sortedMasked = torch.where(mask, torch.zeros_like(sorted), sorted)
+        use sums = torch.sum(sortedMasked, dim = -1L, keepdim = true).clamp_min(1e-12)
+        use sortedNorm = sortedMasked / sums
+        use next = torch.multinomial(sortedNorm, 1L)
+        use token = torch.gather(indices, -1L, next)
+        token.to_type(torch.int32).item<int>()
       else
-        logits
-    use argmax = scaled.argmax(dim = 1L).to_type(torch.int64).cpu()
-    int (argmax.item<int64>())
+        use sums = torch.sum(probs, dim = -1L, keepdim = true).clamp_min(1e-12)
+        use probsNorm = probs / sums
+        use next = torch.multinomial(probsNorm, 1L)
+        next.to_type(torch.int32).item<int>()
+
+  let private selectNextTokenId
+    (session: InferenceSession)
+    (hidden: torch.Tensor)
+    (temperature: float32)
+    (topP: float32)
+    =
+    use last = hidden.narrow(1L, hidden.shape.[1] - 1L, 1L)
+    use lastNorm = rmsNormWeighted last session.FinalNorm session.Config.RmsNormEps
+    use logits0 = session.LmHead.Forward(lastNorm, outDtype = session.DType)
+    use logits = if logits0.dtype = torch.float32 then logits0 else logits0.to_type(torch.float32)
+    sampleFromLogits logits temperature topP
 
   let private decodeTokens (tokenizer: Tokenizer) (tokenIds: int list) =
     if tokenIds.IsEmpty then
@@ -457,14 +479,29 @@ module InferenceBridge =
 
     let runtimeTarget =
       if device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then Q4RuntimeTarget.Cuda 0 else Q4RuntimeTarget.Cpu
+
+    let backendOverrideEnv = Environment.GetEnvironmentVariable("QWEN3_FS_Q4_BACKEND")
+    let backendOverride =
+      if String.IsNullOrWhiteSpace backendOverrideEnv then
+        None
+      else
+        Some(backendOverrideEnv.Trim().ToLowerInvariant())
+
+    let computePath, backendName =
+      match runtimeTarget, backendOverride with
+      | Q4RuntimeTarget.Cpu, _ -> Q4ComputePath.DequantMatmulOnly, "dequant-matmul"
+      | _, Some "dequant-matmul" -> Q4ComputePath.DequantMatmulOnly, "dequant-matmul"
+      | _, Some "nvfp4-kernel" -> Q4ComputePath.KernelOnly, "nvfp4-kernel"
+      | _, _ -> Q4ComputePath.KernelOnly, "nvfp4-kernel"
+
+    printfn "[InferInit] q4-backend=%s compute-path=%A" backendName computePath
+
     let q4cfg =
       {
         Q4.pureNvfp4SessionConfig with
             RuntimeTarget = runtimeTarget
-            ComputePath =
-              if runtimeTarget = Q4RuntimeTarget.Cpu then Q4ComputePath.DequantMatmulOnly else Q4ComputePath.KernelOnly
-            BackendOverride =
-              if runtimeTarget = Q4RuntimeTarget.Cpu then Some "dequant-matmul" else Some "nvfp4-kernel"
+            ComputePath = computePath
+            BackendOverride = Some backendName
       }
 
     let rawKeys =
@@ -564,11 +601,7 @@ module InferenceBridge =
       |> Seq.map int
       |> Seq.toList
 
-    let inputIds =
-      match session.Config.BosTokenId with
-      | Some bos ->
-        if encoded.IsEmpty then [ bos ] else bos :: encoded
-      | None -> encoded
+    let inputIds = encoded
 
     if inputIds.IsEmpty then
       invalidOp "prompt encoded to empty token sequence"
@@ -579,9 +612,13 @@ module InferenceBridge =
     let targetSteps = max 1 opt.MaxTokens
     let mutable stop = false
 
+    match opt.Seed with
+    | Some s when s >= 0 -> torch.manual_seed(int64 s) |> ignore
+    | _ -> ()
+
     while step < targetSteps && not stop do
       use hidden = forwardModel session (running |> List.toArray)
-      let nextId = selectNextTokenId session hidden opt.Temperature
+      let nextId = selectNextTokenId session hidden opt.Temperature opt.TopP
       generated <- generated @ [ nextId ]
       running <- running @ [ nextId ]
       step <- step + 1

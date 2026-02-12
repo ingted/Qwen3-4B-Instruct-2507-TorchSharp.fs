@@ -17,7 +17,7 @@
 | WBS-11 | Checkpoint/recover | code + doc | Done |
 | WBS-12 | Integrate tokenizer.json in pure F# inference | `InferenceBridge.fs` | Done |
 | WBS-13 | Replace handcrafted embedding with model-consistent embedding lookup | `InferenceBridge.fs` | Done |
-| WBS-14 | Implement explicit Qwen3-like block wiring (`q/k/v/o`, `gate/up/down`) | `InferenceBridge.fs` | In Progress |
+| WBS-14 | Implement explicit Qwen3-like block wiring (`q/k/v/o`, `gate/up/down`) | `InferenceBridge.fs` | Done |
 | WBS-15 | Remove 2-layer fallback behavior for run-training path | `InferenceBridge.fs`, `Types.fs` | Done |
 | WBS-16 | Add run-training vs run2 parity smoke checks | `doc/Test.md`, `scripts/Tests*.fsx` | Pending |
 | WBS-17 | Track inference parity changes and commits in DevLog | `doc/DevLog.md` | Done |
@@ -44,7 +44,7 @@
 | WBS-11 | checkpoint/recover | code + doc | Done |
 | WBS-12 | 在 pure F# 推論接入 tokenizer.json | `InferenceBridge.fs` | Done |
 | WBS-13 | 以模型一致 embedding lookup 取代手工 embedding | `InferenceBridge.fs` | Done |
-| WBS-14 | 實作明確 Qwen3-like block 接線（`q/k/v/o`, `gate/up/down`） | `InferenceBridge.fs` | In Progress |
+| WBS-14 | 實作明確 Qwen3-like block 接線（`q/k/v/o`, `gate/up/down`） | `InferenceBridge.fs` | Done |
 | WBS-15 | 移除 run-training 路徑的 2 層 fallback 行為 | `InferenceBridge.fs`, `Types.fs` | Done |
 | WBS-16 | 補 run-training 與 run2 的 parity smoke 測試 | `doc/Test.md`, `scripts/Tests*.fsx` | Pending |
 | WBS-17 | 在 DevLog 追蹤推論一致性變更與 commit | `doc/DevLog.md` | Done |

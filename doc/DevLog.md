@@ -121,3 +121,18 @@
   - 目前輸出雖然非 trivial，但與 `run2.fsx` 相比語意仍不穩定。
 - 最新阻塞：
   - 要達成嚴格 parity，仍需對齊 decode/sampling 細節與 KV-path 語意。
+
+### 實作更新 #3（同日，parity 路線）
+- 問題定位：
+  - `run-training.fsx` 的 `Q4Linear` NVFP4 路徑語意失真，`run2.fsx` 同權重可正常輸出。
+  - 差異點確認為 native interop 路徑：`TorchSharp.Q4.Extension` 原先走 `LibTorchSharp` 的 `THSFP4_quantize/THSTensor_scaled_mm` 包裝；`run2` 實際可用路徑為 `libNVFP4.so` 直接呼叫。
+- 修正內容：
+  - 在 `TorchSharp.Q4.Extension/NativeInterop.fs` 改為直接使用 `NVFP4_quantize`、`NVFP4_scaled_mm`。
+  - `InferenceBridge.fs` 同步對齊：
+    - 以 `[B,H,T,D]` 形狀走 `scaled_dot_product_attention`；
+    - 取消 BOS prepend，與 `run2` prompt 編碼行為一致；
+    - `temperature <= 0` 時改為 greedy (`argmax`)。
+- 驗證結果（同 prompt）：
+  - `run2.fsx`: 維持可讀語意輸出。
+  - `run-training.fsx`: 已從亂碼/多語碎片提升為可讀且語意合理句子：
+    - `I’ve never seen a UFO, but I’ve spent countless nights wondering what it would be like to encounter one.`
