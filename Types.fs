@@ -1,5 +1,6 @@
 namespace Qwen3_4B_Instruct_2507_TorchSharp_fs
 
+open System
 open TorchSharp
 open TorchSharp.Q4.Extension
 
@@ -52,12 +53,23 @@ module Defaults =
     }
 
 module Q4 =
+  let private defaultUnifiedMemoryPolicy () =
+    let raw = Environment.GetEnvironmentVariable("TS_Q4_DISABLE_UM")
+    if String.IsNullOrWhiteSpace(raw) then
+      UnifiedMemoryPolicy.Disabled
+    else
+      match raw.Trim().ToLowerInvariant() with
+      | "0"
+      | "false"
+      | "no" -> UnifiedMemoryPolicy.PreferUnified
+      | _ -> UnifiedMemoryPolicy.Disabled
+
   let pureNvfp4SessionConfig : Q4SessionConfig =
     {
       BackendOverride = Some "nvfp4-kernel"
       ComputePath = Q4ComputePath.KernelOnly
       RuntimeTarget = Q4RuntimeTarget.Auto
-      UnifiedMemoryPolicy = UnifiedMemoryPolicy.PreferUnified
+      UnifiedMemoryPolicy = defaultUnifiedMemoryPolicy ()
       EnableDiagnostics = true
     }
 

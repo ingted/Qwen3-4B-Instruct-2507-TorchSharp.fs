@@ -58,6 +58,10 @@ type InferenceSession =
     LmHead: Q4Linear
   }
 
+type KvPrefillMode =
+  | TokenByToken
+  | PromptByPrompt
+
 module InferenceBridge =
   let private imEndTokenId = 151645
   let private endOfTextTokenId = 151643
@@ -296,7 +300,7 @@ module InferenceBridge =
     use x2 = x.slice(lastDim, halfDim, headDim, 1L)
     torch.cat([| -x2; x1 |], dim = lastDim)
 
-  let private applyRoPE (x: torch.Tensor) (theta: float) =
+  let private applyRoPE (x: torch.Tensor) (theta: float) (positionOffset: int64) =
     // x: [batch, heads, seq, head_dim]
     let headDim = int x.shape.[3]
     if headDim % 2 <> 0 then
@@ -312,7 +316,8 @@ module InferenceBridge =
       |]
 
     use invFreq = torch.tensor(invFreqData, dtype = torch.float32, device = x.device)
-    use positions = torch.arange(int64 seqLen, dtype = torch.float32, device = x.device).unsqueeze(0L)
+    use positions =
+      torch.arange(positionOffset, positionOffset + int64 seqLen, dtype = torch.float32, device = x.device).unsqueeze(0L)
     use freqs = positions.unsqueeze(-1L) * invFreq
     use emb = torch.cat([| freqs; freqs |], dim = -1L)
     use cos = torch.cos(emb).to_type(x.dtype).unsqueeze(1L)
@@ -369,8 +374,8 @@ module InferenceBridge =
     use kh0Norm = rmsNormWeighted (kh0.transpose(1L, 2L)) layer.KNorm session.Config.RmsNormEps
     use qhNormT = qhNorm.transpose(1L, 2L).contiguous()
     use kh0NormT = kh0Norm.transpose(1L, 2L).contiguous()
-    use qhRope = applyRoPE qhNormT session.Config.RopeTheta
-    use kh0Rope = applyRoPE kh0NormT session.Config.RopeTheta
+    use qhRope = applyRoPE qhNormT session.Config.RopeTheta 0L
+    use kh0Rope = applyRoPE kh0NormT session.Config.RopeTheta 0L
     use kh = expandKvHeads numHeads numKvHeads kh0Rope
     use vh = expandKvHeads numHeads numKvHeads vh0
 
@@ -399,6 +404,134 @@ module InferenceBridge =
       let next = forwardLayer session layer hidden
       hidden.Dispose()
       hidden <- next
+    hidden
+
+  type private LayerKvCache =
+    {
+      mutable K: torch.Tensor option
+      mutable V: torch.Tensor option
+    }
+
+  type private InferenceKvCache(layerCount: int) =
+    let layers = Array.init layerCount (fun _ -> { K = None; V = None })
+    let mutable seqLen = 0L
+
+    member _.Layers = layers
+    member _.SeqLen
+      with get () = seqLen
+      and set (v: int64) = seqLen <- v
+
+    interface IDisposable with
+      member _.Dispose() =
+        for layer in layers do
+          layer.K |> Option.iter (fun t -> t.Dispose())
+          layer.V |> Option.iter (fun t -> t.Dispose())
+          layer.K <- None
+          layer.V <- None
+
+  let private forwardLayerWithCache
+    (session: InferenceSession)
+    (layer: LayerWeights)
+    (cache: LayerKvCache)
+    (hidden: torch.Tensor)
+    (positionOffset: int64)
+    =
+    let numHeads = session.Config.NumAttentionHeads
+    let numKvHeads = session.Config.NumKeyValueHeads
+    let headDim = session.Config.HeadDim
+    let batchSize = hidden.shape.[0]
+    let seqLen = hidden.shape.[1]
+
+    use normed0 = rmsNormWeighted hidden layer.InputNorm session.Config.RmsNormEps
+    use q = linearQ4 normed0 layer.QProj session.DType
+    use k = linearQ4 normed0 layer.KProj session.DType
+    use v = linearQ4 normed0 layer.VProj session.DType
+
+    use qh =
+      q
+        .reshape([| batchSize; seqLen; int64 numHeads; int64 headDim |])
+        .transpose(1L, 2L)
+        .contiguous()
+
+    use kh0 =
+      k
+        .reshape([| batchSize; seqLen; int64 numKvHeads; int64 headDim |])
+        .transpose(1L, 2L)
+        .contiguous()
+
+    use vh0 =
+      v
+        .reshape([| batchSize; seqLen; int64 numKvHeads; int64 headDim |])
+        .transpose(1L, 2L)
+        .contiguous()
+
+    use qhNorm = rmsNormWeighted (qh.transpose(1L, 2L)) layer.QNorm session.Config.RmsNormEps
+    use kh0Norm = rmsNormWeighted (kh0.transpose(1L, 2L)) layer.KNorm session.Config.RmsNormEps
+    use qhNormT = qhNorm.transpose(1L, 2L).contiguous()
+    use kh0NormT = kh0Norm.transpose(1L, 2L).contiguous()
+    use qhRope = applyRoPE qhNormT session.Config.RopeTheta positionOffset
+    let currentK = applyRoPE kh0NormT session.Config.RopeTheta positionOffset
+    let currentV = vh0.contiguous()
+
+    match cache.K with
+    | Some pastK ->
+      let merged = torch.cat([| pastK; currentK |], dim = 2L).contiguous()
+      pastK.Dispose()
+      currentK.Dispose()
+      cache.K <- Some merged
+    | None ->
+      cache.K <- Some currentK
+
+    match cache.V with
+    | Some pastV ->
+      let merged = torch.cat([| pastV; currentV |], dim = 2L).contiguous()
+      pastV.Dispose()
+      currentV.Dispose()
+      cache.V <- Some merged
+    | None ->
+      cache.V <- Some currentV
+
+    let kAll =
+      match cache.K with
+      | Some t -> t
+      | None -> invalidOp "kv-cache internal error: missing K after append"
+    let vAll =
+      match cache.V with
+      | Some t -> t
+      | None -> invalidOp "kv-cache internal error: missing V after append"
+
+    use kh = expandKvHeads numHeads numKvHeads kAll
+    use vh = expandKvHeads numHeads numKvHeads vAll
+
+    // For incremental decode (cache already has past), query has no future tokens in this call.
+    let useCausal = positionOffset = 0L && seqLen > 1L
+    use ctxHeads = torch.nn.functional.scaled_dot_product_attention(qhRope, kh, vh, is_casual = useCausal)
+    use ctx =
+      ctxHeads
+        .transpose(1L, 2L)
+        .contiguous()
+        .reshape([| batchSize; seqLen; int64 (numHeads * headDim) |])
+
+    use attnOut = linearQ4 ctx layer.OProj session.DType
+    let resid1 = (hidden + attnOut).contiguous()
+
+    use normed1 = rmsNormWeighted resid1 layer.PostAttnNorm session.Config.RmsNormEps
+    use gate = linearQ4 normed1 layer.GateProj session.DType
+    use up = linearQ4 normed1 layer.UpProj session.DType
+    use act = torch.nn.functional.silu(gate) * up
+    use down = linearQ4 act layer.DownProj session.DType
+    let resid2 = (resid1 + down).contiguous()
+    resid1.Dispose()
+    resid2
+
+  let private forwardModelWithCache (session: InferenceSession) (cache: InferenceKvCache) (tokenIds: int array) =
+    let mutable hidden = buildTokenEmbeddings session tokenIds
+    let positionOffset = cache.SeqLen
+    for i in 0 .. session.Layers.Length - 1 do
+      let next = forwardLayerWithCache session session.Layers.[i] cache.Layers.[i] hidden positionOffset
+      hidden.Dispose()
+      hidden <- next
+    cache.SeqLen <- cache.SeqLen + int64 tokenIds.Length
     hidden
 
   let private sampleFromLogits (logits: torch.Tensor) (temperature: float32) (topP: float32) =
@@ -646,6 +779,79 @@ module InferenceBridge =
     | _ -> ()
 
     decodeTokens session.Tokenizer (generated |> Seq.toList)
+
+  let generateFromRenderedPromptWithStopTokensKvCache
+    (session: InferenceSession)
+    (renderedPrompt: string)
+    (opt: InferenceGenOptions)
+    (stopTokens: int list)
+    (prefillMode: KvPrefillMode)
+    =
+    use _noGrad = torch.no_grad()
+
+    let inputIds =
+      session.Tokenizer.Encode(renderedPrompt)
+      |> Seq.map int
+      |> Seq.toArray
+
+    if inputIds.Length = 0 then
+      invalidOp "prompt encoded to empty token sequence"
+
+    let generated = ResizeArray<int>(max 1 opt.MaxTokens)
+    let targetSteps = max 1 opt.MaxTokens
+    let stopSet = stopTokens |> Set.ofList
+    let mutable step = 0
+    let mutable stop = false
+
+    match opt.Seed with
+    | Some s when s >= 0 -> torch.manual_seed(int64 s) |> ignore
+    | _ -> ()
+
+    use cache = new InferenceKvCache(session.Layers.Length)
+
+    let mutable nextId =
+      use prefillHidden =
+        match prefillMode with
+        | PromptByPrompt ->
+          forwardModelWithCache session cache inputIds
+        | TokenByToken ->
+          let mutable lastHidden: torch.Tensor option = None
+          for tokenId in inputIds do
+            lastHidden |> Option.iter (fun t -> t.Dispose())
+            lastHidden <- Some (forwardModelWithCache session cache [| tokenId |])
+          match lastHidden with
+          | Some h -> h
+          | None -> invalidOp "token-by-token prefill produced no hidden state"
+      selectNextTokenId session prefillHidden opt.Temperature opt.TopP
+
+    while step < targetSteps && not stop do
+      if stopSet.Contains(nextId) then
+        stop <- true
+      else
+        generated.Add(nextId)
+        step <- step + 1
+        if step < targetSteps then
+          use hidden = forwardModelWithCache session cache [| nextId |]
+          nextId <- selectNextTokenId session hidden opt.Temperature opt.TopP
+
+    match Environment.GetEnvironmentVariable("QWEN3_FS_DEBUG_TOKENS") with
+    | "1" ->
+      printfn "[InferDebug] generated token ids (kvc): %A" (generated |> Seq.toList)
+    | _ -> ()
+
+    decodeTokens session.Tokenizer (generated |> Seq.toList)
+
+  let generateFromRenderedPromptWithKvCache
+    (session: InferenceSession)
+    (renderedPrompt: string)
+    (opt: InferenceGenOptions)
+    (prefillMode: KvPrefillMode)
+    =
+    let stopTokens =
+      [ imEndTokenId; endOfTextTokenId ]
+      @ ([ session.Config.EosTokenId ] |> List.choose id)
+      |> List.distinct
+    generateFromRenderedPromptWithStopTokensKvCache session renderedPrompt opt stopTokens prefillMode
 
   let generateFromRenderedPrompt (session: InferenceSession) (renderedPrompt: string) (opt: InferenceGenOptions) =
     let stopTokens =
