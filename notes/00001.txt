@@ -1,0 +1,33 @@
+• 你抓得準，這句是對的：同權重要同語意品質，前提是同模型結構與同 tokenizer/解碼流程。
+  目前 run-training.fsx 雖然能跑，但還不是等價推論，所以品質一定掉。
+
+  關鍵差異（現況）：
+
+  - 不是原始 tokenizer：
+      - 現在用 UTF-8 bytes 當 token，VocabSize=256。
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/InferenceBridge.fs:49
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/InferenceBridge.fs:158
+  - 不是原始 embedding：
+      - 現在把 token 手工投影成 feature 向量，不是 learned embedding lookup。
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/InferenceBridge.fs:61
+  - 不是原始 Qwen block：
+      - 現在 block 是 linearSte + gelu (+residual)，沒有 attention/RoPE/RMSNorm/MLP 原始接線。
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/InferenceBridge.fs:90
+  - 只載了 2 層且維度 fallback：
+      - 預設 MaxLayers=2、In/Out=1024/1024，實際權重 fallback 到 4096/2560。
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/Types.fs:43
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/Types.fs:45
+      - 你剛跑也看到：fallback to (in=4096,out=2560), layers=2
+  - lm_head 也不是原始 head：
+      - 目前從某層權重裁切近似頭，不是真正 lm_head 權重。
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/InferenceBridge.fs:113
+
+  所以你看到 out: \0\0\0\0 是預期結果，不是權重檔壞掉。
+
+  接下來若要達到你要的「同品質」，我會直接往這個方向做（純 F#、不碰 Qwen3.dll）：
+
+  1. 接入 tokenizer.json 的真 tokenizer。
+  2. 改為完整 Qwen3 block 接線（embedding、RMSNorm、QKV+RoPE、attention、MLP、lm_head）。
+  3. 取消 2-layer scaffold 限制，按 config 全層載入與對齊。
+  4. 用同一組 prompt 對比 runner-arm64-fp4/run2.fsx 輸出做 parity。
+
