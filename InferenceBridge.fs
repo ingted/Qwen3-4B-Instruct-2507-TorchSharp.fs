@@ -25,22 +25,25 @@ type ModelConfigLite =
     NumKeyValueHeads: int
     HeadDim: int
     VocabSize: int
+    RopeTheta: float
+    RmsNormEps: float
+    BosTokenId: int option
     EosTokenId: int option
   }
 
 type LayerWeights =
   {
-    QProj: torch.Tensor
-    KProj: torch.Tensor
-    VProj: torch.Tensor
-    OProj: torch.Tensor
+    QProj: Q4Linear
+    KProj: Q4Linear
+    VProj: Q4Linear
+    OProj: Q4Linear
     InputNorm: torch.Tensor
     PostAttnNorm: torch.Tensor
     QNorm: torch.Tensor
     KNorm: torch.Tensor
-    GateProj: torch.Tensor
-    UpProj: torch.Tensor
-    DownProj: torch.Tensor
+    GateProj: Q4Linear
+    UpProj: Q4Linear
+    DownProj: Q4Linear
   }
 
 type InferenceSession =
@@ -52,7 +55,7 @@ type InferenceSession =
     Layers: LayerWeights array
     EmbedTokens: torch.Tensor
     FinalNorm: torch.Tensor
-    LmHead: torch.Tensor
+    LmHead: Q4Linear
   }
 
 module InferenceBridge =
@@ -81,6 +84,11 @@ module InferenceBridge =
   let private requiredInt64 (root: JsonElement) (name: string) =
     int64 (requiredInt root name)
 
+  let private requiredFloat (root: JsonElement) (name: string) =
+    match root.TryGetProperty(name) with
+    | true, prop -> prop.GetDouble()
+    | _ -> invalidOp (sprintf "config missing field: %s" name)
+
   let private optionalInt (root: JsonElement) (name: string) =
     match root.TryGetProperty(name) with
     | true, prop when prop.ValueKind = JsonValueKind.Number -> Some(prop.GetInt32())
@@ -96,6 +104,9 @@ module InferenceBridge =
       NumKeyValueHeads = requiredInt root "num_key_value_heads"
       HeadDim = requiredInt root "head_dim"
       VocabSize = requiredInt root "vocab_size"
+      RopeTheta = requiredFloat root "rope_theta"
+      RmsNormEps = requiredFloat root "rms_norm_eps"
+      BosTokenId = optionalInt root "bos_token_id"
       EosTokenId = optionalInt root "eos_token_id"
     }
 
@@ -214,14 +225,6 @@ module InferenceBridge =
     else
       None
 
-  let private materializeWeight (device: string) (dtype: TorchSharp.torch.ScalarType) (bundle: Q4TensorBundle) =
-    let dense = Qwen3Model.materializeMasterWeight bundle device dtype
-    bundle.Weight.Dispose()
-    bundle.Scale |> Option.iter (fun t -> t.Dispose())
-    bundle.Absmax |> Option.iter (fun t -> t.Dispose())
-    bundle.QuantMap |> Option.iter (fun t -> t.Dispose())
-    dense
-
   let private loadByDims
     (baseCfg: TrainingConfig)
     (inFeatures: int64)
@@ -238,9 +241,8 @@ module InferenceBridge =
       }
     Nvfp4State.load cfg
 
-  let private buildLayerMap
-    (device: string)
-    (dtype: TorchSharp.torch.ScalarType)
+  let private buildLayerLinearMap
+    (q4cfg: Q4SessionConfig)
     (suffix: string)
     (state: Nvfp4ModelState)
     =
@@ -249,19 +251,14 @@ module InferenceBridge =
       if layer.Name.EndsWith(suffix, StringComparison.Ordinal) then
         match parseLayerIndex layer.Name with
         | Some idx ->
-          let w = materializeWeight device dtype layer.Bundle
-          Some(idx, w)
-        | None ->
-          layer.Bundle.Weight.Dispose()
-          layer.Bundle.Scale |> Option.iter (fun t -> t.Dispose())
-          None
+          let linear = new Q4Linear(q4cfg, Q4.pureNvfp4Schema, layer.Bundle)
+          Some(idx, linear)
+        | None -> None
       else
-        layer.Bundle.Weight.Dispose()
-        layer.Bundle.Scale |> Option.iter (fun t -> t.Dispose())
         None)
     |> Map.ofList
 
-  let private mapGet (name: string) (idx: int) (m: Map<int, torch.Tensor>) =
+  let private mapGet (name: string) (idx: int) (m: Map<int, Q4Linear>) =
     match m.TryFind idx with
     | Some v -> v
     | None -> invalidOp (sprintf "missing %s for layer %d" name idx)
@@ -271,8 +268,8 @@ module InferenceBridge =
     | Some v -> v
     | None -> invalidOp (sprintf "missing raw tensor key: %s" key)
 
-  let private linear (input: torch.Tensor) (weight: torch.Tensor) =
-    input.matmul(weight.transpose(0L, 1L))
+  let private linearQ4 (input: torch.Tensor) (proj: Q4Linear) (outDtype: TorchSharp.torch.ScalarType) =
+    proj.Forward(input, outDtype = outDtype)
 
   let private rmsNorm (x: torch.Tensor) (eps: float) =
     use xF = x.to_type(torch.float32)
@@ -289,6 +286,34 @@ module InferenceBridge =
     use normalized = rmsNorm x eps
     use w = weight.reshape([| 1L; 1L; weight.shape.[0] |])
     normalized * w
+
+  let private applyRoPE (x: torch.Tensor) (theta: float) =
+    // x: [heads, seq, head_dim]
+    let headDim = int x.shape.[2]
+    if headDim % 2 <> 0 then
+      invalidOp (sprintf "head_dim must be even for RoPE, got %d" headDim)
+
+    let seqLen = int x.shape.[1]
+    let halfDim = headDim / 2
+    let invFreqData =
+      [|
+        for i in 0 .. halfDim - 1 do
+          let exponent = float (2 * i) / float headDim
+          yield float32 (1.0 / (Math.Pow(theta, exponent)))
+      |]
+
+    use invFreq = torch.tensor(invFreqData, dtype = torch.float32, device = x.device)
+    use positions = torch.arange(int64 seqLen, dtype = torch.float32, device = x.device)
+    use angles = positions.unsqueeze(1L) * invFreq.unsqueeze(0L) // [seq, half]
+    use cosPart = torch.cos(angles).unsqueeze(0L).to_type(x.dtype) // [1, seq, half]
+    use sinPart = torch.sin(angles).unsqueeze(0L).to_type(x.dtype)
+
+    use xEven = x.slice(2L, 0L, int64 headDim, 2L)
+    use xOdd = x.slice(2L, 1L, int64 headDim, 2L)
+    use yEven = xEven * cosPart - xOdd * sinPart
+    use yOdd = xEven * sinPart + xOdd * cosPart
+    use stacked = torch.stack([| yEven; yOdd |], -1L) // [heads, seq, half, 2]
+    stacked.reshape([| x.shape.[0]; x.shape.[1]; int64 headDim |]).contiguous()
 
   let private expandKvHeads (numHeads: int) (numKvHeads: int) (kv: torch.Tensor) =
     let seqLen = kv.shape.[1]
@@ -311,10 +336,10 @@ module InferenceBridge =
     let seqLen = hidden.shape.[0]
     let sqrtHead = sqrt (float32 headDim)
 
-    use normed0 = rmsNormWeighted hidden layer.InputNorm 1e-6
-    use q = linear normed0 layer.QProj
-    use k = linear normed0 layer.KProj
-    use v = linear normed0 layer.VProj
+    use normed0 = rmsNormWeighted hidden layer.InputNorm session.Config.RmsNormEps
+    use q = linearQ4 normed0 layer.QProj session.DType
+    use k = linearQ4 normed0 layer.KProj session.DType
+    use v = linearQ4 normed0 layer.VProj session.DType
 
     use qh =
       q
@@ -334,12 +359,14 @@ module InferenceBridge =
         .permute([| 1L; 0L; 2L |])
         .contiguous()
 
-    use qhNorm = rmsNormHeadWeighted qh layer.QNorm 1e-6
-    use kh0Norm = rmsNormHeadWeighted kh0 layer.KNorm 1e-6
-    use kh = expandKvHeads numHeads numKvHeads kh0Norm
+    use qhNorm = rmsNormHeadWeighted qh layer.QNorm session.Config.RmsNormEps
+    use kh0Norm = rmsNormHeadWeighted kh0 layer.KNorm session.Config.RmsNormEps
+    use qhRope = applyRoPE qhNorm session.Config.RopeTheta
+    use kh0Rope = applyRoPE kh0Norm session.Config.RopeTheta
+    use kh = expandKvHeads numHeads numKvHeads kh0Rope
     use vh = expandKvHeads numHeads numKvHeads vh0
 
-    use attnScores = qhNorm.matmul(kh.transpose(1L, 2L)) / sqrtHead
+    use attnScores = qhRope.matmul(kh.transpose(1L, 2L)) / sqrtHead
     use attnScoresF = attnScores.to_type(torch.float32)
     use mask2d = torch.triu(torch.ones([| seqLen; seqLen |], dtype = torch.bool, device = session.Device), 1L)
     use mask = mask2d.unsqueeze(0L).expand([| int64 numHeads; seqLen; seqLen |])
@@ -353,14 +380,14 @@ module InferenceBridge =
         .contiguous()
         .reshape([| seqLen; int64 (numHeads * headDim) |])
 
-    use attnOut = linear ctx layer.OProj
+    use attnOut = linearQ4 ctx layer.OProj session.DType
     let resid1 = (hidden + attnOut).contiguous()
 
-    use normed1 = rmsNormWeighted resid1 layer.PostAttnNorm 1e-6
-    use gate = linear normed1 layer.GateProj
-    use up = linear normed1 layer.UpProj
+    use normed1 = rmsNormWeighted resid1 layer.PostAttnNorm session.Config.RmsNormEps
+    use gate = linearQ4 normed1 layer.GateProj session.DType
+    use up = linearQ4 normed1 layer.UpProj session.DType
     use act = torch.nn.functional.silu(gate) * up
-    use down = linear act layer.DownProj
+    use down = linearQ4 act layer.DownProj session.DType
     let resid2 = (resid1 + down).contiguous()
     resid1.Dispose()
     resid2
@@ -375,8 +402,8 @@ module InferenceBridge =
 
   let private selectNextTokenId (session: InferenceSession) (hidden: torch.Tensor) (temperature: float32) =
     use last = hidden.narrow(0L, hidden.shape.[0] - 1L, 1L)
-    use lastNorm = rmsNormWeighted last session.FinalNorm 1e-6
-    use logits = lastNorm.matmul(session.LmHead.transpose(0L, 1L))
+    use lastNorm = rmsNormWeighted last session.FinalNorm session.Config.RmsNormEps
+    use logits = session.LmHead.Forward(lastNorm, outDtype = torch.float32)
     use scaled =
       if temperature > 0.0f then
         logits / temperature
@@ -428,6 +455,18 @@ module InferenceBridge =
             StrictLoad = true
       }
 
+    let runtimeTarget =
+      if device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then Q4RuntimeTarget.Cuda 0 else Q4RuntimeTarget.Cpu
+    let q4cfg =
+      {
+        Q4.pureNvfp4SessionConfig with
+            RuntimeTarget = runtimeTarget
+            ComputePath =
+              if runtimeTarget = Q4RuntimeTarget.Cpu then Q4ComputePath.DequantMatmulOnly else Q4ComputePath.KernelOnly
+            BackendOverride =
+              if runtimeTarget = Q4RuntimeTarget.Cpu then Some "dequant-matmul" else Some "nvfp4-kernel"
+      }
+
     let rawKeys =
       seq {
         yield "model.embed_tokens.weight"
@@ -444,41 +483,36 @@ module InferenceBridge =
 
     let qMap =
       loadByDims baseCfg cfgLite.HiddenSize (int64 (cfgLite.NumAttentionHeads * cfgLite.HeadDim)) cfgLite.NumHiddenLayers
-      |> buildLayerMap device dtype ".self_attn.q_proj"
+      |> buildLayerLinearMap q4cfg ".self_attn.q_proj"
 
     let kvCount = cfgLite.NumHiddenLayers * 2
     let kvState = loadByDims baseCfg cfgLite.HiddenSize (int64 (cfgLite.NumKeyValueHeads * cfgLite.HeadDim)) kvCount
-    let kMap = buildLayerMap device dtype ".self_attn.k_proj" kvState
+    let kMap = buildLayerLinearMap q4cfg ".self_attn.k_proj" kvState
     let vMap =
       loadByDims baseCfg cfgLite.HiddenSize (int64 (cfgLite.NumKeyValueHeads * cfgLite.HeadDim)) kvCount
-      |> buildLayerMap device dtype ".self_attn.v_proj"
+      |> buildLayerLinearMap q4cfg ".self_attn.v_proj"
 
     let oMap =
       loadByDims baseCfg (int64 (cfgLite.NumAttentionHeads * cfgLite.HeadDim)) cfgLite.HiddenSize cfgLite.NumHiddenLayers
-      |> buildLayerMap device dtype ".self_attn.o_proj"
+      |> buildLayerLinearMap q4cfg ".self_attn.o_proj"
 
     let guCount = cfgLite.NumHiddenLayers * 2
     let gateMap =
       loadByDims baseCfg cfgLite.HiddenSize 9728L guCount
-      |> buildLayerMap device dtype ".mlp.gate_proj"
+      |> buildLayerLinearMap q4cfg ".mlp.gate_proj"
     let upMap =
       loadByDims baseCfg cfgLite.HiddenSize 9728L guCount
-      |> buildLayerMap device dtype ".mlp.up_proj"
+      |> buildLayerLinearMap q4cfg ".mlp.up_proj"
 
     let downMap =
       loadByDims baseCfg 9728L cfgLite.HiddenSize cfgLite.NumHiddenLayers
-      |> buildLayerMap device dtype ".mlp.down_proj"
+      |> buildLayerLinearMap q4cfg ".mlp.down_proj"
 
     let lmState = loadByDims baseCfg cfgLite.HiddenSize (int64 cfgLite.VocabSize) 1
     let lmHead =
       match lmState.Layers |> List.tryFind (fun l -> l.Name = "lm_head") with
-      | Some l -> materializeWeight device dtype l.Bundle
+      | Some l -> new Q4Linear(q4cfg, Q4.pureNvfp4Schema, l.Bundle)
       | None -> invalidOp "missing lm_head"
-
-    for l in lmState.Layers do
-      if l.Name <> "lm_head" then
-        l.Bundle.Weight.Dispose()
-        l.Bundle.Scale |> Option.iter (fun t -> t.Dispose())
 
     let layers =
       [|
@@ -525,10 +559,16 @@ module InferenceBridge =
     let renderedPrompt =
       $"<|im_start|>user\n{prompt}\n<|im_end|>\n<|im_start|>assistant\n"
 
-    let inputIds =
+    let encoded =
       session.Tokenizer.Encode(renderedPrompt)
       |> Seq.map int
       |> Seq.toList
+
+    let inputIds =
+      match session.Config.BosTokenId with
+      | Some bos ->
+        if encoded.IsEmpty then [ bos ] else bos :: encoded
+      | None -> encoded
 
     if inputIds.IsEmpty then
       invalidOp "prompt encoded to empty token sequence"
@@ -550,23 +590,28 @@ module InferenceBridge =
       | Some eos when nextId = eos -> stop <- true
       | _ -> ()
 
+    match Environment.GetEnvironmentVariable("QWEN3_FS_DEBUG_TOKENS") with
+    | "1" ->
+      printfn "[InferDebug] generated token ids: %A" generated
+    | _ -> ()
+
     decodeTokens session.Tokenizer generated
 
   let dispose (session: InferenceSession) =
     for layer in session.Layers do
-      layer.QProj.Dispose()
-      layer.KProj.Dispose()
-      layer.VProj.Dispose()
-      layer.OProj.Dispose()
+      (layer.QProj :> IDisposable).Dispose()
+      (layer.KProj :> IDisposable).Dispose()
+      (layer.VProj :> IDisposable).Dispose()
+      (layer.OProj :> IDisposable).Dispose()
       layer.InputNorm.Dispose()
       layer.PostAttnNorm.Dispose()
       layer.QNorm.Dispose()
       layer.KNorm.Dispose()
-      layer.GateProj.Dispose()
-      layer.UpProj.Dispose()
-      layer.DownProj.Dispose()
+      (layer.GateProj :> IDisposable).Dispose()
+      (layer.UpProj :> IDisposable).Dispose()
+      (layer.DownProj :> IDisposable).Dispose()
 
     session.EmbedTokens.Dispose()
     session.FinalNorm.Dispose()
-    session.LmHead.Dispose()
+    (session.LmHead :> IDisposable).Dispose()
     session.Tokenizer.Dispose()

@@ -47,6 +47,20 @@
 - Current blocker hypothesis:
   - RoPE and exact decode/KV behavior remain missing and likely dominate quality gap.
 
+### Implementation Update #2 (same day, parity track)
+- Implemented:
+  - added RoPE in attention path (pure F# implementation over `[heads, seq, head_dim]`)
+  - switched projection execution from dense dequant matmul to `Q4Linear` NVFP4 path for:
+    - `q/k/v/o`
+    - `gate/up/down`
+    - `lm_head`
+  - added BOS prepend and kept assistant-generation prompt template.
+- Validation:
+  - `run-training.fsx` no longer collapses to token id `0` / repeated `!`.
+  - output is now non-trivial but still semantically unstable compared with `run2.fsx`.
+- Updated blocker:
+  - exact Qwen3 parity still needs stricter alignment for decode/sampling details and KV-path semantics.
+
 ## 2026-02-12（中文）
 ### 背景
 - 來源備註：`notes/00001.txt`
@@ -93,3 +107,17 @@
   - `dotnet fsi run-training.fsx --max-tokens 16` 可跑滿 36 層，但輸出仍偏重複（`!!!!!!!!!!!!!!!`），尚未達到語意 parity。
 - 目前阻塞推測：
   - RoPE 與精確 decode/KV 行為尚未補齊，應是語意落差主要來源。
+
+### 實作更新 #2（同日，parity 路線）
+- 已補上：
+  - attention 路徑 RoPE（pure F#，作用於 `[heads, seq, head_dim]`）
+  - 投影計算改走 `Q4Linear` NVFP4 路徑，不再使用 dense dequant matmul：
+    - `q/k/v/o`
+    - `gate/up/down`
+    - `lm_head`
+  - 補上 BOS prepend 與 assistant generation prompt template。
+- 驗證：
+  - `run-training.fsx` 已不再退化成 token id `0` 或連續 `!`。
+  - 目前輸出雖然非 trivial，但與 `run2.fsx` 相比語意仍不穩定。
+- 最新阻塞：
+  - 要達成嚴格 parity，仍需對齊 decode/sampling 細節與 KV-path 語意。
