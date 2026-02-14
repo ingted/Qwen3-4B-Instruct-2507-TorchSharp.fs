@@ -1,0 +1,35 @@
+  依據程式碼：
+
+  - Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3Model.fs:52
+    訓練 forward 仍是 List.fold (linearSte) 的線性堆疊，沒有完整 Transformer block 接線。
+  - Qwen3-4B-Instruct-2507-TorchSharp.fs/InferenceBridge.fs:393
+    推論路徑才有 q/k/v/o + RoPE + SDPA + MLP(gate/up/down) + residual + RMSNorm。
+
+  所以現在是：
+
+  - 推論接線接近官方。
+  - 訓練接線仍是 scaffold，不是官方同構訓練圖。
+
+  怎麼驗證（由弱到強）
+
+  1. Smoke parity（已有）
+
+  - 跑 scripts/Tests.Parity.fsx、scripts/Tests.KVCStress.fsx。
+  - 這只能證明「可跑且輸出可讀」，不能證明同構。
+
+  2. 結構 parity（必要）
+
+  - 檢查每層是否都有 q_proj/k_proj/v_proj/o_proj/gate/up/down，層數與 config 一致。
+
+  3. Layer-wise 數值 parity（關鍵）
+
+  - 同一組 token、同權重、同 dtype，對比每層 hidden state：max_abs、mean_abs、cosine。
+  - 第一個誤差爆炸層就是接線或 layout 問題點。
+
+  4. Logits parity（最終）
+
+  - 比較最終 logits（或 top-k 排序）差異。
+  - temp=0, top_p=1, 固定 seed，避免 sampling 干擾。
+
+  如果你要，我下一步直接補一個 scripts/Tests.LayerParity.fsx，把第 2~4 點自動化，直接輸出「第一個失真爆炸層」。
+
