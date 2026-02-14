@@ -63,13 +63,13 @@ type KvPrefillMode =
   | PromptByPrompt
 
 module InferenceBridge =
-  let private imEndTokenId = 151645
-  let private endOfTextTokenId = 151643
+  let imEndTokenId = 151645
+  let endOfTextTokenId = 151643
 
-  let private renderPrompt (prompt: string) =
+  let renderPrompt (prompt: string) =
     $"<|im_start|>user\n{prompt}\n<|im_end|>\n<|im_start|>assistant\n"
 
-  let private defaultWeightForQuant (modelDir: string) (quantHint: string option) =
+  let defaultWeightForQuant (modelDir: string) (quantHint: string option) =
     match quantHint with
     | Some q when q.Equals("fp4", StringComparison.OrdinalIgnoreCase) ->
       Path.Combine(modelDir, "Qwen3-4B-Instruct-2507-nvfp4.dat")
@@ -80,31 +80,31 @@ module InferenceBridge =
       Path.Combine(modelDir, "Qwen3-4B-Instruct-2507-4bit.nf4.dat")
     | _ -> Defaults.weightPath
 
-  let private resolveWeightPath (modelDir: string) (weightOverride: string option) (quantHint: string option) =
+  let resolveWeightPath (modelDir: string) (weightOverride: string option) (quantHint: string option) =
     match weightOverride with
     | Some w when not (String.IsNullOrWhiteSpace w) ->
       if Path.IsPathRooted w then w else Path.Combine(modelDir, w)
     | _ -> defaultWeightForQuant modelDir quantHint
 
-  let private requiredInt (root: JsonElement) (name: string) =
+  let requiredInt (root: JsonElement) (name: string) =
     match root.TryGetProperty(name) with
     | true, prop -> prop.GetInt32()
     | _ -> invalidOp (sprintf "config missing field: %s" name)
 
-  let private requiredInt64 (root: JsonElement) (name: string) =
+  let requiredInt64 (root: JsonElement) (name: string) =
     int64 (requiredInt root name)
 
-  let private requiredFloat (root: JsonElement) (name: string) =
+  let requiredFloat (root: JsonElement) (name: string) =
     match root.TryGetProperty(name) with
     | true, prop -> prop.GetDouble()
     | _ -> invalidOp (sprintf "config missing field: %s" name)
 
-  let private optionalInt (root: JsonElement) (name: string) =
+  let optionalInt (root: JsonElement) (name: string) =
     match root.TryGetProperty(name) with
     | true, prop when prop.ValueKind = JsonValueKind.Number -> Some(prop.GetInt32())
     | _ -> None
 
-  let private loadConfigLite (configPath: string) =
+  let loadConfigLite (configPath: string) =
     use doc = JsonDocument.Parse(File.ReadAllText(configPath))
     let root = doc.RootElement
     {
@@ -120,7 +120,7 @@ module InferenceBridge =
       EosTokenId = optionalInt root "eos_token_id"
     }
 
-  let private readLeb128 (br: BinaryReader) : uint64 =
+  let readLeb128 (br: BinaryReader) : uint64 =
     let mutable result = 0UL
     let mutable shift = 0
     let mutable keepReading = true
@@ -131,7 +131,7 @@ module InferenceBridge =
       shift <- shift + 7
     result
 
-  let private elementSize (elemType: int) =
+  let elementSize (elemType: int) =
     match elemType with
     | 0
     | 1
@@ -147,13 +147,13 @@ module InferenceBridge =
     | 7 -> 8
     | _ -> invalidOp (sprintf "unsupported elemType=%d" elemType)
 
-  let private checkedByteCount (shape: int64 array) (elemSize: int) =
+  let checkedByteCount (shape: int64 array) (elemSize: int) =
     let mutable n = 1L
     for d in shape do
       n <- n * d
     n * int64 elemSize
 
-  let private readFloatTensor
+  let readFloatTensor
     (br: BinaryReader)
     (elemType: int)
     (shape: int64 array)
@@ -190,7 +190,7 @@ module InferenceBridge =
     tensorCpu.Dispose()
     tensor
 
-  let private loadRawTensorMap (weightPath: string) (device: string) (keys: Set<string>) =
+  let loadRawTensorMap (weightPath: string) (device: string) (keys: Set<string>) =
     use fs = File.OpenRead(weightPath)
     use br = new BinaryReader(fs)
     let entryCount = int64 (readLeb128 br)
@@ -221,7 +221,7 @@ module InferenceBridge =
 
     results |> Seq.map (fun kv -> kv.Key, kv.Value) |> Map.ofSeq
 
-  let private applyUnifiedPolicyToRawMap
+  let applyUnifiedPolicyToRawMap
     (policy: UnifiedMemoryPolicy)
     (rawMap: Map<string, torch.Tensor>)
     =
@@ -232,7 +232,7 @@ module InferenceBridge =
         tensor.Dispose()
       promoted)
 
-  let private parseLayerIndex (name: string) =
+  let parseLayerIndex (name: string) =
     let marker = "model.layers."
     if name.StartsWith(marker, StringComparison.Ordinal) then
       let rest = name.Substring(marker.Length)
@@ -246,7 +246,7 @@ module InferenceBridge =
     else
       None
 
-  let private loadByDims
+  let loadByDims
     (baseCfg: TrainingConfig)
     (inFeatures: int64)
     (outFeatures: int64)
@@ -262,7 +262,7 @@ module InferenceBridge =
       }
     Nvfp4State.load cfg
 
-  let private buildLayerLinearMap
+  let buildLayerLinearMap
     (q4cfg: Q4SessionConfig)
     (suffix: string)
     (state: Nvfp4ModelState)
@@ -279,31 +279,31 @@ module InferenceBridge =
         None)
     |> Map.ofList
 
-  let private mapGet (name: string) (idx: int) (m: Map<int, Q4Linear>) =
+  let mapGet (name: string) (idx: int) (m: Map<int, Q4Linear>) =
     match m.TryFind idx with
     | Some v -> v
     | None -> invalidOp (sprintf "missing %s for layer %d" name idx)
 
-  let private rawGet (key: string) (m: Map<string, torch.Tensor>) =
+  let rawGet (key: string) (m: Map<string, torch.Tensor>) =
     match m.TryFind key with
     | Some v -> v
     | None -> invalidOp (sprintf "missing raw tensor key: %s" key)
 
-  let private linearQ4 (input: torch.Tensor) (proj: Q4Linear) (outDtype: TorchSharp.torch.ScalarType) =
+  let linearQ4 (input: torch.Tensor) (proj: Q4Linear) (outDtype: TorchSharp.torch.ScalarType) =
     proj.Forward(input, outDtype = outDtype)
 
-  let private rmsNorm (x: torch.Tensor) (eps: float) =
+  let rmsNorm (x: torch.Tensor) (eps: float) =
     use xF = x.to_type(torch.float32)
     use sq = xF * xF
     use mean = sq.mean([| -1L |], true)
     use denom = torch.sqrt(mean + eps)
     (xF / denom).to_type(x.dtype)
 
-  let private rmsNormWeighted (x: torch.Tensor) (weight: torch.Tensor) (eps: float) =
+  let rmsNormWeighted (x: torch.Tensor) (weight: torch.Tensor) (eps: float) =
     use normalized = rmsNorm x eps
     normalized * weight
 
-  let private rotateHalf (x: torch.Tensor) =
+  let rotateHalf (x: torch.Tensor) =
     let lastDim = int64 (x.shape.Length - 1)
     let headDim = x.shape.[int lastDim]
     let halfDim = headDim / 2L
@@ -311,7 +311,7 @@ module InferenceBridge =
     use x2 = x.slice(lastDim, halfDim, headDim, 1L)
     torch.cat([| -x2; x1 |], dim = lastDim)
 
-  let private applyRoPE (x: torch.Tensor) (theta: float) (positionOffset: int64) =
+  let applyRoPE (x: torch.Tensor) (theta: float) (positionOffset: int64) =
     // x: [batch, heads, seq, head_dim]
     let headDim = int x.shape.[3]
     if headDim % 2 <> 0 then
@@ -336,7 +336,7 @@ module InferenceBridge =
     use rotated = rotateHalf x
     (x * cos + rotated * sin).contiguous()
 
-  let private expandKvHeads (numHeads: int) (numKvHeads: int) (kv: torch.Tensor) =
+  let expandKvHeads (numHeads: int) (numKvHeads: int) (kv: torch.Tensor) =
     let batchSize = kv.shape.[0]
     let seqLen = kv.shape.[2]
     let headDim = kv.shape.[3]
@@ -346,12 +346,12 @@ module InferenceBridge =
       .expand([| batchSize; int64 numKvHeads; int64 repeatFactor; seqLen; headDim |])
       .reshape([| batchSize; int64 numHeads; seqLen; headDim |])
 
-  let private buildTokenEmbeddings (session: InferenceSession) (tokenIds: int array) =
+  let buildTokenEmbeddings (session: InferenceSession) (tokenIds: int array) =
     use tokenTensor =
       torch.tensor(tokenIds, dtype = torch.int64, device = session.Device)
     session.EmbedTokens.index_select(0L, tokenTensor).unsqueeze(0L).contiguous()
 
-  let private forwardLayer (session: InferenceSession) (layer: LayerWeights) (hidden: torch.Tensor) =
+  let forwardLayer (session: InferenceSession) (layer: LayerWeights) (hidden: torch.Tensor) =
     let numHeads = session.Config.NumAttentionHeads
     let numKvHeads = session.Config.NumKeyValueHeads
     let headDim = session.Config.HeadDim
@@ -409,7 +409,7 @@ module InferenceBridge =
     resid1.Dispose()
     resid2
 
-  let private forwardModel (session: InferenceSession) (tokenIds: int array) =
+  let forwardModel (session: InferenceSession) (tokenIds: int array) =
     let mutable hidden = buildTokenEmbeddings session tokenIds
     for layer in session.Layers do
       let next = forwardLayer session layer hidden
@@ -417,13 +417,13 @@ module InferenceBridge =
       hidden <- next
     hidden
 
-  type private LayerKvCache =
+  type LayerKvCache =
     {
       mutable K: torch.Tensor option
       mutable V: torch.Tensor option
     }
 
-  type private InferenceKvCache(layerCount: int) =
+  type InferenceKvCache(layerCount: int) =
     let layers = Array.init layerCount (fun _ -> { K = None; V = None })
     let mutable seqLen = 0L
 
@@ -440,7 +440,7 @@ module InferenceBridge =
           layer.K <- None
           layer.V <- None
 
-  let private forwardLayerWithCache
+  let forwardLayerWithCache
     (session: InferenceSession)
     (layer: LayerWeights)
     (cache: LayerKvCache)
@@ -535,7 +535,7 @@ module InferenceBridge =
     resid1.Dispose()
     resid2
 
-  let private forwardModelWithCache (session: InferenceSession) (cache: InferenceKvCache) (tokenIds: int array) =
+  let forwardModelWithCache (session: InferenceSession) (cache: InferenceKvCache) (tokenIds: int array) =
     let mutable hidden = buildTokenEmbeddings session tokenIds
     let positionOffset = cache.SeqLen
     for i in 0 .. session.Layers.Length - 1 do
@@ -545,7 +545,7 @@ module InferenceBridge =
     cache.SeqLen <- cache.SeqLen + int64 tokenIds.Length
     hidden
 
-  let private sampleFromLogits (logits: torch.Tensor) (temperature: float32) (topP: float32) =
+  let sampleFromLogits (logits: torch.Tensor) (temperature: float32) (topP: float32) =
     if temperature <= 0.0f then
       use next = logits.argmax(dim = -1L)
       next.to_type(torch.int32).item<int>()
@@ -572,7 +572,7 @@ module InferenceBridge =
         use next = torch.multinomial(probsNorm, 1L)
         next.to_type(torch.int32).item<int>()
 
-  let private selectNextTokenId
+  let selectNextTokenId
     (session: InferenceSession)
     (hidden: torch.Tensor)
     (temperature: float32)
@@ -584,7 +584,7 @@ module InferenceBridge =
     use logits = if logits0.dtype = torch.float32 then logits0 else logits0.to_type(torch.float32)
     sampleFromLogits logits temperature topP
 
-  let private decodeTokens (tokenizer: Tokenizer) (tokenIds: int list) =
+  let decodeTokens (tokenizer: Tokenizer) (tokenIds: int list) =
     if tokenIds.IsEmpty then
       ""
     else
