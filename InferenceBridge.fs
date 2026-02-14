@@ -352,62 +352,36 @@ module InferenceBridge =
     session.EmbedTokens.index_select(0L, tokenTensor).unsqueeze(0L).contiguous()
 
   let forwardLayer (session: InferenceSession) (layer: LayerWeights) (hidden: torch.Tensor) =
-    let numHeads = session.Config.NumAttentionHeads
-    let numKvHeads = session.Config.NumKeyValueHeads
-    let headDim = session.Config.HeadDim
-    let batchSize = hidden.shape.[0]
-    let seqLen = hidden.shape.[1]
+    let cfg : Qwen3Core.CoreConfig =
+      {
+        NumAttentionHeads = session.Config.NumAttentionHeads
+        NumKeyValueHeads = session.Config.NumKeyValueHeads
+        HeadDim = session.Config.HeadDim
+        RopeTheta = session.Config.RopeTheta
+        RmsNormEps = session.Config.RmsNormEps
+        DType = session.DType
+      }
 
-    use normed0 = rmsNormWeighted hidden layer.InputNorm session.Config.RmsNormEps
-    use q = linearQ4 normed0 layer.QProj session.DType
-    use k = linearQ4 normed0 layer.KProj session.DType
-    use v = linearQ4 normed0 layer.VProj session.DType
+    let norms : Qwen3Core.BlockNorms =
+      {
+        InputNorm = layer.InputNorm
+        PostAttnNorm = layer.PostAttnNorm
+        QNorm = layer.QNorm
+        KNorm = layer.KNorm
+      }
 
-    use qh =
-      q
-        .reshape([| batchSize; seqLen; int64 numHeads; int64 headDim |])
-        .transpose(1L, 2L)
-        .contiguous()
+    let projs : Qwen3Core.BlockProjections =
+      {
+        QProj = (fun x -> linearQ4 x layer.QProj session.DType)
+        KProj = (fun x -> linearQ4 x layer.KProj session.DType)
+        VProj = (fun x -> linearQ4 x layer.VProj session.DType)
+        OProj = (fun x -> linearQ4 x layer.OProj session.DType)
+        GateProj = (fun x -> linearQ4 x layer.GateProj session.DType)
+        UpProj = (fun x -> linearQ4 x layer.UpProj session.DType)
+        DownProj = (fun x -> linearQ4 x layer.DownProj session.DType)
+      }
 
-    use kh0 =
-      k
-        .reshape([| batchSize; seqLen; int64 numKvHeads; int64 headDim |])
-        .transpose(1L, 2L)
-        .contiguous()
-
-    use vh0 =
-      v
-        .reshape([| batchSize; seqLen; int64 numKvHeads; int64 headDim |])
-        .transpose(1L, 2L)
-        .contiguous()
-
-    use qhNorm = rmsNormWeighted (qh.transpose(1L, 2L)) layer.QNorm session.Config.RmsNormEps
-    use kh0Norm = rmsNormWeighted (kh0.transpose(1L, 2L)) layer.KNorm session.Config.RmsNormEps
-    use qhNormT = qhNorm.transpose(1L, 2L).contiguous()
-    use kh0NormT = kh0Norm.transpose(1L, 2L).contiguous()
-    use qhRope = applyRoPE qhNormT session.Config.RopeTheta 0L
-    use kh0Rope = applyRoPE kh0NormT session.Config.RopeTheta 0L
-    use kh = expandKvHeads numHeads numKvHeads kh0Rope
-    use vh = expandKvHeads numHeads numKvHeads vh0
-
-    use ctxHeads = torch.nn.functional.scaled_dot_product_attention(qhRope, kh, vh, is_casual = true)
-    use ctx =
-      ctxHeads
-        .transpose(1L, 2L)
-        .contiguous()
-        .reshape([| batchSize; seqLen; int64 (numHeads * headDim) |])
-
-    use attnOut = linearQ4 ctx layer.OProj session.DType
-    let resid1 = (hidden + attnOut).contiguous()
-
-    use normed1 = rmsNormWeighted resid1 layer.PostAttnNorm session.Config.RmsNormEps
-    use gate = linearQ4 normed1 layer.GateProj session.DType
-    use up = linearQ4 normed1 layer.UpProj session.DType
-    use act = torch.nn.functional.silu(gate) * up
-    use down = linearQ4 act layer.DownProj session.DType
-    let resid2 = (resid1 + down).contiguous()
-    resid1.Dispose()
-    resid2
+    Qwen3Core.forwardBlockNoCache cfg norms projs hidden 0L
 
   let forwardModel (session: InferenceSession) (tokenIds: int array) =
     let mutable hidden = buildTokenEmbeddings session tokenIds

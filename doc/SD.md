@@ -383,3 +383,53 @@
 - `Qwen3Model.forward` 不再使用 scaffold `List.fold` 接線。
 - 訓練路徑明確使用 `TrainingFunctional` operators。
 - build 通過，既有訓練腳本可執行。
+
+## Official-Equivalent Wiring Contract Freeze (WBS-26, 2026-02-14)
+### Block contract (shape/order/norm path)
+- Input hidden state: `[B, T, Hidden]`.
+- Attention projection order:
+  - `input_rms_norm -> q_proj/k_proj/v_proj`
+  - reshape:
+    - `q`: `[B, heads, T, head_dim]`
+    - `k/v`: `[B, kv_heads, T, head_dim]`
+  - `q_norm/k_norm` on transposed view, then RoPE on q/k
+  - `k/v` expand from `kv_heads` to `heads`
+  - SDPA (causal for full prefill block path)
+  - merge heads -> `o_proj`
+- Residual path #1: `hidden + attn_out`
+- MLP order:
+  - `post_attn_rms_norm -> gate_proj/up_proj`
+  - `silu(gate) * up`
+  - `down_proj`
+- Residual path #2: `resid1 + down`
+
+### Shared-core implementation rule
+- One shared pure function for no-cache block forward:
+  - `Qwen3Core.forwardBlockNoCache`
+- Inference no-cache path must call this function directly.
+- Training path migration target: call same function with training projection adapters (STE).
+
+## 官方等價接線契約凍結（WBS-26，2026-02-14）
+### Block 契約（shape/順序/norm 路徑）
+- 輸入 hidden state：`[B, T, Hidden]`。
+- Attention 投影順序：
+  - `input_rms_norm -> q_proj/k_proj/v_proj`
+  - reshape：
+    - `q`: `[B, heads, T, head_dim]`
+    - `k/v`: `[B, kv_heads, T, head_dim]`
+  - 在轉置視圖套 `q_norm/k_norm`，再對 q/k 套 RoPE
+  - 將 `k/v` 從 `kv_heads` 擴展到 `heads`
+  - SDPA（full prefill block 路徑採 causal）
+  - merge heads -> `o_proj`
+- 殘差路徑 #1：`hidden + attn_out`
+- MLP 順序：
+  - `post_attn_rms_norm -> gate_proj/up_proj`
+  - `silu(gate) * up`
+  - `down_proj`
+- 殘差路徑 #2：`resid1 + down`
+
+### Shared-core 實作規則
+- no-cache block forward 使用同一個 pure function：
+  - `Qwen3Core.forwardBlockNoCache`
+- 推論 no-cache 路徑必須直接呼叫此函式。
+- 訓練路徑遷移目標：以 training projection adapters（STE）呼叫同一函式。

@@ -735,3 +735,45 @@ let output = torch.nn.functional.linear(inputForCompute, weightForCompute) // fa
 - 推論 smoke（確認未改行為）：
   - `cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-training2.fsx --max-tokens 4 --timing true`
   - 生成與 logits 流程完成；腳本最終拋 `stop here` 為設計行為。
+
+## 2026-02-14 (WBS-26/27 kickoff: shared block core)
+### Implemented
+- Added new shared block module:
+  - `Qwen3Core.fs` with:
+    - `CoreConfig`
+    - `BlockNorms`
+    - `BlockProjections`
+    - `forwardBlockNoCache`
+- Integrated no-cache inference block path:
+  - `InferenceBridge.forwardLayer` now delegates to `Qwen3Core.forwardBlockNoCache`.
+  - cache path (`forwardLayerWithCache`) remains unchanged in this step.
+
+### Scope clarification
+- This step starts WBS-27 but does not complete it yet:
+  - shared core is now used by inference no-cache path.
+  - training path has not yet been migrated to call this core.
+
+### WBS impact
+- WBS-26 set to Done (contract frozen in SD).
+- WBS-27 moved to In Progress.
+
+## 2026-02-14（WBS-26/27 開工：shared block core）
+### 已完成
+- 新增 shared block 模組：
+  - `Qwen3Core.fs`，包含：
+    - `CoreConfig`
+    - `BlockNorms`
+    - `BlockProjections`
+    - `forwardBlockNoCache`
+- 推論 no-cache block 路徑改為共用核心：
+  - `InferenceBridge.forwardLayer` 已改為呼叫 `Qwen3Core.forwardBlockNoCache`。
+  - cache 路徑（`forwardLayerWithCache`）此階段先保持原樣。
+
+### 範圍說明
+- 此步驟是 WBS-27 的起始，不是完工：
+  - shared core 已被推論 no-cache 路徑使用。
+  - 訓練路徑尚未遷移到同一核心。
+
+### WBS 影響
+- WBS-26 改為 Done（SD 已凍結契約）。
+- WBS-27 改為 In Progress。
