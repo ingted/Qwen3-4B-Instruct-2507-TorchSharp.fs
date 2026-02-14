@@ -412,3 +412,228 @@
   - init 輸出：
     - `[InferInit] UM(raw tensors): managed=146 total=146`
   - 相容性檢查（UM 關閉 / env 未設定）：可跑到設計的 `stop here`。
+
+## 2026-02-14 (notes/00002 review and next planning)
+### Source
+- Reviewed: `notes/00002.txt`
+
+### Key conclusion
+- Current training graph is still scaffold-style:
+  - `Qwen3Model.forward` uses linear stack with `List.fold + linearSte`.
+- Current inference graph in `InferenceBridge` already includes Qwen3-like block wiring, but is still not runtime-identical to official C# path.
+
+### Why inference is only "close", not "identical"
+- Runtime path difference:
+  - pure F# inference path does not call official `Qwen3Dense/Qwen3MoE` pipeline classes.
+- Session/cache behavior difference:
+  - `run2` C# path has session-level incremental KVC state machine.
+  - current `InferenceBridge` KVC is call-local; history/session orchestration is done externally in scripts.
+- Sampling/template handling difference:
+  - stop-token handling, template/session bookkeeping, and generation trim rules are not fully shared with official pipeline code.
+
+### Decision
+- Start a dedicated parity refactor:
+  - move training forward from scaffold to full Qwen3 block wiring.
+  - extract shared block-forward implementation to avoid train/infer drift.
+  - add layer-wise/logits parity tests against the existing run2 route.
+
+## 2026-02-14（notes/00002 審閱與後續規劃）
+### 來源
+- 已審閱：`notes/00002.txt`
+
+### 核心結論
+- 目前訓練圖仍是 scaffold：
+  - `Qwen3Model.forward` 仍為 `List.fold + linearSte` 線性堆疊。
+- 目前 `InferenceBridge` 雖已是 Qwen3-like block 接線，但尚未與官方 C# runtime 完全同構。
+
+### 為何推論僅「接近」而非「相同」
+- Runtime 路徑不同：
+  - pure F# 推論未直接走官方 `Qwen3Dense/Qwen3MoE` pipeline 類別。
+- Session/cache 行為不同：
+  - `run2` 的 C# 路徑有 session 級增量 KVC 狀態機。
+  - 目前 `InferenceBridge` 的 KVC 為單次呼叫內快取，跨輪歷史由外部腳本組裝。
+- 取樣/模板處理差異：
+  - stop token、模板與 session bookkeeping、生成裁切規則，尚未與官方 pipeline 程式碼完全共用。
+
+### 決策
+- 啟動專項 parity 重構：
+  - 訓練 forward 改為完整 Qwen3 block 接線，移除 scaffold。
+  - 抽 shared block-forward，降低 train/infer 漂移。
+  - 增加 layer-wise/logits parity 測試，對照現有 run2 路徑。
+
+## 2026-02-14 (clarification: model-block parity vs chat-pipeline parity)
+### Clarification
+- Current pure F# inference already has Qwen3-like model block wiring (`q/k/v/o`, RoPE, SDPA, MLP).
+- But the outer chat/session pipeline is still simplified compared with `run2` route.
+
+### Practical difference
+- `run2` path (`Runner_api`) includes session-level orchestration:
+  - history accumulation
+  - delta-token prefill logic
+  - KV-cache reset/append policy
+  - assistant end-token bookkeeping
+- `run-training2` pure F# path mainly calls `InferenceBridge` generation APIs directly with a lighter orchestration layer.
+
+### Flow sketch
+```mermaid
+flowchart TD
+  A[User Prompt] --> B[run2.fsx / Runner_api]
+  B --> C[History + Delta Tokens + KVC Policy]
+  C --> D[Model Forward]
+  D --> E[Decode + Session Bookkeeping]
+
+  A --> F[run-training2.fsx / InferenceBridge]
+  F --> G[Simple Prompt Assembly + Generate]
+  G --> H[Model Forward]
+  H --> I[Decode]
+```
+
+### Implication
+- "Model wiring parity" and "chat pipeline parity" are different layers.
+- We are close on model-block wiring, but not yet fully identical on session/chat pipeline behavior.
+
+## 2026-02-14（補充：模型接線一致性 vs 對話流程一致性）
+### 說明
+- 目前 pure F# 推論在模型 block 內部，已具備 Qwen3-like 接線（`q/k/v/o`, RoPE, SDPA, MLP）。
+- 但外層 chat/session pipeline 相較 `run2` 仍是簡化版。
+
+### 實際差異
+- `run2`（`Runner_api`）有完整 session 級流程：
+  - history 累積
+  - delta-token prefill 策略
+  - KV cache reset/append 規則
+  - assistant 結尾 token 的 bookkeeping
+- `run-training2` pure F# 路徑目前主要是直接呼叫 `InferenceBridge` 生成 API，外層流程較薄。
+
+### 流程示意
+```mermaid
+flowchart TD
+  A[使用者輸入] --> B[run2.fsx / Runner_api]
+  B --> C[History + Delta Token + KVC 策略]
+  C --> D[模型 Forward]
+  D --> E[Decode + Session Bookkeeping]
+
+  A --> F[run-training2.fsx / InferenceBridge]
+  F --> G[簡化 Prompt 組裝 + Generate]
+  G --> H[模型 Forward]
+  H --> I[Decode]
+```
+
+### 結論
+- 「模型接線一致」與「對話流程一致」是兩個層次。
+- 目前模型接線接近官方，但 session/chat pipeline 尚未完全同構。
+
+## 2026-02-14 (InferenceBridge vs `Qwen3-4B-Instruct-2507-TorchSharp-mod` mapping table)
+### Scope
+- Comparison target:
+  - `InferenceBridge.fs` (pure F# path)
+  - `Qwen3-4B-Instruct-2507-TorchSharp-mod` (`Qwen3Attention/Qwen3MLP/Qwen3Block/Qwen3Model`)
+
+### Q/K/V/O and MLP comparison
+| Item | `Qwen3-...-mod` | `InferenceBridge` | Gap / Missing |
+|---|---|---|---|
+| `q_proj` | Yes (`Qwen3Attention`) | Yes (`layer.QProj`) | No major gap in existence |
+| `k_proj` | Yes | Yes (`layer.KProj`) | No major gap in existence |
+| `v_proj` | Yes | Yes (`layer.VProj`) | No major gap in existence |
+| `o_proj` | Yes | Yes (`layer.OProj`) | No major gap in existence |
+| `q_norm` / `k_norm` | Yes (`Qwen3RMSNorm`) | Yes (`layer.QNorm/KNorm`) | No major gap in existence |
+| RoPE application | Uses `Qwen3RotaryEmbedding.forward(...)` then `ApplyRotaryPosEmb(...)` | Uses local `applyRoPE(...)` | Implementation differs; F# path is text-focused and does not include mod's multimodal rotary branch |
+| KV head expansion (`GQA`) | `repeat_interleave` / `RepeatKV` | `expandKvHeads` | Equivalent intent; implementation form differs |
+| Cache attention mask when `past!=null` and `T>1` | Explicit `attn_mask` + `useCausal=false` | Only `useCausal` toggle, no explicit mask branch | **Missing parity detail** (prompt-chunk prefill semantics can diverge) |
+| Max context clipping | Clips `k/v` to `maxContext`, updates `PositionOffset` | No `maxContext` clipping in `InferenceBridge` cache path | **Missing parity detail** (long-context behavior diverges) |
+| MLP `gate/up/down` | `silu(gate(x)) * up(x) -> down(...)` | Same formula (`silu(gate) * up -> down`) | No major gap in dense MLP math |
+| MoE path | Dense + MoE variants exist | Dense-style path only | **Missing feature** if MoE parity is required |
+| Final norm + lm_head | Yes | Yes (`lastNorm + LmHead`) | No major gap in existence |
+
+### Summary
+- For requested core parts (`q/k/v/o`, MLP), `InferenceBridge` already has corresponding modules and formula.
+- Current missing parity points are around cache/runtime semantics:
+  - past+chunk attention mask branch
+  - max-context clipping/position offset
+  - full session-level orchestration
+
+### NVFP4 storage vs compute dtype comparison
+| Stage | `Qwen3-...-mod` (C# + `Qwen3.FP4.Extension`) snippet | `InferenceBridge` (`TorchSharp.Q4.Extension`) snippet |
+|---|---|---|
+| Weight file (`.dat`) | `var qKey = prefix + ".qdata"; var sKey = prefix + ".scale";` | `match format with NVFP4 -> prefix + ".qdata", Some (prefix + ".scale"), None, None` |
+| In-memory weight (ready) | `_qweight <- qweight.detach().contiguous().to(Device(device))` / `_scale <- Fp4Ops.to_blocked ...` | `new PreparedNvfp4KernelWeight(... packed, scaleBlocked, inFeatures, outFeatures)` |
+| Forward input handling | `let qinput0, iscale0 = Fp4Ops.quantize in2d` | `let qInputRaw, inputScaleRaw = NativeInterop.fp4Quantize input2d` |
+| Core matmul | `Fp4Ops.scaled_mm qinput (_qweight.t()) iscale_swiz _scale input.dtype` | `NativeInterop.scaledMmFp4 qInput qweightT inputScaleBlocked scaleBlocked outDtype` |
+| Default output dtype in runner | `--dtype float16` (default args in `run2.fsx`) | `--dtype float16` (default args in `run-training2.fsx`) |
+| Where float/bf16 appears | `... scaled_mm ... input.dtype` (output follows input dtype), debug path has `to_type(Float32)` for A/B | `let computeDtype = ensureComputeDtype ...` then `linear(...)`; kernel output cast by `outDtype` |
+| Full float fallback path | `deqW = Fp4Ops.dequantize_weight ...` then `torch.matmul(inputF, deqWF...)` (A/B) | `let output = torch.nn.functional.linear(inputForCompute, weightForCompute)` |
+
+### Key snippets (stable by symbol, not line number)
+```fsharp
+// fsann/Qwen3.FP4.Extension/Library.fs
+_qweight <- qweight.detach().contiguous().``to``(Device(device)).MoveToOuterDisposeScope()
+_scale <- Fp4Ops.to_blocked scaleTmp
+let qinput0, iscale0 = Fp4Ops.quantize in2d
+let outTmp = Fp4Ops.scaled_mm qinput (_qweight.t()) iscale_swiz _scale input.dtype
+```
+
+```fsharp
+// TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension/Backend.fs
+let qInputRaw, inputScaleRaw = NativeInterop.fp4Quantize input2d
+use out2d = NativeInterop.scaledMmFp4 qInput qweightT inputScaleBlocked scaleBlocked outDtype
+let output = torch.nn.functional.linear(inputForCompute, weightForCompute) // fallback
+```
+
+## 2026-02-14（`InferenceBridge` 與 `Qwen3-...-mod` 對照表）
+### 範圍
+- 對照目標：
+  - `InferenceBridge.fs`（pure F# 路徑）
+  - `Qwen3-4B-Instruct-2507-TorchSharp-mod`（`Qwen3Attention/Qwen3MLP/Qwen3Block/Qwen3Model`）
+
+### Q/K/V/O 與 MLP 對照
+| 項目 | `Qwen3-...-mod` | `InferenceBridge` | 差異/缺漏 |
+|---|---|---|---|
+| `q_proj` | 有（`Qwen3Attention`） | 有（`layer.QProj`） | 存在性無主要缺口 |
+| `k_proj` | 有 | 有（`layer.KProj`） | 存在性無主要缺口 |
+| `v_proj` | 有 | 有（`layer.VProj`） | 存在性無主要缺口 |
+| `o_proj` | 有 | 有（`layer.OProj`） | 存在性無主要缺口 |
+| `q_norm` / `k_norm` | 有（`Qwen3RMSNorm`） | 有（`layer.QNorm/KNorm`） | 存在性無主要缺口 |
+| RoPE 套用 | 先 `Qwen3RotaryEmbedding.forward(...)` 再 `ApplyRotaryPosEmb(...)` | 使用本地 `applyRoPE(...)` | 實作不同；F# 路徑為 text-focused，未含 mod 的 multimodal rotary 分支 |
+| KV head 展開（GQA） | `repeat_interleave` / `RepeatKV` | `expandKvHeads` | 意圖等價，實作形式不同 |
+| `past!=null` 且 `T>1` 的 cache 注意力遮罩 | 有明確 `attn_mask` + `useCausal=false` | 目前僅切 `useCausal`，無明確 mask 分支 | **一致性缺口**（prompt-chunk prefill 語意可能偏移） |
+| `maxContext` 裁切 | 會裁切 `k/v` 並更新 `PositionOffset` | `InferenceBridge` cache 路徑未做 `maxContext` 裁切 | **一致性缺口**（長上下文行為偏移） |
+| MLP `gate/up/down` | `silu(gate(x)) * up(x) -> down(...)` | 同公式（`silu(gate) * up -> down`） | dense MLP 數學上無主要缺口 |
+| MoE 路徑 | 有 Dense + MoE 變體 | 目前僅 Dense 風格路徑 | 若要 MoE parity 則是**缺功能** |
+| Final norm + lm_head | 有 | 有（`lastNorm + LmHead`） | 存在性無主要缺口 |
+
+### 結論
+- 你指定的核心段（`q/k/v/o`, MLP）在 `InferenceBridge` 已有對應，公式也對。
+- 目前主要缺口在 cache/runtime 語意：
+  - past+chunk 的注意力遮罩分支
+  - max-context 裁切與 position offset
+  - 完整 session 級流程控制
+
+### NVFP4 儲存 vs 計算 dtype 對照
+| 階段 | `Qwen3-...-mod`（C# + `Qwen3.FP4.Extension`）關鍵片段 | `InferenceBridge`（`TorchSharp.Q4.Extension`）關鍵片段 |
+|---|---|---|
+| 權重檔（`.dat`） | `var qKey = prefix + ".qdata"; var sKey = prefix + ".scale";` | `match format with NVFP4 -> prefix + ".qdata", Some (prefix + ".scale"), None, None` |
+| 記憶體中的權重（就緒） | `_qweight <- qweight.detach().contiguous().to(Device(device))` / `_scale <- Fp4Ops.to_blocked ...` | `new PreparedNvfp4KernelWeight(... packed, scaleBlocked, inFeatures, outFeatures)` |
+| Forward 輸入處理 | `let qinput0, iscale0 = Fp4Ops.quantize in2d` | `let qInputRaw, inputScaleRaw = NativeInterop.fp4Quantize input2d` |
+| 核心 matmul | `Fp4Ops.scaled_mm qinput (_qweight.t()) iscale_swiz _scale input.dtype` | `NativeInterop.scaledMmFp4 qInput qweightT inputScaleBlocked scaleBlocked outDtype` |
+| runner 預設輸出 dtype | `--dtype float16`（`run2.fsx` defaultArgs） | `--dtype float16`（`run-training2.fsx` defaultArgs） |
+| 哪裡會出現 float/bf16 | `... scaled_mm ... input.dtype`（輸出跟 input dtype），A/B 路徑會 `to_type(Float32)` | `let computeDtype = ensureComputeDtype ...` 再 `linear(...)`；kernel 路徑由 `outDtype` 決定輸出 |
+| 全浮點 fallback 路徑 | `deqW = Fp4Ops.dequantize_weight ...` + `torch.matmul(inputF, deqWF...)`（A/B） | `let output = torch.nn.functional.linear(inputForCompute, weightForCompute)` |
+
+### 關鍵程式碼片段（以符號定位，不依賴行號）
+```fsharp
+// fsann/Qwen3.FP4.Extension/Library.fs
+_qweight <- qweight.detach().contiguous().``to``(Device(device)).MoveToOuterDisposeScope()
+_scale <- Fp4Ops.to_blocked scaleTmp
+let qinput0, iscale0 = Fp4Ops.quantize in2d
+let outTmp = Fp4Ops.scaled_mm qinput (_qweight.t()) iscale_swiz _scale input.dtype
+```
+
+```fsharp
+// TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension/Backend.fs
+let qInputRaw, inputScaleRaw = NativeInterop.fp4Quantize input2d
+use out2d = NativeInterop.scaledMmFp4 qInput qweightT inputScaleBlocked scaleBlocked outDtype
+let output = torch.nn.functional.linear(inputForCompute, weightForCompute) // fallback
+```
+
+### Maintenance note
+- Canonical, standalone version is now maintained in `doc/NVFP4_DataPath.md` (EN + ZH, snippet-first).
