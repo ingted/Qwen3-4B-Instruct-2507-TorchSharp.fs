@@ -691,3 +691,47 @@ let output = torch.nn.functional.linear(inputForCompute, weightForCompute) // fa
 - 新增 combinators（`chain`, `residual`, `parallel2`, `merge2`）支援複雜接線。
 - 重構 `Qwen3Model.forward` 以 operator 組線執行。
 - 以 build + 既有訓練/推論腳本做驗證。
+
+## 2026-02-14 (Functional training operator migration implementation)
+### Implemented
+- Added `TrainingFunctional.fs`:
+  - `TensorOp`, `TensorPairOp`
+  - operators: `->>`, `-->`
+  - combinators: `id`, `stage`, `chain`, `residual`, `parallel2`, `merge2`
+  - NVFP4 adapter: `linearSte weight outDtype`
+- Updated project compile order:
+  - `Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` now includes `TrainingFunctional.fs`.
+- Refactored training wiring:
+  - `Qwen3Model.forward` now builds training graph with operator composition (`stage` + `chain`) and executes via `input --> trainingGraph`.
+  - Removed scaffold-style direct `List.fold` wiring path.
+
+### Validation
+- Build:
+  - `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` => success.
+- Training-path regression:
+  - `dotnet fsi scripts/Tests.CPU.fsx` => all checks passed (9/9).
+- Inference smoke (unchanged behavior check):
+  - `cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-training2.fsx --max-tokens 4 --timing true`
+  - generation/logits flow completed; script ended with `stop here` exception by design.
+
+## 2026-02-14（訓練 functional operator 遷移實作）
+### 已完成
+- 新增 `TrainingFunctional.fs`：
+  - `TensorOp`, `TensorPairOp`
+  - operators：`->>`, `-->`
+  - combinators：`id`, `stage`, `chain`, `residual`, `parallel2`, `merge2`
+  - NVFP4 adapter：`linearSte weight outDtype`
+- 更新專案編譯順序：
+  - `Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` 已納入 `TrainingFunctional.fs`。
+- 訓練接線重構：
+  - `Qwen3Model.forward` 改為 operator 組線（`stage` + `chain`），以 `input --> trainingGraph` 執行。
+  - 移除原本 scaffold 直接 `List.fold` 接線。
+
+### 驗證
+- Build：
+  - `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` => 成功。
+- 訓練路徑回歸：
+  - `dotnet fsi scripts/Tests.CPU.fsx` => 全部通過（9/9）。
+- 推論 smoke（確認未改行為）：
+  - `cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-training2.fsx --max-tokens 4 --timing true`
+  - 生成與 logits 流程完成；腳本最終拋 `stop here` 為設計行為。

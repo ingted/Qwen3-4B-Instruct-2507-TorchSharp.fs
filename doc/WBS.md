@@ -35,9 +35,9 @@
 | WBS-29 | Add layer-wise hidden-state parity test (first divergence layer report) | `scripts/Tests.LayerParity.fsx` | Pending |
 | WBS-30 | Add logits parity acceptance test vs run2 baseline route | `scripts/Tests.LogitsParity.fsx` | Pending |
 | WBS-31 | Clone/review TorchSharp.Fun + DiffSharp for FP operator design | review note in `doc/DevLog.md` | Done |
-| WBS-32 | Add training functional operator module (`->>`, `-->`, combinators) | `TrainingFunctional.fs` | Pending |
-| WBS-33 | Refactor training wiring to operator pipeline style | `Qwen3Model.fs` | Pending |
-| WBS-34 | Verify no inference behavior change after training FP migration | build + smoke run logs | Pending |
+| WBS-32 | Add training functional operator module (`->>`, `-->`, combinators) | `TrainingFunctional.fs` | Done |
+| WBS-33 | Refactor training wiring to operator pipeline style | `Qwen3Model.fs` | Done |
+| WBS-34 | Verify no inference behavior change after training FP migration | build + smoke run logs | Done |
 
 ## Milestones
 - M1: Docs and test framework complete (WBS-01~08).
@@ -83,9 +83,9 @@
 | WBS-29 | 新增 layer-wise hidden-state parity 測試（回報首個失真層） | `scripts/Tests.LayerParity.fsx` | Pending |
 | WBS-30 | 新增對 run2 基線路徑的 logits parity 驗收 | `scripts/Tests.LogitsParity.fsx` | Pending |
 | WBS-31 | clone/review TorchSharp.Fun + DiffSharp，完成 FP operator 設計評估 | `doc/DevLog.md` 評估紀錄 | Done |
-| WBS-32 | 新增訓練 functional operator 模組（`->>`, `-->`, combinators） | `TrainingFunctional.fs` | Pending |
-| WBS-33 | 將訓練接線重構為 operator pipeline 風格 | `Qwen3Model.fs` | Pending |
-| WBS-34 | 驗證訓練 FP 風格遷移後推論行為不變 | build + smoke log | Pending |
+| WBS-32 | 新增訓練 functional operator 模組（`->>`, `-->`, combinators） | `TrainingFunctional.fs` | Done |
+| WBS-33 | 將訓練接線重構為 operator pipeline 風格 | `Qwen3Model.fs` | Done |
+| WBS-34 | 驗證訓練 FP 風格遷移後推論行為不變 | build + smoke log | Done |
 
 ## 里程碑
 - M1: 文件與測試框架完整（WBS-01~08）。
