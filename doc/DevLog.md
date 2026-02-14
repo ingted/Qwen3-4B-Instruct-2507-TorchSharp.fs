@@ -777,3 +777,63 @@ let output = torch.nn.functional.linear(inputForCompute, weightForCompute) // fa
 ### WBS 影響
 - WBS-26 改為 Done（SD 已凍結契約）。
 - WBS-27 改為 In Progress。
+
+## 2026-02-14 (WBS-27/28 complete: operator-graph block + training path hookup)
+### Implemented
+- `TrainingFunctional.fs`
+  - generalized operator composition to generic `Op<'a,'b>`
+  - added branch/merge helpers for block graph:
+    - `parallel3`, `merge3`
+- `Qwen3Core.fs`
+  - added `buildBlockGraphNoCache` using `TrainingFunctional` operators:
+    - attention main path: `input_norm -> (q/k/v branch) -> attn merge`
+    - residual #1 via `residual`
+    - MLP main path: `post_norm -> (gate/up branch) -> silu* -> down`
+    - residual #2 via `residual`
+  - `forwardBlockNoCache` now executes `hidden --> blockGraph`.
+- `Qwen3Model.fs`
+  - training model now includes `Blocks` metadata and `ExtraParameters`.
+  - training forward now runs through the same `Qwen3Core.buildBlockGraphNoCache`.
+  - for current scaffold/synthetic training state, each square trainable layer is adapted into a block-compatible projection set (shared projection parameter + trainable norm parameters) so the training path can execute the same block graph API.
+- `InferenceBridge.fs`
+  - no-cache block path already delegated to shared core from previous step.
+
+### Validation
+- `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` => success.
+- `dotnet fsi scripts/Tests.CPU.fsx` => all checks passed.
+- `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-training2.fsx --max-tokens 4 --timing true` => generation/logits flow still works; ends with designed `stop here`.
+
+### WBS status update
+- WBS-27 => Done
+- WBS-28 => Done
+- WBS-29/30 remain pending
+
+## 2026-02-14（WBS-27/28 完工：operator-graph block + 訓練路徑接線）
+### 已完成
+- `TrainingFunctional.fs`
+  - operator 組合泛化為 `Op<'a,'b>`
+  - 新增 block 圖所需 branch/merge：
+    - `parallel3`, `merge3`
+- `Qwen3Core.fs`
+  - 新增 `buildBlockGraphNoCache`，以 `TrainingFunctional` operators 建圖：
+    - attention 主路徑：`input_norm -> (q/k/v 分支) -> attn merge`
+    - 殘差 #1：`residual`
+    - MLP 主路徑：`post_norm -> (gate/up 分支) -> silu* -> down`
+    - 殘差 #2：`residual`
+  - `forwardBlockNoCache` 改為 `hidden --> blockGraph` 執行。
+- `Qwen3Model.fs`
+  - 訓練模型新增 `Blocks` 與 `ExtraParameters`。
+  - 訓練 forward 改為呼叫同一份 `Qwen3Core.buildBlockGraphNoCache`。
+  - 目前 scaffold/synthetic 訓練 state 下，將 square 線性層適配為 block 可用投影集合（共享 projection 參數 + 可訓練 norm 參數），讓訓練路徑可執行同一套 block graph API。
+- `InferenceBridge.fs`
+  - no-cache block 路徑延續前一步，已共用 shared core。
+
+### 驗證
+- `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` => 成功。
+- `dotnet fsi scripts/Tests.CPU.fsx` => 全通過。
+- `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-training2.fsx --max-tokens 4 --timing true` => 生成/logits 流程仍正常，最後為設計行為 `stop here`。
+
+### WBS 狀態更新
+- WBS-27 => Done
+- WBS-28 => Done
+- WBS-29/30 仍 Pending

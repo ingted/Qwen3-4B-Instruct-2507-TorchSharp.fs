@@ -1,6 +1,7 @@
 namespace Qwen3_4B_Instruct_2507_TorchSharp_fs
 
 open TorchSharp
+open Qwen3_4B_Instruct_2507_TorchSharp_fs.TrainingFunctional
 
 module Qwen3Core =
   type CoreConfig =
@@ -77,20 +78,17 @@ module Qwen3Core =
       .expand([| batchSize; int64 numKvHeads; int64 repeatFactor; seqLen; headDim |])
       .reshape([| batchSize; int64 numHeads; seqLen; headDim |])
 
-  let forwardBlockNoCache
+  let attentionOutFromQkv
     (cfg: CoreConfig)
     (norms: BlockNorms)
     (projs: BlockProjections)
-    (hidden: torch.Tensor)
     (positionOffset: int64)
+    (q: torch.Tensor)
+    (k: torch.Tensor)
+    (v: torch.Tensor)
     =
-    let batchSize = hidden.shape.[0]
-    let seqLen = hidden.shape.[1]
-
-    use normed0 = rmsNormWeighted hidden norms.InputNorm cfg.RmsNormEps
-    use q = projs.QProj normed0
-    use k = projs.KProj normed0
-    use v = projs.VProj normed0
+    let batchSize = q.shape.[0]
+    let seqLen = q.shape.[1]
 
     use qh =
       q
@@ -118,22 +116,58 @@ module Qwen3Core =
     use kh0Rope = applyRoPE kh0NormT cfg.RopeTheta positionOffset
     use kh = expandKvHeads cfg.NumAttentionHeads cfg.NumKeyValueHeads kh0Rope
     use vh = expandKvHeads cfg.NumAttentionHeads cfg.NumKeyValueHeads vh0
+    let attnDtype = qhRope.dtype
+    let khAttnTemp = if kh.dtype = attnDtype then None else Some (kh.to_type(attnDtype))
+    let vhAttnTemp = if vh.dtype = attnDtype then None else Some (vh.to_type(attnDtype))
+    let khAttn = match khAttnTemp with | Some t -> t | None -> kh
+    let vhAttn = match vhAttnTemp with | Some t -> t | None -> vh
 
-    use ctxHeads = torch.nn.functional.scaled_dot_product_attention(qhRope, kh, vh, is_casual = true)
+    use ctxHeads = torch.nn.functional.scaled_dot_product_attention(qhRope, khAttn, vhAttn, is_casual = true)
     use ctx =
       ctxHeads
         .transpose(1L, 2L)
         .contiguous()
         .reshape([| batchSize; seqLen; int64 (cfg.NumAttentionHeads * cfg.HeadDim) |])
 
-    use attnOut = projs.OProj ctx
-    let resid1 = (hidden + attnOut).contiguous()
+    khAttnTemp |> Option.iter (fun t -> t.Dispose())
+    vhAttnTemp |> Option.iter (fun t -> t.Dispose())
 
-    use normed1 = rmsNormWeighted resid1 norms.PostAttnNorm cfg.RmsNormEps
-    use gate = projs.GateProj normed1
-    use up = projs.UpProj normed1
-    use act = torch.nn.functional.silu(gate) * up
-    use down = projs.DownProj act
-    let resid2 = (resid1 + down).contiguous()
-    resid1.Dispose()
-    resid2
+    projs.OProj ctx
+
+  let buildBlockGraphNoCache
+    (cfg: CoreConfig)
+    (norms: BlockNorms)
+    (projs: BlockProjections)
+    (positionOffset: int64)
+    : TensorOp
+    =
+    let inputNormOp = stage (fun hidden -> rmsNormWeighted hidden norms.InputNorm cfg.RmsNormEps)
+    let qProjOp = stage projs.QProj
+    let kProjOp = stage projs.KProj
+    let vProjOp = stage projs.VProj
+
+    let qkvBranch = parallel3 qProjOp kProjOp vProjOp
+    let attnOutOp = merge3 (fun q k v -> attentionOutFromQkv cfg norms projs positionOffset q k v) qkvBranch
+    let attnMain = inputNormOp ->> attnOutOp
+    let attnResidual = residual attnMain
+
+    let postNormOp = stage (fun hidden -> rmsNormWeighted hidden norms.PostAttnNorm cfg.RmsNormEps)
+    let gateProjOp = stage projs.GateProj
+    let upProjOp = stage projs.UpProj
+    let gateUpBranch = parallel2 gateProjOp upProjOp
+    let activationMerge = merge2 (fun gate up -> torch.nn.functional.silu(gate) * up) gateUpBranch
+    let downProjOp = stage projs.DownProj
+    let mlpMain = postNormOp ->> activationMerge ->> downProjOp
+    let mlpResidual = residual mlpMain
+
+    attnResidual ->> mlpResidual
+
+  let forwardBlockNoCache
+    (cfg: CoreConfig)
+    (norms: BlockNorms)
+    (projs: BlockProjections)
+    (hidden: torch.Tensor)
+    (positionOffset: int64)
+    =
+    let blockGraph = buildBlockGraphNoCache cfg norms projs positionOffset
+    hidden --> blockGraph

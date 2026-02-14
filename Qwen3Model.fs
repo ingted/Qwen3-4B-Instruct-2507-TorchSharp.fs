@@ -1,6 +1,8 @@
 namespace Qwen3_4B_Instruct_2507_TorchSharp_fs
 
 open System
+open System.Collections.Generic
+open System.Runtime.CompilerServices
 open TorchSharp
 open TorchSharp.Modules
 open TorchSharp.Q4.Extension
@@ -12,10 +14,31 @@ type Qwen3TrainableLayer =
     MasterWeight: Parameter
   }
 
+type Qwen3TrainableBlock =
+  {
+    Name: string
+    QProj: Parameter
+    KProj: Parameter
+    VProj: Parameter
+    OProj: Parameter
+    GateProj: Parameter
+    UpProj: Parameter
+    DownProj: Parameter
+    InputNorm: Parameter
+    PostAttnNorm: Parameter
+    QNorm: Parameter
+    KNorm: Parameter
+    NumAttentionHeads: int
+    NumKeyValueHeads: int
+    HeadDim: int
+  }
+
 type Qwen3Nvfp4Model =
   {
     Session: Q4Session
     Layers: Qwen3TrainableLayer list
+    Blocks: Qwen3TrainableBlock list
+    ExtraParameters: Parameter list
     InFeatures: int64
     OutFeatures: int64
   }
@@ -48,7 +71,21 @@ module Qwen3Model =
     onTarget.contiguous().clone()
 
   let parameters (model: Qwen3Nvfp4Model) =
-    model.Layers |> List.map (fun l -> l.MasterWeight)
+    let all =
+      seq {
+        for l in model.Layers do
+          yield l.MasterWeight
+        for p in model.ExtraParameters do
+          yield p
+      }
+
+    let seen = HashSet<int>()
+    let unique = ResizeArray<Parameter>()
+    for p in all do
+      let key = RuntimeHelpers.GetHashCode(p)
+      if seen.Add(key) then
+        unique.Add(p)
+    unique |> Seq.toList
 
   let forward
     (model: Qwen3Nvfp4Model)
@@ -57,11 +94,67 @@ module Qwen3Model =
     : TorchSharp.torch.Tensor
     =
     let targetOutDtype = outDtype |> Option.defaultValue input.dtype
-    let trainingGraph =
-      model.Layers
-      |> List.map (fun layer -> stage (linearSte layer.MasterWeight targetOutDtype))
-      |> chain
-    input --> trainingGraph
+    if model.Blocks.IsEmpty then
+      let trainingGraph =
+        model.Layers
+        |> List.map (fun layer -> stage (linearSte layer.MasterWeight targetOutDtype))
+        |> chain
+      input --> trainingGraph
+    else
+      let forwardBlock (hidden: torch.Tensor) (block: Qwen3TrainableBlock) =
+        let cfg : Qwen3Core.CoreConfig =
+          {
+            NumAttentionHeads = block.NumAttentionHeads
+            NumKeyValueHeads = block.NumKeyValueHeads
+            HeadDim = block.HeadDim
+            RopeTheta = 1e6
+            RmsNormEps = 1e-6
+            DType = targetOutDtype
+          }
+
+        let norms : Qwen3Core.BlockNorms =
+          {
+            InputNorm = block.InputNorm
+            PostAttnNorm = block.PostAttnNorm
+            QNorm = block.QNorm
+            KNorm = block.KNorm
+          }
+
+        let projs : Qwen3Core.BlockProjections =
+          {
+            QProj = (fun x -> Nvfp4Training.linearSte x block.QProj targetOutDtype)
+            KProj = (fun x -> Nvfp4Training.linearSte x block.KProj targetOutDtype)
+            VProj = (fun x -> Nvfp4Training.linearSte x block.VProj targetOutDtype)
+            OProj = (fun x -> Nvfp4Training.linearSte x block.OProj targetOutDtype)
+            GateProj = (fun x -> Nvfp4Training.linearSte x block.GateProj targetOutDtype)
+            UpProj = (fun x -> Nvfp4Training.linearSte x block.UpProj targetOutDtype)
+            DownProj = (fun x -> Nvfp4Training.linearSte x block.DownProj targetOutDtype)
+          }
+
+        let blockGraph = Qwen3Core.buildBlockGraphNoCache cfg norms projs 0L
+        hidden --> blockGraph
+
+      let hidden0, squeezeBack =
+        if input.shape.Length = 2 then
+          input.unsqueeze(1L), true
+        else
+          input, false
+
+      let mutable hidden = hidden0
+      let mutable ownsHidden = false
+      for block in model.Blocks do
+        let next = forwardBlock hidden block
+        if ownsHidden then
+          hidden.Dispose()
+        hidden <- next
+        ownsHidden <- true
+
+      if squeezeBack then
+        let output = hidden.squeeze(1L).contiguous()
+        hidden.Dispose()
+        output
+      else
+        hidden
 
   let disposeSession (session: Q4Session) =
     match box session with
@@ -71,6 +164,8 @@ module Qwen3Model =
   let dispose (model: Qwen3Nvfp4Model) =
     for layer in model.Layers do
       layer.MasterWeight.Dispose()
+    for p in model.ExtraParameters do
+      p.Dispose()
     disposeSession model.Session
 
   let create (cfg: TrainingConfig) (state: Nvfp4ModelState) : Qwen3Nvfp4Model =
@@ -108,9 +203,55 @@ module Qwen3Model =
           MasterWeight = p
         })
 
+    let blocks, extraParams =
+      let createdBlocks = ResizeArray<Qwen3TrainableBlock>()
+      let createdNorms = ResizeArray<Parameter>()
+
+      let makeNorm (size: int64) (dtype: TorchSharp.torch.ScalarType) (deviceStr: string) =
+        let t = torch.ones([| size |], dtype = dtype, device = deviceStr)
+        let p = torch.nn.Parameter(t, true)
+        createdNorms.Add(p)
+        p
+
+      for i, layer in layers |> List.indexed do
+        let w = layer.MasterWeight
+        if w.shape.Length = 2 && w.shape.[0] = w.shape.[1] then
+          let hidden = w.shape.[1]
+          let headDim = int w.shape.[0]
+          let dtype = w.dtype
+          let dev = w.device.ToString()
+          let inputNorm = makeNorm hidden dtype dev
+          let postNorm = makeNorm hidden dtype dev
+          let qNorm = makeNorm (int64 headDim) dtype dev
+          let kNorm = makeNorm (int64 headDim) dtype dev
+
+          createdBlocks.Add(
+            {
+              Name = sprintf "train.block.%d" i
+              QProj = layer.MasterWeight
+              KProj = layer.MasterWeight
+              VProj = layer.MasterWeight
+              OProj = layer.MasterWeight
+              GateProj = layer.MasterWeight
+              UpProj = layer.MasterWeight
+              DownProj = layer.MasterWeight
+              InputNorm = inputNorm
+              PostAttnNorm = postNorm
+              QNorm = qNorm
+              KNorm = kNorm
+              NumAttentionHeads = 1
+              NumKeyValueHeads = 1
+              HeadDim = headDim
+            }
+          )
+
+      createdBlocks |> Seq.toList, createdNorms |> Seq.toList
+
     {
       Session = session
       Layers = layers
+      Blocks = blocks
+      ExtraParameters = extraParams
       InFeatures = state.InFeatures
       OutFeatures = state.OutFeatures
     }

@@ -409,6 +409,10 @@
 - Inference no-cache path must call this function directly.
 - Training path migration target: call same function with training projection adapters (STE).
 
+### Implementation status (2026-02-14)
+- `Qwen3Core.buildBlockGraphNoCache` implemented with `TrainingFunctional` operators (`->>`, branch/merge, residual).
+- `InferenceBridge.forwardLayer` (no-cache) and `Qwen3Model.forward` now both execute through the same block-graph core API.
+
 ## 官方等價接線契約凍結（WBS-26，2026-02-14）
 ### Block 契約（shape/順序/norm 路徑）
 - 輸入 hidden state：`[B, T, Hidden]`。

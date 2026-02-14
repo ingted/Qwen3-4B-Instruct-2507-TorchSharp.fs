@@ -30,8 +30,8 @@
 | WBS-24 | Integrate managed allocator capability from TorchSharp.Q4.Extension in runtime path | `InferenceBridge.fs` + dependency update | Done |
 | WBS-25 | Validate `TS_Q4_DISABLE_UM=0` E2E path and log managed coverage | runtime log + `doc/DevLog.md` | Done |
 | WBS-26 | Freeze official-equivalent training wiring contract (tensor shapes/order/norm path) | spec in `doc/SD.md` | Done |
-| WBS-27 | Implement shared block-forward core for train/infer | `Qwen3Core*.fs` + integration | In Progress |
-| WBS-28 | Refactor `Qwen3Model.forward` to full Qwen3 block wiring | `Qwen3Model.fs` | Pending |
+| WBS-27 | Implement shared block-forward core for train/infer | `Qwen3Core*.fs` + integration | Done |
+| WBS-28 | Refactor `Qwen3Model.forward` to full Qwen3 block wiring | `Qwen3Model.fs` | Done |
 | WBS-29 | Add layer-wise hidden-state parity test (first divergence layer report) | `scripts/Tests.LayerParity.fsx` | Pending |
 | WBS-30 | Add logits parity acceptance test vs run2 baseline route | `scripts/Tests.LogitsParity.fsx` | Pending |
 | WBS-31 | Clone/review TorchSharp.Fun + DiffSharp for FP operator design | review note in `doc/DevLog.md` | Done |
@@ -78,8 +78,8 @@
 | WBS-24 | 串接 TorchSharp.Q4.Extension managed allocator 能力到 runtime 路徑 | `InferenceBridge.fs` + 依賴更新 | Done |
 | WBS-25 | 驗證 `TS_Q4_DISABLE_UM=0` E2E 路徑並記錄 managed 覆蓋率 | runtime log + `doc/DevLog.md` | Done |
 | WBS-26 | 凍結「訓練接線等價官方」契約（張量 shape/順序/norm 路徑） | `doc/SD.md` 規格段落 | Done |
-| WBS-27 | 實作 train/infer 共用 block-forward core | `Qwen3Core*.fs` + 整合 | In Progress |
-| WBS-28 | 將 `Qwen3Model.forward` 重構為完整 Qwen3 block 接線 | `Qwen3Model.fs` | Pending |
+| WBS-27 | 實作 train/infer 共用 block-forward core | `Qwen3Core*.fs` + 整合 | Done |
+| WBS-28 | 將 `Qwen3Model.forward` 重構為完整 Qwen3 block 接線 | `Qwen3Model.fs` | Done |
 | WBS-29 | 新增 layer-wise hidden-state parity 測試（回報首個失真層） | `scripts/Tests.LayerParity.fsx` | Pending |
 | WBS-30 | 新增對 run2 基線路徑的 logits parity 驗收 | `scripts/Tests.LogitsParity.fsx` | Pending |
 | WBS-31 | clone/review TorchSharp.Fun + DiffSharp，完成 FP operator 設計評估 | `doc/DevLog.md` 評估紀錄 | Done |
