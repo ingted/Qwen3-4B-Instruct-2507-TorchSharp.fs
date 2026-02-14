@@ -158,6 +158,34 @@ The current scaffold can be iterated directly, with priority on real parser and 
 - FR-17: Add layer-wise hidden-state parity test to detect first divergence layer.
 - FR-18: Add final logits parity acceptance check (same prompt/seed/dtype/weights) against run2 baseline behavior.
 
+## Functional-Style Migration Gap (2026-02-14)
+- GAP-11 Training graph style mismatch:
+  - training path still defines wiring as imperative/scaffold `List.fold`, not operator-composed pipeline style like TorchSharp.Fun / DiffSharp examples.
+- GAP-12 No reusable functional operators for complex graph topology:
+  - branch/merge/residual composition is not represented as first-class training operators.
+- GAP-13 Training-path FP convention is not codified:
+  - no explicit contract describing accepted operator style (`->>`, `-->`) and how it maps to STE/Q4 blocks.
+
+## Additional Requirements (Functional-Style Training)
+- FR-19: Introduce a training-only functional composition module with pipeline operators (`->>`, `-->`) and reusable graph combinators.
+- FR-20: Refactor `Qwen3Model.forward` training path to build and execute the graph via operator composition (no OO-style training wiring helpers).
+- FR-21: Keep inference runtime behavior unchanged while migrating training-path graph style.
+- FR-22: Document TorchSharp.Fun/DiffSharp reference evaluation and chosen adaptation in `DevLog/SD/WBS`.
+
+## 功能式風格遷移缺口（2026-02-14）
+- GAP-11 訓練圖風格不一致：
+  - 訓練路徑目前仍是 imperative/scaffold 的 `List.fold`，非 TorchSharp.Fun / DiffSharp 那種 operator pipeline 形式。
+- GAP-12 缺少可重用的功能式複雜接線運算子：
+  - branch/merge/residual 還沒有被抽象成第一類訓練運算子。
+- GAP-13 訓練路徑 FP 規範未明確化：
+  - 尚未定義 `->>`、`-->` 這類 operator 與 STE/Q4 block 的對應規格。
+
+## 新增功能式訓練需求
+- FR-19：新增 training-only 的 functional composition 模組，提供 pipeline operator（`->>`, `-->`）與可重用圖組合子。
+- FR-20：重構 `Qwen3Model.forward` 訓練路徑，改為 operator 組線執行（不再使用 OO-style 訓練接線 helper）。
+- FR-21：遷移訓練風格時，推論 runtime 行為保持不變。
+- FR-22：將 TorchSharp.Fun/DiffSharp 參考評估與採用策略寫入 `DevLog/SD/WBS`。
+
 ## 訓練接線一致性缺口（2026-02-14）
 - GAP-08 訓練 forward 仍是 scaffold：
   - `Qwen3Model.forward` 目前仍為線性堆疊（`List.fold + linearSte`），不是完整 Transformer block。

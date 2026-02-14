@@ -11,6 +11,7 @@
     <Compile Include="Types.fs" />
     <Compile Include="Cli.fs" />
     <Compile Include="Nvfp4State.fs" />
+    <Compile Include="TrainingFunctional.fs" />
     <Compile Include="Qwen3Model.fs" />
     <Compile Include="InferenceBridge.fs" />
     <Compile Include="Trainer.fs" />

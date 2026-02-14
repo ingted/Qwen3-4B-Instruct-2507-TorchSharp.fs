@@ -637,3 +637,57 @@ let output = torch.nn.functional.linear(inputForCompute, weightForCompute) // fa
 
 ### Maintenance note
 - Canonical, standalone version is now maintained in `doc/NVFP4_DataPath.md` (EN + ZH, snippet-first).
+
+## 2026-02-14 (Functional training operator migration planning)
+### Context
+- User requested training graph wiring to adopt TorchSharp.Fun / DiffSharp-like functional operators:
+  - sequential style (`->>`)
+  - application style (`-->`)
+- Constraint: inference path must remain unchanged.
+
+### Reference review (cloned locally)
+- `https://github.com/fwaris/TorchSharp.Fun`
+  - reviewed `TorchSharp.Fun/TorchSharp.Fun.fs`
+  - key idea used: operator-driven stage composition (`->>`).
+- `https://github.com/diffsharp/DiffSharp`
+  - reviewed operator usage and docs examples (`-->`) for branch/merge friendly functional graph expression.
+
+### Design decision
+- Implement in-project minimal FP operator module for training path (`TrainingFunctional.fs`) instead of importing external full source.
+- Keep runtime semantics unchanged:
+  - no inference behavior change
+  - no quantization-path rewrite
+  - only wiring style migration for training graph.
+
+### Planned implementation
+- Add `TensorOp` and operators (`->>`, `-->`).
+- Add combinators (`chain`, `residual`, `parallel2`, `merge2`) for complex graph form.
+- Refactor `Qwen3Model.forward` to construct training graph with operators.
+- Validate with build + existing training/inference scripts.
+
+## 2026-02-14（訓練 functional operator 遷移規劃）
+### 背景
+- 使用者要求訓練圖接線改為 TorchSharp.Fun / DiffSharp 類型的功能式 operator：
+  - 串接風格（`->>`）
+  - 套用風格（`-->`）
+- 限制：推論路徑必須保持不變。
+
+### 參考評估（已本地 clone）
+- `https://github.com/fwaris/TorchSharp.Fun`
+  - 已審閱 `TorchSharp.Fun/TorchSharp.Fun.fs`
+  - 採用重點：operator 驅動的 stage composition（`->>`）。
+- `https://github.com/diffsharp/DiffSharp`
+  - 已審閱 `-->` 在 docs/examples 的使用方式，作為 branch/merge 形式參考。
+
+### 設計決策
+- 不直接整包匯入外部程式碼，改在專案內實作最小化訓練專用 FP operator 模組（`TrainingFunctional.fs`）。
+- runtime 語意不變：
+  - 推論行為不改
+  - 量化計算路徑不改
+  - 本次只做訓練圖「接線風格」遷移。
+
+### 預計實作
+- 新增 `TensorOp` 與 operators（`->>`, `-->`）。
+- 新增 combinators（`chain`, `residual`, `parallel2`, `merge2`）支援複雜接線。
+- 重構 `Qwen3Model.forward` 以 operator 組線執行。
+- 以 build + 既有訓練/推論腳本做驗證。

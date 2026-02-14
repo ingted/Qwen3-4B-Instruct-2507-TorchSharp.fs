@@ -34,6 +34,10 @@
 | WBS-28 | Refactor `Qwen3Model.forward` to full Qwen3 block wiring | `Qwen3Model.fs` | Pending |
 | WBS-29 | Add layer-wise hidden-state parity test (first divergence layer report) | `scripts/Tests.LayerParity.fsx` | Pending |
 | WBS-30 | Add logits parity acceptance test vs run2 baseline route | `scripts/Tests.LogitsParity.fsx` | Pending |
+| WBS-31 | Clone/review TorchSharp.Fun + DiffSharp for FP operator design | review note in `doc/DevLog.md` | Done |
+| WBS-32 | Add training functional operator module (`->>`, `-->`, combinators) | `TrainingFunctional.fs` | Pending |
+| WBS-33 | Refactor training wiring to operator pipeline style | `Qwen3Model.fs` | Pending |
+| WBS-34 | Verify no inference behavior change after training FP migration | build + smoke run logs | Pending |
 
 ## Milestones
 - M1: Docs and test framework complete (WBS-01~08).
@@ -42,6 +46,7 @@
 - M4: Runtime stability hardening baseline (WBS-18~21).
 - M5: Managed-UM runtime path baseline (WBS-22~25).
 - M6: Training/inference wiring parity foundation (WBS-26~30).
+- M7: Functional-style training graph migration baseline (WBS-31~34).
 
 ## 追蹤表
 
@@ -77,6 +82,10 @@
 | WBS-28 | 將 `Qwen3Model.forward` 重構為完整 Qwen3 block 接線 | `Qwen3Model.fs` | Pending |
 | WBS-29 | 新增 layer-wise hidden-state parity 測試（回報首個失真層） | `scripts/Tests.LayerParity.fsx` | Pending |
 | WBS-30 | 新增對 run2 基線路徑的 logits parity 驗收 | `scripts/Tests.LogitsParity.fsx` | Pending |
+| WBS-31 | clone/review TorchSharp.Fun + DiffSharp，完成 FP operator 設計評估 | `doc/DevLog.md` 評估紀錄 | Done |
+| WBS-32 | 新增訓練 functional operator 模組（`->>`, `-->`, combinators） | `TrainingFunctional.fs` | Pending |
+| WBS-33 | 將訓練接線重構為 operator pipeline 風格 | `Qwen3Model.fs` | Pending |
+| WBS-34 | 驗證訓練 FP 風格遷移後推論行為不變 | build + smoke log | Pending |
 
 ## 里程碑
 - M1: 文件與測試框架完整（WBS-01~08）。
@@ -85,3 +94,4 @@
 - M4: 執行期穩定性強化基線（WBS-18~21）。
 - M5: Managed-UM 執行路徑基線（WBS-22~25）。
 - M6: 訓練/推論接線一致性基線（WBS-26~30）。
+- M7: 訓練圖 functional-style 遷移基線（WBS-31~34）。

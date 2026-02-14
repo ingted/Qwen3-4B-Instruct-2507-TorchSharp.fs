@@ -4,6 +4,7 @@ open System
 open TorchSharp
 open TorchSharp.Modules
 open TorchSharp.Q4.Extension
+open Qwen3_4B_Instruct_2507_TorchSharp_fs.TrainingFunctional
 
 type Qwen3TrainableLayer =
   {
@@ -56,8 +57,11 @@ module Qwen3Model =
     : TorchSharp.torch.Tensor
     =
     let targetOutDtype = outDtype |> Option.defaultValue input.dtype
-    model.Layers
-    |> List.fold (fun x layer -> Nvfp4Training.linearSte x layer.MasterWeight targetOutDtype) input
+    let trainingGraph =
+      model.Layers
+      |> List.map (fun layer -> stage (linearSte layer.MasterWeight targetOutDtype))
+      |> chain
+    input --> trainingGraph
 
   let disposeSession (session: Q4Session) =
     match box session with

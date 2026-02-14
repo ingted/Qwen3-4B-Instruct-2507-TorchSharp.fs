@@ -311,3 +311,75 @@
 - `Qwen3Model.forward` 不再是 scaffold `List.fold + linearSte` 串接。
 - train/infer 皆共用同一份 block-forward。
 - layer-wise 與 logits parity 腳本在設定門檻內通過。
+
+## Functional Operator Design For Training Graph (2026-02-14)
+### Reference evaluation
+- Reviewed and cloned:
+  - `TorchSharp.Fun` (`TorchSharp.Fun.fs`): `->>`/`=>>` composition and module-to-model adaptation patterns.
+  - `DiffSharp`: `-->` operator usage for both model composition and tensor application.
+- Decision:
+  - Do not import full external source files into this repo.
+  - Implement a minimal training-focused FP operator layer in-project to avoid extra dependency surface.
+
+### New training-only module
+- `TrainingFunctional.fs` (new):
+  - Type aliases:
+    - `TensorOp = torch.Tensor -> torch.Tensor`
+  - Operators:
+    - `->>`: compose two `TensorOp` stages
+    - `-->`: apply tensor to `TensorOp`
+  - Graph combinators:
+    - `id`, `stage`, `chain`
+    - `residual` (for skip connection form)
+    - `parallel2` + `merge2` (for branch/merge form)
+  - NVFP4 adapters:
+    - `linearSte weight outDtype : TensorOp`
+
+### Integration strategy
+- Keep inference files unchanged.
+- Migrate `Qwen3Model.forward` training path to:
+  - build stage list (`linearSte` per trainable layer)
+  - compose via `->>` / `chain`
+  - execute via `input --> trainingGraph`
+- Keep autograd behavior unchanged (functional style only, no numerical-path rewrite).
+
+### Acceptance checks
+- `Qwen3Model.forward` has no scaffold `List.fold` wiring.
+- Training path uses `TrainingFunctional` operators explicitly.
+- Build succeeds and existing training scripts still run.
+
+## 訓練圖 Functional Operator 設計（2026-02-14）
+### 參考評估
+- 已 clone 並審閱：
+  - `TorchSharp.Fun`（`TorchSharp.Fun.fs`）：`->>`/`=>>` 的組線與 module 適配模式。
+  - `DiffSharp`：`-->` 在 model 組線與 tensor 套用上的語意。
+- 決策：
+  - 不直接整包引入外部原始碼到本專案。
+  - 在專案內實作最小化、訓練專用的 FP operator 層，降低依賴面與維護風險。
+
+### 新增訓練專用模組
+- `TrainingFunctional.fs`（新檔）：
+  - 型別別名：
+    - `TensorOp = torch.Tensor -> torch.Tensor`
+  - Operators：
+    - `->>`：組合兩個 `TensorOp` 階段
+    - `-->`：將 tensor 套用到 `TensorOp`
+  - 圖組合子：
+    - `id`, `stage`, `chain`
+    - `residual`（skip connection 形式）
+    - `parallel2` + `merge2`（branch/merge 形式）
+  - NVFP4 適配器：
+    - `linearSte weight outDtype : TensorOp`
+
+### 整合策略
+- 推論檔案不改。
+- `Qwen3Model.forward` 訓練路徑改為：
+  - 建立 stage 清單（每層 `linearSte`）
+  - 用 `->>` / `chain` 組線
+  - 以 `input --> trainingGraph` 執行
+- 保持 autograd 行為不變（僅改風格，不改數值路徑）。
+
+### 驗收檢查
+- `Qwen3Model.forward` 不再使用 scaffold `List.fold` 接線。
+- 訓練路徑明確使用 `TrainingFunctional` operators。
+- build 通過，既有訓練腳本可執行。
