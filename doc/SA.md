@@ -143,3 +143,31 @@ The current scaffold can be iterated directly, with priority on real parser and 
 - FR-12：在 `TS_Q4_DISABLE_UM=0` 下，持久推論 tensors 必須經 managed allocator 升級。
 - FR-13：runtime init 必須輸出 raw tensor 的 managed 覆蓋率診斷。
 - FR-14：UM 關閉時維持既有行為（相容性優先）。
+
+## Training-Wiring Parity Gap (2026-02-14)
+- GAP-08 Training forward is still scaffold-only:
+  - `Qwen3Model.forward` currently uses linear stack (`List.fold + linearSte`) instead of full Transformer block wiring.
+- GAP-09 Train/Infer graph drift risk:
+  - inference uses Qwen3-like block wiring in `InferenceBridge`, but training path does not share the same block implementation.
+- GAP-10 Inference runtime still differs from official C# pipeline:
+  - session-level KVC bookkeeping, template/stop handling, and generation lifecycle are not fully unified with `run2` path.
+
+## Additional Requirements (Training/Parity)
+- FR-15: Training forward path must adopt full Qwen3 block wiring (`q/k/v/o`, RoPE, SDPA, RMSNorm, MLP gate/up/down, residual).
+- FR-16: Build one shared block-forward core used by both training and inference to prevent semantic drift.
+- FR-17: Add layer-wise hidden-state parity test to detect first divergence layer.
+- FR-18: Add final logits parity acceptance check (same prompt/seed/dtype/weights) against run2 baseline behavior.
+
+## 訓練接線一致性缺口（2026-02-14）
+- GAP-08 訓練 forward 仍是 scaffold：
+  - `Qwen3Model.forward` 目前仍為線性堆疊（`List.fold + linearSte`），不是完整 Transformer block。
+- GAP-09 Train/Infer 圖存在漂移風險：
+  - 推論在 `InferenceBridge` 已是 Qwen3-like block，但訓練路徑尚未共用同一份 block 實作。
+- GAP-10 推論 runtime 仍與官方 C# pipeline 有差異：
+  - session 級 KVC bookkeeping、template/stop 處理與 generation lifecycle 尚未完全同構 `run2` 路徑。
+
+## 新增訓練/一致性需求
+- FR-15：訓練 forward 必須改為完整 Qwen3 block 接線（`q/k/v/o`, RoPE, SDPA, RMSNorm, MLP gate/up/down, residual）。
+- FR-16：建立 train/infer 共用 block-forward core，避免語意漂移。
+- FR-17：新增 layer-wise hidden-state parity 測試，定位第一個失真層。
+- FR-18：新增最終 logits parity 驗收（同 prompt/seed/dtype/weights），對照 run2 基線行為。

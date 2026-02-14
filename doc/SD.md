@@ -241,3 +241,73 @@
 - 降低 init 階段配置尖峰。
 - 降低 allocator fragmentation 壓力與間歇性 native crash 機率。
 - 減少 `.dat` 掃描次數，加快初始化。
+
+## Training Wiring Parity Design (2026-02-14)
+### Goal
+- Replace scaffold training forward with full Qwen3 block wiring and keep training/inference graph semantics aligned.
+
+### Design
+- Introduce shared block-forward module (new logical component):
+  - `Qwen3Core.ForwardBlock(...)`
+  - Inputs:
+    - hidden states
+    - layer projection handles (`q/k/v/o`, `gate/up/down`)
+    - norm tensors (`input/post/q/k norm`)
+    - config (`heads`, `kv_heads`, `head_dim`, `rope_theta`, `rms_eps`)
+  - Output:
+    - next hidden states
+- `InferenceBridge` and `Qwen3Model` both call the same block-forward core.
+- Training-specific behavior:
+  - keep master trainable weights and STE quant/dequant path.
+  - preserve autograd graph in training mode.
+- Inference-specific behavior:
+  - use `torch.no_grad()` and existing generation APIs.
+
+### Parity Validation Plan
+1. Structural parity:
+   - assert each layer has required projections and norm tensors.
+2. Layer-wise parity:
+   - compare hidden states after each block (`max_abs`, `mean_abs`, `cosine`).
+   - report first layer index exceeding threshold.
+3. Logits parity:
+   - compare final logits/top-k under fixed prompt + seed.
+
+### Acceptance
+- `Qwen3Model.forward` no longer uses scaffold `List.fold + linearSte` chain.
+- Shared block-forward is used by both training and inference paths.
+- Layer-wise and logits parity scripts report pass within configured tolerance.
+
+## 訓練接線一致性設計（2026-02-14）
+### 目標
+- 以完整 Qwen3 block 接線取代訓練 scaffold forward，並讓 train/infer 圖語意對齊。
+
+### 設計
+- 新增 shared block-forward 模組（邏輯元件）：
+  - `Qwen3Core.ForwardBlock(...)`
+  - 輸入：
+    - hidden states
+    - 各層投影句柄（`q/k/v/o`, `gate/up/down`）
+    - norm tensors（`input/post/q/k norm`）
+    - config（`heads`, `kv_heads`, `head_dim`, `rope_theta`, `rms_eps`）
+  - 輸出：
+    - 下一層 hidden states
+- `InferenceBridge` 與 `Qwen3Model` 都改呼叫同一份 block-forward core。
+- 訓練特化行為：
+  - 保留 master trainable weights 與 STE quant/dequant 路徑。
+  - 訓練模式保留 autograd graph。
+- 推論特化行為：
+  - 使用 `torch.no_grad()` 與既有生成 API。
+
+### 一致性驗證計畫
+1. 結構一致性：
+   - 驗證每層是否具備必要 projection 與 norm tensors。
+2. Layer-wise 一致性：
+   - 比較每層 hidden state（`max_abs`, `mean_abs`, `cosine`）。
+   - 回報第一個超門檻層。
+3. Logits 一致性：
+   - 固定 prompt + seed，比較最終 logits/top-k。
+
+### 驗收標準
+- `Qwen3Model.forward` 不再是 scaffold `List.fold + linearSte` 串接。
+- train/infer 皆共用同一份 block-forward。
+- layer-wise 與 logits parity 腳本在設定門檻內通過。
