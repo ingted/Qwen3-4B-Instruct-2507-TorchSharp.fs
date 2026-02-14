@@ -1,0 +1,34 @@
+› 0. 請參考此程式碼 https://github.com/fwaris/TorchSharp.Fun/blob/master/TorchSharp.Fun/TorchSharp.Fun.fs
+  1. https://github.com/fwaris/TorchSharp.Fun  README 的概念是
+  let model =
+      torch.nn.EmbeddingBag(EMB_INDX_DIM,EMB_DIM)
+      ->> torch.nn.Linear(EMB_DIM,BTL_N)
+      ->> lisht()
+      ->> torch.nn.Dropout(0.1)
+      ->> torch.nn.Linear(BTL_N,BTL_N)
+      ->> lisht()
+      ->> torch.nn.Dropout(0.1)
+      ->> torch.nn.Linear(BTL_N,BASE_TGTS)
+
+  2. 將 Qwen3-4B-Instruct-2507-TorchSharp.fs 專案的訓練模型 layer 連接改上述的方式，如果有更複雜的連接形式，請再參考 https://diffsharp.github.io/
+  3. 關於 2. 有更複雜的連接情況請引入 functional style 形式的 operator，長相類似 DiffSharp 的
+  let encoder =
+      Conv2d(1, 32, 4, 2)
+      --> dsharp.relu
+      --> Conv2d(32, 64, 4, 2)
+      --> dsharp.relu
+      --> Conv2d(64, 128, 4, 2)
+      --> dsharp.flatten(1)
+
+  let decoder =
+      dsharp.unflatten(1, [128;1;1])
+      --> ConvTranspose2d(128, 64, 4, 2)
+      --> dsharp.relu
+      --> ConvTranspose2d(64, 32, 4, 3)
+      --> dsharp.relu
+      --> ConvTranspose2d(32, 1, 4, 2)
+      --> dsharp.sigmoid
+  4. 原先推論部分不用改變，訓練部分請不要再有 OO 風格，請 code review 把訓練部分的 oo 風都改成 fp 風
+  5. 如果要引入 TorchSharp.Fun.fs 或者從 DiffSharp 專案複製程式碼檔案，請記得 clone
+  6. 關於 5. 對應的文件也都請更新 (建議先 clone -> code review -> evaluation -> 確認變更設計 -> 新 SD -> WBS -> 開工)
+  7. 有問題先問
