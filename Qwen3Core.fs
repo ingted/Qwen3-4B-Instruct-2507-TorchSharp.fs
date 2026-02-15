@@ -162,7 +162,7 @@ module Qwen3Core =
     let vhAttn = match vhAttnTemp with | Some t -> t | None -> vh
 
     use ctxHeads = torch.nn.functional.scaled_dot_product_attention(qhRope, khAttn, vhAttn, is_casual = true)
-    use ctx =
+    let ctx =
       ctxHeads
         .transpose(1L, 2L)
         .contiguous()
