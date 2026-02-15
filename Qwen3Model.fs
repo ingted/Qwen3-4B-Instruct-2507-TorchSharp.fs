@@ -97,9 +97,9 @@ module Qwen3Model =
     if model.Blocks.IsEmpty then
       let trainingGraph =
         model.Layers
-        |> List.map (fun layer -> stage (linearSte layer.MasterWeight targetOutDtype))
-        |> chain
-      input --> trainingGraph
+        |> List.map (fun layer -> stageM (sprintf "layer.%s.linear_ste" layer.Name) (linearSte layer.MasterWeight targetOutDtype))
+        |> chainM
+      runM trainingGraph input
     else
       let forwardBlock (hidden: torch.Tensor) (block: Qwen3TrainableBlock) =
         let cfg : Qwen3Core.CoreConfig =
@@ -132,7 +132,7 @@ module Qwen3Model =
           }
 
         let blockGraph = Qwen3Core.buildBlockGraphNoCache cfg norms projs 0L
-        hidden --> blockGraph
+        runM blockGraph hidden
 
       let hidden0, squeezeBack =
         if input.shape.Length = 2 then

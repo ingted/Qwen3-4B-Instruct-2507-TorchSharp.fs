@@ -20,13 +20,14 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="FAkka.TorchSharp.DGX" Version="26.1.0-py3.7" />
+    <PackageReference Include="FAkka.TorchSharp.DGX" Version="26.1.0-py3.8" />
     <PackageReference Include="Tokenizers.DotNet" Version="1.3.0" />
     <PackageReference Include="Tokenizers.DotNet.runtime.linux-arm64" Version="1.3.0" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="../TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension/TorchSharp.Q4.Extension.fsproj" />
+    <ProjectReference Include="../TorchSharp.Fun.DGX/TorchSharp.Fun.DGX/TorchSharp.Fun.DGX.fsproj" />
   </ItemGroup>
 
 </Project>

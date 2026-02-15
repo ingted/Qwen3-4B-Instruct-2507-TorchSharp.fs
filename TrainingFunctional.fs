@@ -1,12 +1,14 @@
 namespace Qwen3_4B_Instruct_2507_TorchSharp_fs
 
 open TorchSharp
+open TorchSharp.Fun.DGX
 
 module TrainingFunctional =
   type Op<'a, 'b> = 'a -> 'b
   type TensorOp = torch.Tensor -> torch.Tensor
   type TensorPairOp = torch.Tensor -> torch.Tensor * torch.Tensor
   type TensorTripleOp = torch.Tensor -> torch.Tensor * torch.Tensor * torch.Tensor
+  type Stage = IModel
 
   let id : TensorOp = fun x -> x
 
@@ -53,3 +55,22 @@ module TrainingFunctional =
 
   let linearSte (weight: TorchSharp.Modules.Parameter) (outDtype: torch.ScalarType) : TensorOp =
     fun input -> TorchSharp.Q4.Extension.Nvfp4Training.linearSte input weight outDtype
+
+  let stageM (name: string) (f: TensorOp) : Stage =
+    F [ name ] [] f
+
+  let composeM (lhs: Stage) (rhs: Stage) : Stage =
+    lhs =>> (rhs.Module.GetName(), rhs)
+
+  let chainM (stages: Stage list) : Stage =
+    match stages with
+    | [] -> stageM "identity" id
+    | head :: tail -> tail |> List.fold (fun acc s -> composeM acc s) head
+
+  let runM (model: Stage) (input: torch.Tensor) : torch.Tensor =
+    model.forward input
+
+  let residualM (name: string) (block: Stage) : Stage =
+    Fx [ name; $"{name}.block" ] [ box block ] (fun (input, args) ->
+      use output = block.forward input
+      output + input, args)

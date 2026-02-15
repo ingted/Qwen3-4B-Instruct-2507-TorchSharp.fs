@@ -139,28 +139,35 @@ module Qwen3Core =
     (norms: BlockNorms)
     (projs: BlockProjections)
     (positionOffset: int64)
-    : TensorOp
+    : Stage
     =
-    let inputNormOp = stage (fun hidden -> rmsNormWeighted hidden norms.InputNorm cfg.RmsNormEps)
-    let qProjOp = stage projs.QProj
-    let kProjOp = stage projs.KProj
-    let vProjOp = stage projs.VProj
+    let inputNormOp =
+      stageM "block.input_norm" (fun hidden -> rmsNormWeighted hidden norms.InputNorm cfg.RmsNormEps)
 
-    let qkvBranch = parallel3 qProjOp kProjOp vProjOp
-    let attnOutOp = merge3 (fun q k v -> attentionOutFromQkv cfg norms projs positionOffset q k v) qkvBranch
-    let attnMain = inputNormOp ->> attnOutOp
-    let attnResidual = residual attnMain
+    let attnQkvMergeOp =
+      stageM "block.attn.qkv_merge" (fun hiddenNorm ->
+        use q = projs.QProj hiddenNorm
+        use k = projs.KProj hiddenNorm
+        use v = projs.VProj hiddenNorm
+        attentionOutFromQkv cfg norms projs positionOffset q k v)
 
-    let postNormOp = stage (fun hidden -> rmsNormWeighted hidden norms.PostAttnNorm cfg.RmsNormEps)
-    let gateProjOp = stage projs.GateProj
-    let upProjOp = stage projs.UpProj
-    let gateUpBranch = parallel2 gateProjOp upProjOp
-    let activationMerge = merge2 (fun gate up -> torch.nn.functional.silu(gate) * up) gateUpBranch
-    let downProjOp = stage projs.DownProj
-    let mlpMain = postNormOp ->> activationMerge ->> downProjOp
-    let mlpResidual = residual mlpMain
+    let attnMain = chainM [ inputNormOp; attnQkvMergeOp ]
+    let attnResidual = residualM "block.attn.residual" attnMain
 
-    attnResidual ->> mlpResidual
+    let postNormOp =
+      stageM "block.post_attn_norm" (fun hidden -> rmsNormWeighted hidden norms.PostAttnNorm cfg.RmsNormEps)
+
+    let gateUpMergeOp =
+      stageM "block.mlp.gate_up_merge" (fun hiddenNorm ->
+        use gate = projs.GateProj hiddenNorm
+        use up = projs.UpProj hiddenNorm
+        torch.nn.functional.silu(gate) * up)
+
+    let downProjOp = stageM "block.mlp.down_proj" projs.DownProj
+    let mlpMain = chainM [ postNormOp; gateUpMergeOp; downProjOp ]
+    let mlpResidual = residualM "block.mlp.residual" mlpMain
+
+    chainM [ attnResidual; mlpResidual ]
 
   let forwardBlockNoCache
     (cfg: CoreConfig)
@@ -170,4 +177,4 @@ module Qwen3Core =
     (positionOffset: int64)
     =
     let blockGraph = buildBlockGraphNoCache cfg norms projs positionOffset
-    hidden --> blockGraph
+    runM blockGraph hidden
