@@ -22,6 +22,11 @@ module TrainingFunctional =
   let chain (ops: TensorOp list) : TensorOp =
     ops |> List.fold (fun acc op -> acc ->> op) id
 
+  let inline idOp (x: 'a) : 'a = x
+
+  let chainOp (ops: Op<'a, 'a> list) : Op<'a, 'a> =
+    ops |> List.fold (fun acc op -> acc ->> op) idOp
+
   let residual (block: TensorOp) : TensorOp =
     fun input ->
       let output = block input

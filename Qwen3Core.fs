@@ -1,5 +1,6 @@
 namespace Qwen3_4B_Instruct_2507_TorchSharp_fs
 
+open System
 open TorchSharp
 open Qwen3_4B_Instruct_2507_TorchSharp_fs.TrainingFunctional
 
@@ -32,6 +33,44 @@ module Qwen3Core =
       UpProj: torch.Tensor -> torch.Tensor
       DownProj: torch.Tensor -> torch.Tensor
     }
+
+  type BlockRuntimeState =
+    {
+      Hidden: torch.Tensor
+      InputNormed: torch.Tensor option
+      Q: torch.Tensor option
+      K: torch.Tensor option
+      V: torch.Tensor option
+      AttnOut: torch.Tensor option
+      PostNormed: torch.Tensor option
+      Gate: torch.Tensor option
+      Up: torch.Tensor option
+      MlpMixed: torch.Tensor option
+      MlpOut: torch.Tensor option
+    }
+
+  let newBlockRuntimeState (hidden: torch.Tensor) =
+    {
+      Hidden = hidden
+      InputNormed = None
+      Q = None
+      K = None
+      V = None
+      AttnOut = None
+      PostNormed = None
+      Gate = None
+      Up = None
+      MlpMixed = None
+      MlpOut = None
+    }
+
+  let disposeOpt (t: torch.Tensor option) =
+    t |> Option.iter (fun x -> x.Dispose())
+
+  let requireTensor (name: string) (t: torch.Tensor option) =
+    match t with
+    | Some x -> x
+    | None -> raise (InvalidOperationException(sprintf "Block graph state missing required tensor: %s" name))
 
   let rmsNorm (x: torch.Tensor) (eps: float) =
     let dtype = x.dtype
@@ -141,33 +180,142 @@ module Qwen3Core =
     (positionOffset: int64)
     : Stage
     =
-    let inputNormOp =
-      stageM "block.input_norm" (fun hidden -> rmsNormWeighted hidden norms.InputNorm cfg.RmsNormEps)
+    let inputNormStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        disposeOpt s.InputNormed
+        let xNorm = rmsNormWeighted s.Hidden norms.InputNorm cfg.RmsNormEps
+        { s with InputNormed = Some xNorm }
 
-    let attnQkvMergeOp =
-      stageM "block.attn.qkv_merge" (fun hiddenNorm ->
-        use q = projs.QProj hiddenNorm
-        use k = projs.KProj hiddenNorm
-        use v = projs.VProj hiddenNorm
-        attentionOutFromQkv cfg norms projs positionOffset q k v)
+    let qProjStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        let xNorm = requireTensor "InputNormed" s.InputNormed
+        disposeOpt s.Q
+        let q = projs.QProj xNorm
+        { s with Q = Some q }
 
-    let attnMain = chainM [ inputNormOp; attnQkvMergeOp ]
-    let attnResidual = residualM "block.attn.residual" attnMain
+    let kProjStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        let xNorm = requireTensor "InputNormed" s.InputNormed
+        disposeOpt s.K
+        let k = projs.KProj xNorm
+        { s with K = Some k }
 
-    let postNormOp =
-      stageM "block.post_attn_norm" (fun hidden -> rmsNormWeighted hidden norms.PostAttnNorm cfg.RmsNormEps)
+    let vProjStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        let xNorm = requireTensor "InputNormed" s.InputNormed
+        disposeOpt s.V
+        let v = projs.VProj xNorm
+        { s with V = Some v }
 
-    let gateUpMergeOp =
-      stageM "block.mlp.gate_up_merge" (fun hiddenNorm ->
-        use gate = projs.GateProj hiddenNorm
-        use up = projs.UpProj hiddenNorm
-        torch.nn.functional.silu(gate) * up)
+    let attnMergeStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        let q = requireTensor "Q" s.Q
+        let k = requireTensor "K" s.K
+        let v = requireTensor "V" s.V
+        disposeOpt s.AttnOut
+        let attnOut = attentionOutFromQkv cfg norms projs positionOffset q k v
+        disposeOpt s.Q
+        disposeOpt s.K
+        disposeOpt s.V
+        disposeOpt s.InputNormed
+        {
+          s with
+              InputNormed = None
+              Q = None
+              K = None
+              V = None
+              AttnOut = Some attnOut
+        }
 
-    let downProjOp = stageM "block.mlp.down_proj" projs.DownProj
-    let mlpMain = chainM [ postNormOp; gateUpMergeOp; downProjOp ]
-    let mlpResidual = residualM "block.mlp.residual" mlpMain
+    let attnResidualStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        let attnOut = requireTensor "AttnOut" s.AttnOut
+        let nextHidden = attnOut + s.Hidden
+        disposeOpt s.AttnOut
+        { s with Hidden = nextHidden; AttnOut = None }
 
-    chainM [ attnResidual; mlpResidual ]
+    let postNormStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        disposeOpt s.PostNormed
+        let post = rmsNormWeighted s.Hidden norms.PostAttnNorm cfg.RmsNormEps
+        { s with PostNormed = Some post }
+
+    let gateProjStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        let post = requireTensor "PostNormed" s.PostNormed
+        disposeOpt s.Gate
+        let gate = projs.GateProj post
+        { s with Gate = Some gate }
+
+    let upProjStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        let post = requireTensor "PostNormed" s.PostNormed
+        disposeOpt s.Up
+        let up = projs.UpProj post
+        { s with Up = Some up }
+
+    let mlpMergeStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        let gate = requireTensor "Gate" s.Gate
+        let up = requireTensor "Up" s.Up
+        disposeOpt s.MlpMixed
+        let mixed = torch.nn.functional.silu(gate) * up
+        disposeOpt s.Gate
+        disposeOpt s.Up
+        disposeOpt s.PostNormed
+        {
+          s with
+              PostNormed = None
+              Gate = None
+              Up = None
+              MlpMixed = Some mixed
+        }
+
+    let downProjStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        let mixed = requireTensor "MlpMixed" s.MlpMixed
+        disposeOpt s.MlpOut
+        let mlpOut = projs.DownProj mixed
+        disposeOpt s.MlpMixed
+        { s with MlpMixed = None; MlpOut = Some mlpOut }
+
+    let mlpResidualStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        let mlpOut = requireTensor "MlpOut" s.MlpOut
+        let nextHidden = mlpOut + s.Hidden
+        disposeOpt s.MlpOut
+        { s with Hidden = nextHidden; MlpOut = None }
+
+    let blockStateGraph : Op<BlockRuntimeState, BlockRuntimeState> =
+      chainOp
+        [
+          inputNormStage
+          qProjStage
+          kProjStage
+          vProjStage
+          attnMergeStage
+          attnResidualStage
+          postNormStage
+          gateProjStage
+          upProjStage
+          mlpMergeStage
+          downProjStage
+          mlpResidualStage
+        ]
+
+    stageM "block.graph" (fun hidden ->
+      let finalState = newBlockRuntimeState hidden --> blockStateGraph
+      disposeOpt finalState.InputNormed
+      disposeOpt finalState.Q
+      disposeOpt finalState.K
+      disposeOpt finalState.V
+      disposeOpt finalState.AttnOut
+      disposeOpt finalState.PostNormed
+      disposeOpt finalState.Gate
+      disposeOpt finalState.Up
+      disposeOpt finalState.MlpMixed
+      disposeOpt finalState.MlpOut
+      finalState.Hidden)
 
   let forwardBlockNoCache
     (cfg: CoreConfig)
