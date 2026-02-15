@@ -117,7 +117,7 @@ module Qwen3Core =
       .expand([| batchSize; int64 numKvHeads; int64 repeatFactor; seqLen; headDim |])
       .reshape([| batchSize; int64 numHeads; seqLen; headDim |])
 
-  let attentionOutFromQkv
+  let attentionContextFromQkv
     (cfg: CoreConfig)
     (norms: BlockNorms)
     (projs: BlockProjections)
@@ -171,7 +171,7 @@ module Qwen3Core =
     khAttnTemp |> Option.iter (fun t -> t.Dispose())
     vhAttnTemp |> Option.iter (fun t -> t.Dispose())
 
-    projs.OProj ctx
+    ctx
 
   let buildBlockGraphNoCache
     (cfg: CoreConfig)
@@ -213,7 +213,7 @@ module Qwen3Core =
         let k = requireTensor "K" s.K
         let v = requireTensor "V" s.V
         disposeOpt s.AttnOut
-        let attnOut = attentionOutFromQkv cfg norms projs positionOffset q k v
+        let attnCtx = attentionContextFromQkv cfg norms projs positionOffset q k v
         disposeOpt s.Q
         disposeOpt s.K
         disposeOpt s.V
@@ -224,8 +224,15 @@ module Qwen3Core =
               Q = None
               K = None
               V = None
-              AttnOut = Some attnOut
+              AttnOut = Some attnCtx
         }
+
+    let oProjStage : Op<BlockRuntimeState, BlockRuntimeState> =
+      fun s ->
+        let attnCtx = requireTensor "AttnOut" s.AttnOut
+        let attnOut = projs.OProj attnCtx
+        disposeOpt s.AttnOut
+        { s with AttnOut = Some attnOut }
 
     let attnResidualStage : Op<BlockRuntimeState, BlockRuntimeState> =
       fun s ->
@@ -294,6 +301,7 @@ module Qwen3Core =
           kProjStage
           vProjStage
           attnMergeStage
+          oProjStage
           attnResidualStage
           postNormStage
           gateProjStage
