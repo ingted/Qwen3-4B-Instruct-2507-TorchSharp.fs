@@ -352,36 +352,62 @@ module InferenceBridge =
     session.EmbedTokens.index_select(0L, tokenTensor).unsqueeze(0L).contiguous()
 
   let forwardLayer (session: InferenceSession) (layer: LayerWeights) (hidden: torch.Tensor) =
-    let cfg : Qwen3Core.CoreConfig =
-      {
-        NumAttentionHeads = session.Config.NumAttentionHeads
-        NumKeyValueHeads = session.Config.NumKeyValueHeads
-        HeadDim = session.Config.HeadDim
-        RopeTheta = session.Config.RopeTheta
-        RmsNormEps = session.Config.RmsNormEps
-        DType = session.DType
-      }
+    let numHeads = session.Config.NumAttentionHeads
+    let numKvHeads = session.Config.NumKeyValueHeads
+    let headDim = session.Config.HeadDim
+    let batchSize = hidden.shape.[0]
+    let seqLen = hidden.shape.[1]
 
-    let norms : Qwen3Core.BlockNorms =
-      {
-        InputNorm = layer.InputNorm
-        PostAttnNorm = layer.PostAttnNorm
-        QNorm = layer.QNorm
-        KNorm = layer.KNorm
-      }
+    use normed0 = rmsNormWeighted hidden layer.InputNorm session.Config.RmsNormEps
+    use q = linearQ4 normed0 layer.QProj session.DType
+    use k = linearQ4 normed0 layer.KProj session.DType
+    use v = linearQ4 normed0 layer.VProj session.DType
 
-    let projs : Qwen3Core.BlockProjections =
-      {
-        QProj = (fun x -> linearQ4 x layer.QProj session.DType)
-        KProj = (fun x -> linearQ4 x layer.KProj session.DType)
-        VProj = (fun x -> linearQ4 x layer.VProj session.DType)
-        OProj = (fun x -> linearQ4 x layer.OProj session.DType)
-        GateProj = (fun x -> linearQ4 x layer.GateProj session.DType)
-        UpProj = (fun x -> linearQ4 x layer.UpProj session.DType)
-        DownProj = (fun x -> linearQ4 x layer.DownProj session.DType)
-      }
+    use qh =
+      q
+        .reshape([| batchSize; seqLen; int64 numHeads; int64 headDim |])
+        .transpose(1L, 2L)
+        .contiguous()
 
-    Qwen3Core.forwardBlockNoCache cfg norms projs hidden 0L
+    use kh0 =
+      k
+        .reshape([| batchSize; seqLen; int64 numKvHeads; int64 headDim |])
+        .transpose(1L, 2L)
+        .contiguous()
+
+    use vh0 =
+      v
+        .reshape([| batchSize; seqLen; int64 numKvHeads; int64 headDim |])
+        .transpose(1L, 2L)
+        .contiguous()
+
+    use qhNorm = rmsNormWeighted (qh.transpose(1L, 2L)) layer.QNorm session.Config.RmsNormEps
+    use kh0Norm = rmsNormWeighted (kh0.transpose(1L, 2L)) layer.KNorm session.Config.RmsNormEps
+    use qhNormT = qhNorm.transpose(1L, 2L).contiguous()
+    use kh0NormT = kh0Norm.transpose(1L, 2L).contiguous()
+    use qhRope = applyRoPE qhNormT session.Config.RopeTheta 0L
+    use kh0Rope = applyRoPE kh0NormT session.Config.RopeTheta 0L
+    use kh = expandKvHeads numHeads numKvHeads kh0Rope
+    use vh = expandKvHeads numHeads numKvHeads vh0
+
+    use ctxHeads = torch.nn.functional.scaled_dot_product_attention(qhRope, kh, vh, is_casual = true)
+    use ctx =
+      ctxHeads
+        .transpose(1L, 2L)
+        .contiguous()
+        .reshape([| batchSize; seqLen; int64 (numHeads * headDim) |])
+
+    use attnOut = linearQ4 ctx layer.OProj session.DType
+    let resid1 = (hidden + attnOut).contiguous()
+
+    use normed1 = rmsNormWeighted resid1 layer.PostAttnNorm session.Config.RmsNormEps
+    use gate = linearQ4 normed1 layer.GateProj session.DType
+    use up = linearQ4 normed1 layer.UpProj session.DType
+    use act = torch.nn.functional.silu(gate) * up
+    use down = linearQ4 act layer.DownProj session.DType
+    let resid2 = (resid1 + down).contiguous()
+    resid1.Dispose()
+    resid2
 
   let forwardModel (session: InferenceSession) (tokenIds: int array) =
     let mutable hidden = buildTokenEmbeddings session tokenIds
@@ -834,6 +860,70 @@ module InferenceBridge =
     | _ -> ()
 
     decodeTokens session.Tokenizer (generated |> Seq.toList)
+
+  let generateFromTokensWithStopTokensKvCache
+    (session: InferenceSession)
+    (cache: InferenceKvCache)
+    (inputIds: int array)
+    (opt: InferenceGenOptions)
+    (stopTokens: int list)
+    (prefillMode: KvPrefillMode)
+    =
+    use _noGrad = torch.no_grad()
+
+    if inputIds.Length = 0 then
+      invalidOp "inputIds sequence is empty"
+
+    let generated = ResizeArray<int>(max 1 opt.MaxTokens)
+    let targetSteps = max 1 opt.MaxTokens
+    let stopSet = stopTokens |> Set.ofList
+    let mutable step = 0
+    let mutable stop = false
+
+    match opt.Seed with
+    | Some s when s >= 0 -> torch.manual_seed(int64 s) |> ignore
+    | _ -> ()
+
+    let mutable nextId =
+      use prefillHidden =
+        match prefillMode with
+        | PromptByPrompt ->
+          forwardModelWithCache session cache inputIds
+        | TokenByToken ->
+          let mutable lastHidden: torch.Tensor option = None
+          for tokenId in inputIds do
+            lastHidden |> Option.iter (fun t -> t.Dispose())
+            lastHidden <- Some (forwardModelWithCache session cache [| tokenId |])
+          match lastHidden with
+          | Some h -> h
+          | None -> invalidOp "token-by-token prefill produced no hidden state"
+      selectNextTokenId session prefillHidden opt.Temperature opt.TopP
+
+    while step < targetSteps && not stop do
+      if stopSet.Contains(nextId) then
+        stop <- true
+      else
+        generated.Add(nextId)
+        step <- step + 1
+        if step < targetSteps then
+          use hidden = forwardModelWithCache session cache [| nextId |]
+          nextId <- selectNextTokenId session hidden opt.Temperature opt.TopP
+
+    decodeTokens session.Tokenizer (generated |> Seq.toList)
+
+  let generateFromRenderedPromptWithStopTokensKvCachePersistent
+    (session: InferenceSession)
+    (cache: InferenceKvCache)
+    (renderedPrompt: string)
+    (opt: InferenceGenOptions)
+    (stopTokens: int list)
+    (prefillMode: KvPrefillMode)
+    =
+    let inputIds =
+      session.Tokenizer.Encode(renderedPrompt)
+      |> Seq.map int
+      |> Seq.toArray
+    generateFromTokensWithStopTokensKvCache session cache inputIds opt stopTokens prefillMode
 
   let generateFromRenderedPromptWithKvCache
     (session: InferenceSession)
