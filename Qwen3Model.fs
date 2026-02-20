@@ -94,6 +94,39 @@ module Qwen3Model =
     : TorchSharp.torch.Tensor
     =
     let targetOutDtype = outDtype |> Option.defaultValue input.dtype
+
+    let blockToStage (block: Qwen3TrainableBlock) =
+      let cfg : Qwen3Core.CoreConfig =
+        {
+          NumAttentionHeads = block.NumAttentionHeads
+          NumKeyValueHeads = block.NumKeyValueHeads
+          HeadDim = block.HeadDim
+          RopeTheta = 1e6
+          RmsNormEps = 1e-6
+          DType = targetOutDtype
+        }
+
+      let norms : Qwen3Core.BlockNorms =
+        {
+          InputNorm = block.InputNorm
+          PostAttnNorm = block.PostAttnNorm
+          QNorm = block.QNorm
+          KNorm = block.KNorm
+        }
+
+      let projs : Qwen3Core.BlockProjections =
+        {
+          QProj = (fun x -> Nvfp4Training.linearSte x block.QProj targetOutDtype)
+          KProj = (fun x -> Nvfp4Training.linearSte x block.KProj targetOutDtype)
+          VProj = (fun x -> Nvfp4Training.linearSte x block.VProj targetOutDtype)
+          OProj = (fun x -> Nvfp4Training.linearSte x block.OProj targetOutDtype)
+          GateProj = (fun x -> Nvfp4Training.linearSte x block.GateProj targetOutDtype)
+          UpProj = (fun x -> Nvfp4Training.linearSte x block.UpProj targetOutDtype)
+          DownProj = (fun x -> Nvfp4Training.linearSte x block.DownProj targetOutDtype)
+        }
+
+      Qwen3Core.buildBlockGraphNoCache cfg norms projs 0L
+
     if model.Blocks.IsEmpty then
       let trainingGraph =
         model.Layers
@@ -101,38 +134,7 @@ module Qwen3Model =
         |> chainM
       runM trainingGraph input
     else
-      let forwardBlock (hidden: torch.Tensor) (block: Qwen3TrainableBlock) =
-        let cfg : Qwen3Core.CoreConfig =
-          {
-            NumAttentionHeads = block.NumAttentionHeads
-            NumKeyValueHeads = block.NumKeyValueHeads
-            HeadDim = block.HeadDim
-            RopeTheta = 1e6
-            RmsNormEps = 1e-6
-            DType = targetOutDtype
-          }
-
-        let norms : Qwen3Core.BlockNorms =
-          {
-            InputNorm = block.InputNorm
-            PostAttnNorm = block.PostAttnNorm
-            QNorm = block.QNorm
-            KNorm = block.KNorm
-          }
-
-        let projs : Qwen3Core.BlockProjections =
-          {
-            QProj = (fun x -> Nvfp4Training.linearSte x block.QProj targetOutDtype)
-            KProj = (fun x -> Nvfp4Training.linearSte x block.KProj targetOutDtype)
-            VProj = (fun x -> Nvfp4Training.linearSte x block.VProj targetOutDtype)
-            OProj = (fun x -> Nvfp4Training.linearSte x block.OProj targetOutDtype)
-            GateProj = (fun x -> Nvfp4Training.linearSte x block.GateProj targetOutDtype)
-            UpProj = (fun x -> Nvfp4Training.linearSte x block.UpProj targetOutDtype)
-            DownProj = (fun x -> Nvfp4Training.linearSte x block.DownProj targetOutDtype)
-          }
-
-        let blockGraph = Qwen3Core.buildBlockGraphNoCache cfg norms projs 0L
-        runM blockGraph hidden
+      let trainingGraph = model.Blocks |> List.map blockToStage |> chainM
 
       let hidden0, squeezeBack =
         if input.shape.Length = 2 then
@@ -140,14 +142,7 @@ module Qwen3Model =
         else
           input, false
 
-      let mutable hidden = hidden0
-      let mutable ownsHidden = false
-      for block in model.Blocks do
-        let next = forwardBlock hidden block
-        if ownsHidden then
-          hidden.Dispose()
-        hidden <- next
-        ownsHidden <- true
+      let hidden = runM trainingGraph hidden0
 
       if squeezeBack then
         let output = hidden.squeeze(1L).contiguous()

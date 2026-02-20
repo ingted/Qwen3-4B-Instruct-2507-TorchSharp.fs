@@ -312,7 +312,7 @@ module Qwen3Core =
         ]
 
     stageM "block.graph" (fun hidden ->
-      let finalState = newBlockRuntimeState hidden --> blockStateGraph
+      let finalState = runOp (newBlockRuntimeState hidden) blockStateGraph
       disposeOpt finalState.InputNormed
       disposeOpt finalState.Q
       disposeOpt finalState.K

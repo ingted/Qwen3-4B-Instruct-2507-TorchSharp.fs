@@ -14,18 +14,18 @@ module TrainingFunctional =
 
   let stage (f: TensorOp) : TensorOp = f
 
-  let inline (->>) (lhs: Op<'a, 'b>) (rhs: Op<'b, 'c>) : Op<'a, 'c> =
+  let composeOp (lhs: Op<'a, 'b>) (rhs: Op<'b, 'c>) : Op<'a, 'c> =
     fun input -> rhs (lhs input)
 
-  let inline (-->) (input: 'a) (op: Op<'a, 'b>) : 'b = op input
+  let runOp (input: 'a) (op: Op<'a, 'b>) : 'b = op input
 
   let chain (ops: TensorOp list) : TensorOp =
-    ops |> List.fold (fun acc op -> acc ->> op) id
+    ops |> List.fold composeOp id
 
   let inline idOp (x: 'a) : 'a = x
 
   let chainOp (ops: Op<'a, 'a> list) : Op<'a, 'a> =
-    ops |> List.fold (fun acc op -> acc ->> op) idOp
+    ops |> List.fold composeOp idOp
 
   let residual (block: TensorOp) : TensorOp =
     fun input ->
@@ -65,12 +65,12 @@ module TrainingFunctional =
     F [ name ] [] f
 
   let composeM (lhs: Stage) (rhs: Stage) : Stage =
-    lhs =>> (rhs.Module.GetName(), rhs)
+    lhs ->> rhs
 
   let chainM (stages: Stage list) : Stage =
     match stages with
     | [] -> stageM "identity" id
-    | head :: tail -> tail |> List.fold (fun acc s -> composeM acc s) head
+    | head :: tail -> tail |> List.fold composeM head
 
   let runM (model: Stage) (input: torch.Tensor) : torch.Tensor =
     model.forward input
