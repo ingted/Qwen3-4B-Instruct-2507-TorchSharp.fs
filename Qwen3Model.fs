@@ -2,7 +2,10 @@ namespace Qwen3_4B_Instruct_2507_TorchSharp_fs
 
 open System
 open System.Collections.Generic
+open System.IO
 open System.Runtime.CompilerServices
+open System.Text
+open System.Text.Json
 open TorchSharp
 open TorchSharp.Modules
 open TorchSharp.Q4.Extension
@@ -44,6 +47,17 @@ type Qwen3Nvfp4Model =
   }
 
 module Qwen3Model =
+  type TrainConfigLite =
+    {
+      HiddenSize: int64
+      NumHiddenLayers: int
+      NumAttentionHeads: int
+      NumKeyValueHeads: int
+      HeadDim: int
+      RopeTheta: float
+      RmsNormEps: float
+    }
+
   let isFloatingDtype (dtype: TorchSharp.torch.ScalarType) =
     dtype = torch.float16
     || dtype = torch.float32
@@ -86,6 +100,167 @@ module Qwen3Model =
       if seen.Add(key) then
         unique.Add(p)
     unique |> Seq.toList
+
+  let requiredInt (root: JsonElement) (name: string) =
+    match root.TryGetProperty(name) with
+    | true, prop -> prop.GetInt32()
+    | _ -> invalidOp (sprintf "config missing field: %s" name)
+
+  let requiredInt64 (root: JsonElement) (name: string) =
+    int64 (requiredInt root name)
+
+  let requiredFloat (root: JsonElement) (name: string) =
+    match root.TryGetProperty(name) with
+    | true, prop -> prop.GetDouble()
+    | _ -> invalidOp (sprintf "config missing field: %s" name)
+
+  let loadConfigLite (configPath: string) =
+    use doc = JsonDocument.Parse(File.ReadAllText(configPath))
+    let root = doc.RootElement
+    {
+      HiddenSize = requiredInt64 root "hidden_size"
+      NumHiddenLayers = requiredInt root "num_hidden_layers"
+      NumAttentionHeads = requiredInt root "num_attention_heads"
+      NumKeyValueHeads = requiredInt root "num_key_value_heads"
+      HeadDim = requiredInt root "head_dim"
+      RopeTheta = requiredFloat root "rope_theta"
+      RmsNormEps = requiredFloat root "rms_norm_eps"
+    }
+
+  let parseLayerIndex (name: string) =
+    let marker = "model.layers."
+    if name.StartsWith(marker, StringComparison.Ordinal) then
+      let rest = name.Substring(marker.Length)
+      let dot = rest.IndexOf('.')
+      if dot > 0 then
+        match Int32.TryParse(rest.Substring(0, dot)) with
+        | true, idx -> Some idx
+        | _ -> None
+      else
+        None
+    else
+      None
+
+  let loadByDims
+    (cfg: TrainingConfig)
+    (inFeatures: int64)
+    (outFeatures: int64)
+    (maxLayers: int)
+    =
+    let cfgByDims =
+      {
+        cfg with
+            InFeatures = inFeatures
+            OutFeatures = outFeatures
+            MaxLayers = maxLayers
+            StrictLoad = true
+      }
+    Nvfp4State.load cfgByDims
+
+  let buildLayerBundleMap (suffix: string) (state: Nvfp4ModelState) =
+    state.Layers
+    |> List.choose (fun layer ->
+      if layer.Name.EndsWith(suffix, StringComparison.Ordinal) then
+        match parseLayerIndex layer.Name with
+        | Some idx -> Some(idx, layer.Bundle)
+        | None -> None
+      else
+        None)
+    |> Map.ofList
+
+  let mapGet (name: string) (idx: int) (m: Map<int, Q4TensorBundle>) =
+    match m.TryFind idx with
+    | Some v -> v
+    | None -> invalidOp (sprintf "missing %s bundle for layer %d" name idx)
+
+  let readRawFloatTensor
+    (br: BinaryReader)
+    (elemType: int)
+    (shape: int64 array)
+    (byteCount: int64)
+    (device: string)
+    (dtype: TorchSharp.torch.ScalarType)
+    =
+    if byteCount > int64 Int32.MaxValue then
+      invalidOp (sprintf "tensor too large for reader buffer: %d bytes" byteCount)
+    let bytes = br.ReadBytes(int byteCount)
+    if bytes.Length <> int byteCount then
+      invalidOp "unexpected EOF while reading raw tensor payload"
+
+    let numel = shape |> Array.fold (fun s d -> s * d) 1L |> int
+    let tensorCpu =
+      match elemType with
+      | 5 ->
+        let data = Array.zeroCreate<Half> numel
+        for i in 0 .. numel - 1 do
+          let lo = uint16 bytes.[i * 2]
+          let hi = uint16 bytes.[i * 2 + 1]
+          let bits = lo ||| (hi <<< 8)
+          data.[i] <- BitConverter.UInt16BitsToHalf(bits)
+        torch.tensor(data, dtype = torch.float16)
+      | 3
+      | 6 ->
+        let data = Array.zeroCreate<float32> numel
+        for i in 0 .. numel - 1 do
+          data.[i] <- BitConverter.ToSingle(bytes, i * 4)
+        torch.tensor(data, dtype = torch.float32)
+      | _ -> invalidOp (sprintf "raw tensor elemType %d is not supported for norm loading" elemType)
+
+    let onTarget = tensorCpu.reshape(shape).to_type(dtype).``to``(device = device)
+    tensorCpu.Dispose()
+    onTarget
+
+  let loadRawTensorMap
+    (weightPath: string)
+    (device: string)
+    (dtype: TorchSharp.torch.ScalarType)
+    (keys: Set<string>)
+    =
+    use fs = File.OpenRead(weightPath)
+    use br = new BinaryReader(fs)
+    let entryCount = int64 (Nvfp4State.readLeb128 br)
+    let results = Dictionary<string, torch.Tensor>(StringComparer.Ordinal)
+
+    for _ in 0L .. entryCount - 1L do
+      let keyLen = int (Nvfp4State.readLeb128 br)
+      let key = Text.Encoding.UTF8.GetString(br.ReadBytes(keyLen))
+      let elemType = int (Nvfp4State.readLeb128 br)
+      let ndim = int (Nvfp4State.readLeb128 br)
+      let shape = Array.init ndim (fun _ -> int64 (Nvfp4State.readLeb128 br))
+      let bytes = Nvfp4State.checkedByteCount shape (Nvfp4State.elementSize elemType)
+      if keys.Contains key then
+        let t = readRawFloatTensor br elemType shape bytes device dtype
+        if results.ContainsKey key then
+          results.[key].Dispose()
+        results.[key] <- t
+      else
+        Nvfp4State.skipBytes br bytes
+
+    let missing =
+      keys
+      |> Seq.filter (fun k -> not (results.ContainsKey k))
+      |> Seq.toList
+    if not missing.IsEmpty then
+      invalidOp (sprintf "missing raw tensors in dat: %s" (String.Join(", ", missing)))
+
+    results |> Seq.map (fun kv -> kv.Key, kv.Value) |> Map.ofSeq
+
+  let mkParameterFromBundle (cfg: TrainingConfig) (dtype: TorchSharp.torch.ScalarType) (bundle: Q4TensorBundle) =
+    materializeMasterWeight bundle cfg.Device dtype |> fun t -> torch.nn.Parameter(t, true)
+
+  let mkParameterFromTensor (t: torch.Tensor) =
+    torch.nn.Parameter(t.contiguous().clone(), true)
+
+  let rawGet (key: string) (m: Map<string, torch.Tensor>) =
+    match m.TryFind key with
+    | Some v -> v
+    | None -> invalidOp (sprintf "missing raw tensor key: %s" key)
+
+  let disposeBundle (bundle: Q4TensorBundle) =
+    bundle.Weight.Dispose()
+    bundle.Scale |> Option.iter (fun t -> t.Dispose())
+    bundle.Absmax |> Option.iter (fun t -> t.Dispose())
+    bundle.QuantMap |> Option.iter (fun t -> t.Dispose())
 
   let forward
     (model: Qwen3Nvfp4Model)
@@ -163,7 +338,7 @@ module Qwen3Model =
       p.Dispose()
     disposeSession model.Session
 
-  let create (cfg: TrainingConfig) (state: Nvfp4ModelState) : Qwen3Nvfp4Model =
+  let create (cfg: TrainingConfig) : Qwen3Nvfp4Model =
     let runtimeTarget =
       if cfg.Device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then Q4RuntimeTarget.Cuda 0 else Q4RuntimeTarget.Cpu
 
@@ -185,68 +360,115 @@ module Qwen3Model =
 
     let session = Session.create sessionCfg Q4.pureNvfp4Schema
 
+    let masterDtype =
+      if cfg.Device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then torch.float16 else torch.float32
+
+    let cfgLite = loadConfigLite cfg.ConfigPath
+    let hiddenSize = cfgLite.HiddenSize
+    let qOut = int64 (cfgLite.NumAttentionHeads * cfgLite.HeadDim)
+    let kvOut = int64 (cfgLite.NumKeyValueHeads * cfgLite.HeadDim)
+    let mlpOut =
+      use doc = JsonDocument.Parse(File.ReadAllText(cfg.ConfigPath))
+      let root = doc.RootElement
+      requiredInt64 root "intermediate_size"
+
+    let qMap =
+      loadByDims cfg hiddenSize qOut cfgLite.NumHiddenLayers
+      |> buildLayerBundleMap ".self_attn.q_proj"
+
+    let kvCount = cfgLite.NumHiddenLayers * 2
+    let kvState = loadByDims cfg hiddenSize kvOut kvCount
+    let kMap = buildLayerBundleMap ".self_attn.k_proj" kvState
+    let vMap = buildLayerBundleMap ".self_attn.v_proj" kvState
+
+    let oMap =
+      loadByDims cfg qOut hiddenSize cfgLite.NumHiddenLayers
+      |> buildLayerBundleMap ".self_attn.o_proj"
+
+    let guCount = cfgLite.NumHiddenLayers * 2
+    let guState = loadByDims cfg hiddenSize mlpOut guCount
+    let gateMap = buildLayerBundleMap ".mlp.gate_proj" guState
+    let upMap = buildLayerBundleMap ".mlp.up_proj" guState
+
+    let downMap =
+      loadByDims cfg mlpOut hiddenSize cfgLite.NumHiddenLayers
+      |> buildLayerBundleMap ".mlp.down_proj"
+
+    let rawKeys =
+      seq {
+        for i in 0 .. cfgLite.NumHiddenLayers - 1 do
+          yield sprintf "model.layers.%d.input_layernorm.weight" i
+          yield sprintf "model.layers.%d.post_attention_layernorm.weight" i
+          yield sprintf "model.layers.%d.self_attn.q_norm.weight" i
+          yield sprintf "model.layers.%d.self_attn.k_norm.weight" i
+      }
+      |> Set.ofSeq
+
+    let rawMap = loadRawTensorMap cfg.WeightPath cfg.Device masterDtype rawKeys
+
+    let blocks =
+      [
+        for i in 0 .. cfgLite.NumHiddenLayers - 1 do
+          let qProj = mkParameterFromBundle cfg masterDtype (mapGet "q_proj" i qMap)
+          let kProj = mkParameterFromBundle cfg masterDtype (mapGet "k_proj" i kMap)
+          let vProj = mkParameterFromBundle cfg masterDtype (mapGet "v_proj" i vMap)
+          let oProj = mkParameterFromBundle cfg masterDtype (mapGet "o_proj" i oMap)
+          let gateProj = mkParameterFromBundle cfg masterDtype (mapGet "gate_proj" i gateMap)
+          let upProj = mkParameterFromBundle cfg masterDtype (mapGet "up_proj" i upMap)
+          let downProj = mkParameterFromBundle cfg masterDtype (mapGet "down_proj" i downMap)
+          let inputNorm = mkParameterFromTensor (rawGet (sprintf "model.layers.%d.input_layernorm.weight" i) rawMap)
+          let postNorm = mkParameterFromTensor (rawGet (sprintf "model.layers.%d.post_attention_layernorm.weight" i) rawMap)
+          let qNorm = mkParameterFromTensor (rawGet (sprintf "model.layers.%d.self_attn.q_norm.weight" i) rawMap)
+          let kNorm = mkParameterFromTensor (rawGet (sprintf "model.layers.%d.self_attn.k_norm.weight" i) rawMap)
+
+          {
+            Name = sprintf "model.layers.%d" i
+            QProj = qProj
+            KProj = kProj
+            VProj = vProj
+            OProj = oProj
+            GateProj = gateProj
+            UpProj = upProj
+            DownProj = downProj
+            InputNorm = inputNorm
+            PostAttnNorm = postNorm
+            QNorm = qNorm
+            KNorm = kNorm
+            NumAttentionHeads = cfgLite.NumAttentionHeads
+            NumKeyValueHeads = cfgLite.NumKeyValueHeads
+            HeadDim = cfgLite.HeadDim
+          }
+      ]
+
+    for m in [ qMap; kMap; vMap; oMap; gateMap; upMap; downMap ] do
+      for kv in m do
+        disposeBundle kv.Value
+
+    for kv in rawMap do
+      kv.Value.Dispose()
+
     let layers =
-      let masterDtype =
-        if cfg.Device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then torch.float16 else torch.float32
+      blocks
+      |> List.collect (fun b ->
+        [
+          { Name = $"{b.Name}.self_attn.q_proj"; MasterWeight = b.QProj }
+          { Name = $"{b.Name}.self_attn.k_proj"; MasterWeight = b.KProj }
+          { Name = $"{b.Name}.self_attn.v_proj"; MasterWeight = b.VProj }
+          { Name = $"{b.Name}.self_attn.o_proj"; MasterWeight = b.OProj }
+          { Name = $"{b.Name}.mlp.gate_proj"; MasterWeight = b.GateProj }
+          { Name = $"{b.Name}.mlp.up_proj"; MasterWeight = b.UpProj }
+          { Name = $"{b.Name}.mlp.down_proj"; MasterWeight = b.DownProj }
+        ])
 
-      state.Layers
-      |> List.map (fun layer ->
-        let master = materializeMasterWeight layer.Bundle cfg.Device masterDtype
-        let p = torch.nn.Parameter(master, true)
-        {
-          Name = layer.Name
-          MasterWeight = p
-        })
-
-    let blocks, extraParams =
-      let createdBlocks = ResizeArray<Qwen3TrainableBlock>()
-      let createdNorms = ResizeArray<Parameter>()
-
-      let makeNorm (size: int64) (dtype: TorchSharp.torch.ScalarType) (deviceStr: string) =
-        let t = torch.ones([| size |], dtype = dtype, device = deviceStr)
-        let p = torch.nn.Parameter(t, true)
-        createdNorms.Add(p)
-        p
-
-      for i, layer in layers |> List.indexed do
-        let w = layer.MasterWeight
-        if w.shape.Length = 2 && w.shape.[0] = w.shape.[1] then
-          let hidden = w.shape.[1]
-          let headDim = int w.shape.[0]
-          let dtype = w.dtype
-          let dev = w.device.ToString()
-          let inputNorm = makeNorm hidden dtype dev
-          let postNorm = makeNorm hidden dtype dev
-          let qNorm = makeNorm (int64 headDim) dtype dev
-          let kNorm = makeNorm (int64 headDim) dtype dev
-
-          createdBlocks.Add(
-            {
-              Name = sprintf "train.block.%d" i
-              QProj = layer.MasterWeight
-              KProj = layer.MasterWeight
-              VProj = layer.MasterWeight
-              OProj = layer.MasterWeight
-              GateProj = layer.MasterWeight
-              UpProj = layer.MasterWeight
-              DownProj = layer.MasterWeight
-              InputNorm = inputNorm
-              PostAttnNorm = postNorm
-              QNorm = qNorm
-              KNorm = kNorm
-              NumAttentionHeads = 1
-              NumKeyValueHeads = 1
-              HeadDim = headDim
-            }
-          )
-
-      createdBlocks |> Seq.toList, createdNorms |> Seq.toList
+    let extraParams =
+      blocks
+      |> List.collect (fun b -> [ b.InputNorm; b.PostAttnNorm; b.QNorm; b.KNorm ])
 
     {
       Session = session
       Layers = layers
       Blocks = blocks
       ExtraParameters = extraParams
-      InFeatures = state.InFeatures
-      OutFeatures = state.OutFeatures
+      InFeatures = hiddenSize
+      OutFeatures = hiddenSize
     }

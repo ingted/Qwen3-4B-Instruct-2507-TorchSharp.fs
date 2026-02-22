@@ -24,8 +24,7 @@ module Program =
           cfg.ResumeFromCheckpoint
           cfg.StrictLoad
 
-        let state = Nvfp4State.load cfg
-        let model = Qwen3Model.create cfg state
+        let model = Qwen3Model.create cfg
         try
           Trainer.run cfg model
         finally
