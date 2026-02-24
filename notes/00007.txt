@@ -1,0 +1,178 @@
+• 我先暫停進一步 GPU 實驗，因為目前這個 container 又回到 cudaGetDeviceCount Error 304（連 Python 也 cuda.is_available=False）。
+  我會先把已完成的安全腳本與定位方法完整落在 SA.md/SD.md/DevLog.md，等 GPU 恢復後直接按步驟重跑，不再臨場摸索。
+
+• Edited fsann/alpha/runner-arm64-fp4/SA.md (+22 -0)
+    54  3. 在確認 reference 正確後，再以 layer-wise A/B 重算第一個真正失真層。
+    55 +
+    56 +## 6. 2026-02-24 目前 root-cause 假設（run-training-fp2）
+    57 +1. `!!!!` 並非 tokenizer 壞掉：
+    58 +   - 實測 `decode(0) = "!"`。
+    59 +   - `run-training-fp2` 單輪輸出 `!!!!` 時，生成 token id 為 `[0; 0; 0; 0]`。
+    60 +   - 結論：是 logits 退化到固定選 id=0，不是 decode 對應表錯。
+    61 +2. fp2 路徑在第 0 層即數值發散：
+    62 +   - `debug-fp2-parity.fsx` 顯示 pathB（training block/STE）layer0 後出現 NaN。
+    63 +   - 同時 `q/k/v` 振幅比 baseline 大數百倍（cosine 高但量級錯）。
+    64 +3. OOM 與 `!!!!` 是兩個不同問題：
+    65 +   - 不開 `TS_Q4_STE_USE_NATIVE_QUANTIZE=1` 會落到 fallback quantize，容易推高顯存到 OOM。
+    66 +   - 開 native quantize 可避免 OOM，但 `!!!!` 仍存在。
+    67 +4. 當前最可能根因排序：
+    68 +   - `linearSte/steWeight` 權重語義或尺度與 baseline 不一致（優先）。
+    69 +   - 次要可能是 block graph 內局部配置（RoPE/Norm/dtype）不一致。
+    70 +
+    71 +## 7. 當前穩定性策略
+    72 +1. 所有 fp2 驗證改為單輪、單輸入，禁止連續多輪。
+    73 +2. 強制 `TS_Q4_STE_USE_NATIVE_QUANTIZE=1`，禁用 fallback quantize 路徑。
+    74 +3. 第一輪只要輸出含 `!!!!` 立即 fail-fast。
+    75 +4. `max-tokens` 設安全上限（safe script 限制 <= 8）。
+    76 +5. 每次實驗都保留 watchdog（`nvidia-smi`）與 timeout，避免整機卡死。
+
+• Edited fsann/alpha/runner-arm64-fp4/DevLog.md (+65 -0)
+    33  - **Final Logic**: Every turn now starts with a synchronized and defragmented memory state.
+    34 +
+    35 +---
+    36 +
+    37 +# Developer Log - 2026-02-24
+    38 +
+    39 +## Objective
+    40 +- Stabilize fp2 experiments to avoid host crash.
+    41 +- Reproduce `!!!!` in single-turn mode only.
+    42 +- Prepare A/B/C first-token diagnostics for weight/tokenizer alignment analysis.
+    43 +
+    44 +## Changes Implemented
+    45 +1. Added `run-training-fp2-safe.fsx`.
+    46 +   - Based on `run-training-fp2-single.fsx`.
+    47 +   - Single-turn only.
+    48 +   - Fail-fast when first output contains `!!!!`.
+    49 +   - Requires `TS_Q4_STE_USE_NATIVE_QUANTIZE=1`; otherwise exits immediately.
+    50 +   - Safety cap: `--max-tokens <= 8`.
+    51 +   - Default log path moved to:
+    52 +     - `alpha/log/tee-object-chat-session-fp-safe.txt`
+    53 +     - `alpha/log/tee-object-chat-session-fp-safe.jsonl`
+    54 +2. Added `run-training-fp2-noste.fsx`.
+    55 +   - Single-turn only.
+    56 +   - Uses `Qwen3Core.forwardBlockNoCache` with `InferenceBridge.linearQ4` projections.
+    57 +   - Purpose: no-STE control path while keeping block-graph style execution.
+    58 +3. Added `compare-first-token-fp2.fsx`.
+    59 +   - One-prompt first-token diagnostic.
+    60 +   - Compares three paths:
+    61 +     - `A.infer`: `InferenceBridge.forwardModel`
+    62 +     - `B.fp2_ste`: `Qwen3Model.forward` (training/STE path)
+    63 +     - `C.noste_graph`: block graph + `linearQ4` (no STE)
+    64 +   - Prints hidden/logits NaN/Inf health + top10 token ids and decoded token text.
+    65 +
+    66 +## Key Findings (from successful prior CUDA window)
+    67 +1. `!!!!` corresponds to repeated token id `0`.
+    68 +   - Evidence: `QWEN3_FS_DEBUG_TOKENS=1` showed `[0; 0; 0; 0]` in first turn.
+    69 +   - Tokenizer check:
+    70 +     - `decode(0) = "!"`
+    71 +     - `encode("!") = [0]`
+    72 +2. `debug-fp2-parity.fsx` indicated divergence at layer 0.
+    73 +   - Path A healthy, Path B goes NaN from layer0 onward.
+    74 +   - `q/k/v` in Path B had much larger absolute magnitude than Path A.
+    75 +
+    76 +## Runtime Incident During This Session
+    77 +1. `run-training-fp2-safe.fsx` attempt failed at CUDA init:
+    78 +   - `cudaGetDeviceCount Error 304: OS call failed or operation not supported on this OS`
+    79 +   - `Torch device type CUDA did not initialise on the current machine`
+    80 +2. Confirmed this was environment-state dependent:
+    81 +   - `nvidia-smi` initially looked normal.
+    82 +   - Python check in same container then reported:
+    83 +     - `torch.cuda.is_available() = False`
+    84 +     - `torch.cuda.device_count() = 0`
+    85 +   - Therefore this round’s fp2 runs were blocked by CUDA runtime availability, not script syntax.
+    86 +
+    87 +## Commands Used (representative)
+    88 +1. Safe run:
+    89 +   - `TS_Q4_STE_USE_NATIVE_QUANTIZE=1 QWEN3_FS_DEBUG_TOKENS=1 timeout 120s dotnet fsi run-training-fp2-safe.fsx --prompt "hi" --max-tokens 4 --timing true`
+    90 +2. CUDA status check:
+    91 +   - `nvidia-smi`
+    92 +   - `python3 - <<'PY' ... torch.cuda.is_available()/device_count ... PY`
+    93 +
+    94 +## Next Action (once CUDA becomes available again)
+    95 +1. Re-run `run-training-fp2-safe.fsx` (single-turn).
+    96 +2. Run `run-training-fp2-noste.fsx` with same prompt.
+    97 +3. Run `compare-first-token-fp2.fsx` and persist top10 diff in log.
+    98 +4. Prioritize fixes in STE path (`linearSte/steWeight`) if A/C align but B diverges.
+
+• Ran cat > /workspace/fsann/alpha/runner-arm64-fp4/SD.md <<'EOF'
+  │ # SD - fp2 Safe Diagnostic Design (2026-02-24)
+  │
+  │ … +41 lines
+  └ (no output)
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && git status --short
+  └  M DevLog.md
+     M SA.md
+    … +13 lines
+    ?? run-training-fp2-single.fsx
+    ?? run-training-fp2.fsx
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我已完成腳本與文件更新，現在再補一次殘留行程檢查，確保沒有卡住的 dotnet fsi。接著我給你可直接執行的下一輪命令。
+
+• Ran ps -eo pid,ppid,stat,etime,cmd | rg "dotnet fsi|run-training-fp2|compare-first-token-fp2"
+  └   50885     203 Ss         00:00 /bin/bash -c ps -eo pid,ppid,stat,etime,cmd | rg "dotnet fsi|run-training-fp2|compare-first-token-fp2"
+      50915   50885 S          00:00 rg dotnet fsi|run-training-fp2|compare-first-token-fp2
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 已完成，重點如下。
+
+  1. 新增安全單輪腳本：/workspace/fsann/alpha/runner-arm64-fp4/run-training-fp2-safe.fsx
+
+  - 只跑第一輪。
+  - 第一輪輸出含 !!!! 立即 fail-fast。
+  - 強制要求 TS_Q4_STE_USE_NATIVE_QUANTIZE=1（避免 fallback quantize OOM）。
+  - --max-tokens 安全上限 <= 8。
+
+  2. 新增 no-STE 對照腳本：/workspace/fsann/alpha/runner-arm64-fp4/run-training-fp2-noste.fsx
+
+  - 單輪。
+  - 走 Qwen3Core block graph + InferenceBridge.linearQ4，不走 linearSte。
+
+  3. 新增首 token A/B/C 比對腳本：/workspace/fsann/alpha/runner-arm64-fp4/compare-first-token-fp2.fsx
+
+  - A: InferenceBridge.forwardModel
+  - B: Qwen3Model.forward (STE)
+  - C: no-STE block graph
+  - 會印 hidden/logits NaN/Inf 與 top10 token id/文字。
+
+  4. 文件已更新
+
+  - SA.md
+  - SD.md（新建）
+  - DevLog.md
+
+  目前阻塞點：
+
+  - 這個 container 在我執行時又出現 cudaGetDeviceCount Error 304，所以 run-training-fp2-safe.fsx 在 InferenceBridge.init 前就失敗。
+  - 同時 Python 也顯示 torch.cuda.is_available=False（同一時段）。
+
+  你現在可直接用這組命令在「CUDA 正常當下」重跑：
+
+  cd /workspace/fsann/alpha/runner-arm64-fp4
+
+  TS_Q4_STE_USE_NATIVE_QUANTIZE=1 QWEN3_FS_DEBUG_TOKENS=1 \
+  dotnet fsi run-training-fp2-safe.fsx --prompt "hi" --max-tokens 4 --timing true
+
+  QWEN3_FS_DEBUG_TOKENS=1 \
+  dotnet fsi run-training-fp2-noste.fsx --prompt "hi" --max-tokens 4 --timing true
+
+  TS_Q4_STE_USE_NATIVE_QUANTIZE=1 \
+  dotnet fsi compare-first-token-fp2.fsx "hi"
+
+  如果你要，我下一步就只做一件事：等你確認當前 container 的 Python CUDA 再次 True 後，我幫你跑這三條並整理 A/B/C 差異表。
+
+
+› root@7606cbd:/workspace$ ls
+  Dockerfile                            README.md                TorchSharp_In_DGX_Spark_fp4        backup_deletable  fsann         resume.sh
+  Dockerfile.md                         TorchSharp.Fun.DGX       _refs                              cudatest.py       license.txt   resume_gemini.sh
+  Qwen3-4B-Instruct-2507-TorchSharp.fs  TorchSharp_In_DGX_Spark  analysis_and_optimization_plan.md  docker-examples   nvfp4_native  tutorials
+  root@7606cbd:/workspace$ python cudatest.py
+  torch.__version__: 2.10.0a0+a36e1d39eb.nv26.01.42222806
+  torch.version.cuda: 13.1
+  CUDA_VISIBLE_DEVICES: None
+  CPU matmul ok: torch.Size([128, 128]) cpu torch.float32
+  torch.cuda.init(): OK
+  cuda device_count

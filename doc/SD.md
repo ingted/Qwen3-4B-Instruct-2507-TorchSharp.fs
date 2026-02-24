@@ -437,3 +437,65 @@
   - `Qwen3Core.forwardBlockNoCache`
 - 推論 no-cache 路徑必須直接呼叫此函式。
 - 訓練路徑遷移目標：以 training projection adapters（STE）呼叫同一函式。
+
+## Training Graph Explicitness and KV-cache Design (2026-02-22)
+### Why grouped stages were used first (not fully explicit split)
+- The block graph intentionally grouped:
+  - `qkvContextStage`
+  - `gateUpMergeStage`
+- Reasoning:
+  - keep the migration from scaffold to functional graph stable.
+  - keep one replacement point between no-cache and cache implementations.
+  - avoid over-fragmented `IModel` dependency graph while parity is still under active verification.
+- This is a staging choice, not a limitation of the operator system.
+
+### KV-cache in training path
+- Added cache model in core:
+  - `Qwen3Core.BlockKvCache`
+  - `Qwen3Core.ModelKvCache`
+- Added cache-aware block execution:
+  - `Qwen3Core.buildBlockGraphWithCache`
+  - `Qwen3Core.forwardBlockWithCache`
+- Added model APIs:
+  - `Qwen3Model.createKvCache`
+  - `Qwen3Model.resetKvCache`
+  - `Qwen3Model.forwardWithKvCache`
+- Added training config toggles:
+  - `UseKvCache` (`--use-kvc`)
+  - `SequenceLength` (`--seq-len`)
+
+### Design principle
+- Default training path remains no-cache for full-sequence parallel training.
+- KV-cache path is opt-in for chunked/streaming style training/evaluation where replay cost matters.
+- Keep both paths in one shared block contract to avoid train/infer semantic drift.
+
+## 訓練圖顯式度與 KV-cache 設計（2026-02-22）
+### 為何先採「分組 stage」而非完全拆分
+- block graph 先刻意分組：
+  - `qkvContextStage`
+  - `gateUpMergeStage`
+- 原因：
+  - 先把 scaffold -> functional graph 的遷移做穩定。
+  - 讓 no-cache / cache 只有一個替換點。
+  - 在 parity 尚在持續驗證階段時，避免 `IModel` 相依圖過度碎裂。
+- 這是階段性設計選擇，不是 operator 能力限制。
+
+### 訓練路徑 KV-cache
+- core 新增快取模型：
+  - `Qwen3Core.BlockKvCache`
+  - `Qwen3Core.ModelKvCache`
+- 新增 cache-aware block 執行：
+  - `Qwen3Core.buildBlockGraphWithCache`
+  - `Qwen3Core.forwardBlockWithCache`
+- 模型層新增 API：
+  - `Qwen3Model.createKvCache`
+  - `Qwen3Model.resetKvCache`
+  - `Qwen3Model.forwardWithKvCache`
+- 訓練設定新增：
+  - `UseKvCache`（`--use-kvc`）
+  - `SequenceLength`（`--seq-len`）
+
+### 設計精神
+- 預設仍採 no-cache 以對齊 full-sequence 並行訓練。
+- KV-cache 為 opt-in，服務 chunked/streaming 訓練或評估場景，降低 replay 成本。
+- 兩路徑共用同一份 block 契約，避免 train/infer 語意漂移。

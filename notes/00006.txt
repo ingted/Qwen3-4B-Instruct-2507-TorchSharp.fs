@@ -1,0 +1,15 @@
+  3. 我已開始做你要求的 1/2（含 KVC）
+
+  - 新增訓練用 KVC 結構與路徑：
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3Core.fs:38 (BlockKvCache)
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3Core.fs:59 (ModelKvCache)
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3Core.fs:177 (attentionContextFromQkvWithCache)
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3Core.fs:302 (buildBlockGraphWithCache)
+  - 模型層新增 KVC API：
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3Model.fs:265 (createKvCache)
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3Model.fs:358 (forwardWithKvCache)
+  - 訓練設定新增：
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/Types.fs:21 (UseKvCache)
+      - Qwen3-4B-Instruct-2507-TorchSharp.fs/Types.fs:22 (SequenceLength)
+      - CLI：Qwen3-4B-Instruct-2507-TorchSharp.fs/Cli.fs:77
+  - synthetic hidden->hidden 路徑完整片段已搬到 doc/DevLog.md。

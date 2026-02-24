@@ -837,3 +837,121 @@ let output = torch.nn.functional.linear(inputForCompute, weightForCompute) // fa
 - WBS-27 => Done
 - WBS-28 => Done
 - WBS-29/30 仍 Pending
+
+## 2026-02-22 (Training graph explicitness + KV-cache path added)
+### Why the graph was "not fully explicit"
+- Current design grouped two high-fanout subgraphs into single stages:
+  - `qkvContextStage` (q/k/v projection + attn context assembly)
+  - `gateUpMergeStage` (gate/up projection + SiLU merge)
+- Original reason:
+  - keep operator graph readable and stable while migrating from scaffold to FP-style.
+  - keep one swap point between no-cache and cache implementation without duplicating all stage wiring.
+  - reduce closure/dependent-module churn in `IModel` composition.
+- Tradeoff:
+  - less visual verbosity than fully split `qStage -> kStage -> vStage -> merge`.
+  - easier maintenance for parity and runtime-path switches.
+
+### KV-cache added to training block graph
+- Added cache data structures in `Qwen3Core.fs`:
+  - `BlockKvCache`
+  - `ModelKvCache`
+- Added cache-aware block graph:
+  - `buildBlockGraphWithCache`
+  - `forwardBlockWithCache`
+- Added model-level cache API in `Qwen3Model.fs`:
+  - `createKvCache`
+  - `resetKvCache`
+  - `forwardWithKvCache`
+- Added trainer switches in `TrainingConfig` / CLI:
+  - `UseKvCache` (`--use-kvc`)
+  - `SequenceLength` (`--seq-len`)
+- Current training default remains no-cache; cache path is opt-in.
+
+### Synthetic hidden->hidden path (current code, near-complete)
+```fsharp
+// Trainer.createBatch
+let inputShape, targetShape =
+  if useKvCache then
+    [| batchSize; sequenceLength; inFeatures |], [| batchSize; sequenceLength; outFeatures |]
+  else
+    [| batchSize; inFeatures |], [| batchSize; outFeatures |]
+let input = torch.randn(inputShape, dtype = dtype, device = device)
+let target = torch.randn(targetShape, dtype = dtype, device = device)
+```
+
+```fsharp
+// Trainer.run (forward path switch)
+use output =
+  if cfg.UseKvCache && model.Blocks.Length > 0 then
+    use cache = Qwen3Model.createKvCache model
+    Qwen3Model.forwardWithKvCache model cache inputTensor (Some computeDtype)
+  else
+    Qwen3Model.forward model inputTensor (Some computeDtype)
+use loss = scalarLoss output targetTensor
+```
+
+```fsharp
+// Trainer.scalarLoss (synthetic hidden->hidden objective)
+use diff = output - targetForLoss
+use absDiff = diff.abs()
+let loss = absDiff.mean()
+```
+
+## 2026-02-22（訓練圖顯式度 + 新增 KV-cache 路徑）
+### 為何目前不是「完全顯式」拆法
+- 目前把兩個高扇出子圖打包為 stage：
+  - `qkvContextStage`（q/k/v 投影 + attention context）
+  - `gateUpMergeStage`（gate/up 投影 + SiLU merge）
+- 當初設計原因：
+  - 從 scaffold 遷移到 FP-style 時，先維持可讀且穩定的 operator graph。
+  - 讓 no-cache/cache 只在單一交換點切換，避免整段 stage 重複。
+  - 降低 `IModel` 組裝時 closure/相依註冊數量。
+- 取捨：
+  - 視覺上比完全拆成 `qStage -> kStage -> vStage -> merge` 更短。
+  - 維護 parity 與 runtime-path 切換成本較低。
+
+### 已加入訓練用 KV-cache 路徑
+- `Qwen3Core.fs` 新增快取結構：
+  - `BlockKvCache`
+  - `ModelKvCache`
+- 新增 cache-aware block graph：
+  - `buildBlockGraphWithCache`
+  - `forwardBlockWithCache`
+- `Qwen3Model.fs` 新增模型層 API：
+  - `createKvCache`
+  - `resetKvCache`
+  - `forwardWithKvCache`
+- `TrainingConfig` / CLI 新增：
+  - `UseKvCache`（`--use-kvc`）
+  - `SequenceLength`（`--seq-len`）
+- 目前訓練預設仍為 no-cache；KVC 路徑為 opt-in。
+
+### synthetic hidden->hidden 路徑（目前程式碼）
+```fsharp
+// Trainer.createBatch
+let inputShape, targetShape =
+  if useKvCache then
+    [| batchSize; sequenceLength; inFeatures |], [| batchSize; sequenceLength; outFeatures |]
+  else
+    [| batchSize; inFeatures |], [| batchSize; outFeatures |]
+let input = torch.randn(inputShape, dtype = dtype, device = device)
+let target = torch.randn(targetShape, dtype = dtype, device = device)
+```
+
+```fsharp
+// Trainer.run (forward 路徑切換)
+use output =
+  if cfg.UseKvCache && model.Blocks.Length > 0 then
+    use cache = Qwen3Model.createKvCache model
+    Qwen3Model.forwardWithKvCache model cache inputTensor (Some computeDtype)
+  else
+    Qwen3Model.forward model inputTensor (Some computeDtype)
+use loss = scalarLoss output targetTensor
+```
+
+```fsharp
+// Trainer.scalarLoss（synthetic hidden->hidden 目標）
+use diff = output - targetForLoss
+use absDiff = diff.abs()
+let loss = absDiff.mean()
+```
