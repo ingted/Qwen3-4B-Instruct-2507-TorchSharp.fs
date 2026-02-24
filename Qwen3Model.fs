@@ -1,6 +1,7 @@
 namespace Qwen3_4B_Instruct_2507_TorchSharp_fs
 
 open System
+open System.Collections.Concurrent
 open System.Collections.Generic
 open System.IO
 open System.Runtime.CompilerServices
@@ -58,6 +59,41 @@ module Qwen3Model =
       RmsNormEps: float
     }
 
+  let fp8E4M3FnLutCache = ConcurrentDictionary<string, torch.Tensor>(StringComparer.Ordinal)
+
+  let fp8E4M3FnToFloat32 (raw: byte) =
+    let sign = if (raw &&& 0x80uy) <> 0uy then -1.0f else 1.0f
+    let exp = int ((raw >>> 3) &&& 0x0Fuy)
+    let mant = int (raw &&& 0x07uy)
+
+    if exp = 0 then
+      if mant = 0 then
+        0.0f
+      else
+        // subnormal: mant/8 * 2^(1-bias), bias=7
+        sign * (float32 mant / 8.0f) * MathF.Pow(2.0f, -6.0f)
+    elif exp = 0x0F then
+      Single.NaN
+    else
+      sign * (1.0f + float32 mant / 8.0f) * MathF.Pow(2.0f, float32 (exp - 7))
+
+  let fp8E4M3FnLut (device: TorchSharp.torch.Device) =
+    let key = device.ToString()
+    fp8E4M3FnLutCache.GetOrAdd(
+      key,
+      fun _ ->
+        let data = [| for i in 0 .. 255 -> fp8E4M3FnToFloat32 (byte i) |]
+        torch.tensor(data, dtype = torch.float32, device = device)
+    )
+
+  let decodeFp8E4M3FnTensor (input: TorchSharp.torch.Tensor) =
+    if input.dtype <> torch.uint8 then
+      input.to_type(torch.float32)
+    else
+      use idx = input.to_type(torch.int64).reshape([| -1L |])
+      let lut = fp8E4M3FnLut input.device
+      torch.index_select(lut, 0L, idx).reshape(input.shape).contiguous()
+
   let isFloatingDtype (dtype: TorchSharp.torch.ScalarType) =
     dtype = torch.float16
     || dtype = torch.float32
@@ -73,7 +109,20 @@ module Qwen3Model =
     let dense =
       if w.dtype = torch.uint8 then
         match bundle.Scale with
-        | Some scale -> Nvfp4Training.dequantizePacked w scale targetDtype
+        | Some scale ->
+          // NVFP4 dat commonly stores scale as elemType=101 (1-byte fp8-like encoding).
+          // Decode uint8 scale bytes to float domain before dense dequantization for STE path.
+          let scaleForDeq, ownsScale =
+            if scale.dtype = torch.uint8 then
+              decodeFp8E4M3FnTensor scale, true
+            else
+              scale, false
+
+          try
+            Nvfp4Training.dequantizePacked w scaleForDeq targetDtype
+          finally
+            if ownsScale then
+              scaleForDeq.Dispose()
         | None -> raise (InvalidOperationException("NVFP4 bundle requires scale for uint8 qdata."))
       elif isFloatingDtype w.dtype then
         if w.dtype = targetDtype then w.clone() else w.to_type(targetDtype)
@@ -262,15 +311,22 @@ module Qwen3Model =
     bundle.Absmax |> Option.iter (fun t -> t.Dispose())
     bundle.QuantMap |> Option.iter (fun t -> t.Dispose())
 
-  let forward
+  let createKvCache (model: Qwen3Nvfp4Model) =
+    new Qwen3Core.ModelKvCache(model.Blocks.Length)
+
+  let resetKvCache (cache: Qwen3Core.ModelKvCache) =
+    cache.Reset()
+
+  let forwardInternal
     (model: Qwen3Nvfp4Model)
+    (cache: Qwen3Core.ModelKvCache option)
     (input: TorchSharp.torch.Tensor)
     (outDtype: TorchSharp.torch.ScalarType option)
     : TorchSharp.torch.Tensor
     =
     let targetOutDtype = outDtype |> Option.defaultValue input.dtype
 
-    let blockToStage (block: Qwen3TrainableBlock) =
+    let blockToStage (positionOffset: int64) (cacheOpt: Qwen3Core.BlockKvCache option) (block: Qwen3TrainableBlock) =
       let cfg : Qwen3Core.CoreConfig =
         {
           NumAttentionHeads = block.NumAttentionHeads
@@ -300,31 +356,87 @@ module Qwen3Model =
           DownProj = (fun x -> Nvfp4Training.linearSte x block.DownProj targetOutDtype)
         }
 
-      Qwen3Core.buildBlockGraphNoCache cfg norms projs 0L
+      match cacheOpt with
+      | Some layerCache -> Qwen3Core.buildBlockGraphWithCache cfg norms projs layerCache positionOffset
+      | None -> Qwen3Core.buildBlockGraphNoCache cfg norms projs positionOffset
+(*
+• 這段分支的差異是：
+
+  1. if model.Blocks.IsEmpty then
+
+  - 走「舊版/相容」路徑。
+  - 代表模型沒有完整 Qwen block 結構（只有平面 Layers）。
+  - 只做 linearSte 串接：layer -> layer -> ...，主要是為了相容舊測試/舊checkpoint/synthetic情境。
+
+  2. else
+
+  - 走「正式」路徑。
+  - 代表 Qwen3Model.create 已建立完整 block（q/k/v/o + norm + attn + mlp + residual）。
+  - 先把輸入對齊到 block 需要的 shape：
+      - [B, H] 會升成 [B, 1, H]（單 token）
+      - [B, T, H] 則直接用
+  - 然後跑 block graph（含你要的 operator graph）。
+*)
+
 
     if model.Blocks.IsEmpty then
+      // Fallback path: legacy/synthetic model only has flat Layers (no Qwen block metadata).
+      // This keeps old tests/checkpoints runnable by chaining plain linear STE layers.
       let trainingGraph =
         model.Layers
         |> List.map (fun layer -> stageM (sprintf "layer.%s.linear_ste" layer.Name) (linearSte layer.MasterWeight targetOutDtype))
         |> chainM
       runM trainingGraph input
     else
-      let trainingGraph = model.Blocks |> List.map blockToStage |> chainM
-
-      let hidden0, squeezeBack =
+      // Main path: official-like Qwen block graph (q/k/v/o + norm + attn + mlp + residual).
+      // Blocks are created from real model-layer bundles in Qwen3Model.create.
+      let hidden0, squeezeBack, hidden0Temp =
         if input.shape.Length = 2 then
-          input.unsqueeze(1L), true
+          // Block graph expects [B, T, H]. If caller gives [B, H], treat it as single-token T=1.
+          let expanded = input.unsqueeze(1L)
+          expanded, true, Some expanded
         else
-          input, false
+          input, false, None
 
+      let positionOffset = cache |> Option.map (fun c -> c.SeqLen) |> Option.defaultValue 0L
+      let stages =
+        match cache with
+        | Some kvCache ->
+          model.Blocks
+          |> List.mapi (fun idx block -> blockToStage positionOffset (Some kvCache.Layers.[idx]) block)
+        | None ->
+          model.Blocks
+          |> List.map (fun block -> blockToStage 0L None block)
+
+      let tokenSpan = hidden0.shape.[1]
+      let trainingGraph = stages |> chainM
       let hidden = runM trainingGraph hidden0
+      hidden0Temp |> Option.iter (fun t -> t.Dispose())
 
+      cache |> Option.iter (fun c -> c.SeqLen <- c.SeqLen + tokenSpan)
       if squeezeBack then
         let output = hidden.squeeze(1L).contiguous()
         hidden.Dispose()
         output
       else
         hidden
+
+  let forward
+    (model: Qwen3Nvfp4Model)
+    (input: TorchSharp.torch.Tensor)
+    (outDtype: TorchSharp.torch.ScalarType option)
+    : TorchSharp.torch.Tensor
+    =
+    forwardInternal model None input outDtype
+
+  let forwardWithKvCache
+    (model: Qwen3Nvfp4Model)
+    (cache: Qwen3Core.ModelKvCache)
+    (input: TorchSharp.torch.Tensor)
+    (outDtype: TorchSharp.torch.ScalarType option)
+    : TorchSharp.torch.Tensor
+    =
+    forwardInternal model (Some cache) input outDtype
 
   let disposeSession (session: Q4Session) =
     match box session with
