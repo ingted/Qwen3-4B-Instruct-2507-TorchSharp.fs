@@ -1,0 +1,41 @@
+• 已完成，這輪直接把問題修掉並驗證。
+
+  結果
+
+  1. run-training-fp2-safe.fsx 不再首輪輸出 !!!!
+      - 修正前：[0;0;0;0] -> !!!!
+      - 修正後：[9707; 0; 61804; 233] -> Hello! 👋
+  2. compare-first-token-fp2.fsx "hi"
+      - 修正前：B.fp2_ste 的 hidden/logits 都有 NaN
+      - 修正後：B.fp2_ste finite，top tokens 與 A/C 語意對齊（Hello/Hi/Hey）
+
+  根因
+
+  - .dat 內 *.scale 是 elemType=101（1-byte 特殊 scale 編碼），不是一般線性 uint8 scale。
+  - STE 路徑把 scale 當 uint8 直接用，導致 dequant 錯尺度，layer0 就崩壞成 NaN/!!!!。
+
+  實作修正
+
+  - 在 Qwen3Model.materializeMasterWeight 中，當 scale.dtype = uint8 時，先按 FP8(E4M3FN) 解碼到 float，再做 Nvfp4Training.dequantizePacked。
+  - 檔案：Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3Model.fs
+
+  新增/修正診斷腳本
+
+  - fsann/alpha/runner-arm64-fp4/run-training-fp2-safe.fsx
+  - fsann/alpha/runner-arm64-fp4/run-training-fp2-noste.fsx
+  - fsann/alpha/runner-arm64-fp4/compare-first-token-fp2.fsx（已修 prompt 解析與型別問題）
+
+  文件更新
+
+  - fsann/alpha/runner-arm64-fp4/SA.md
+  - fsann/alpha/runner-arm64-fp4/SD.md
+  - fsann/alpha/runner-arm64-fp4/DevLog.md
+
+  已推送
+
+  - Qwen3-4B-Instruct-2507-TorchSharp.fs
+      - commit: 6e5d6a1
+      - branch: featur/official-layer-connecctions
+  - fsann
+      - commits: 3ae492e, 9b9b49a
+      - branch: 20260207_arm64_v0.3

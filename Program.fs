@@ -14,7 +14,12 @@ module Program =
         printfn "[Init] project=Qwen3-4B-Instruct-2507-TorchSharp.fs"
         printfn "[Init] modelDir=%s" cfg.ModelDir
         printfn "[Init] weight=%s" cfg.WeightPath
-        printfn "[Init] device=%s synthetic=%b" cfg.Device cfg.SyntheticMode
+        printfn
+          "[Init] device=%s synthetic=%b useKvc=%b seqLen=%d"
+          cfg.Device
+          cfg.SyntheticMode
+          cfg.UseKvCache
+          cfg.SequenceLength
         printfn "[Init] maxLayers=%d requested(in=%d,out=%d)" cfg.MaxLayers cfg.InFeatures cfg.OutFeatures
         printfn
           "[Init] lr=%f checkpointDir=%s saveEverySteps=%d resume=%b strictLoad=%b"

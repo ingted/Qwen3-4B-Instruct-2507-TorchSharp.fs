@@ -74,6 +74,8 @@ module Cli =
           OutFeatures = parseInt64 "--out-features" Defaults.trainingConfig.OutFeatures kv
           MaxLayers = parseInt "--max-layers" Defaults.trainingConfig.MaxLayers kv
           SyntheticMode = parseBool "--synthetic" Defaults.trainingConfig.SyntheticMode kv
+          UseKvCache = parseBool "--use-kvc" Defaults.trainingConfig.UseKvCache kv
+          SequenceLength = parseInt64 "--seq-len" Defaults.trainingConfig.SequenceLength kv
           LearningRate = parseFloat "--lr" Defaults.trainingConfig.LearningRate kv
           CheckpointDir = getOrDefault "--checkpoint-dir" Defaults.trainingConfig.CheckpointDir kv
           SaveEverySteps = parseInt "--save-every-steps" Defaults.trainingConfig.SaveEverySteps kv
@@ -100,6 +102,8 @@ module Cli =
     printfn "  --out-features <int64>"
     printfn "  --max-layers <int>"
     printfn "  --synthetic <true|false>"
+    printfn "  --use-kvc <true|false>"
+    printfn "  --seq-len <int64>"
     printfn "  --lr <float>"
     printfn "  --checkpoint-dir <path>"
     printfn "  --save-every-steps <int>"

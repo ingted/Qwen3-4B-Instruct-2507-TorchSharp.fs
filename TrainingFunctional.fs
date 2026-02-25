@@ -76,6 +76,6 @@ module TrainingFunctional =
     model.forward input
 
   let residualM (name: string) (block: Stage) : Stage =
-    Fx [ name; $"{name}.block" ] [ box block ] (fun (input, args) ->
+    F [ name; $"{name}_block" ] [ box block ] (fun input ->
       use output = block.forward input
-      output + input, args)
+      output + input)

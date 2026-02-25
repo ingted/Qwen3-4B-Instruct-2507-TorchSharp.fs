@@ -751,6 +751,107 @@ module InferenceBridge =
       LmHead = lmHead
     }
 
+  let initSamplingOnly
+    (modelDir: string)
+    (weightOverride: string option)
+    (quantHint: string option)
+    (device: string)
+    (dtype: TorchSharp.torch.ScalarType)
+    =
+    torch.InitializeDeviceType(DeviceType.CUDA)
+    torch.set_default_dtype(dtype)
+
+    let resolvedModelDir =
+      if String.IsNullOrWhiteSpace modelDir then Defaults.modelDir else modelDir.Trim()
+    let configPath = Path.Combine(resolvedModelDir, "config.json")
+    let tokenizerPath = Path.Combine(resolvedModelDir, "tokenizer.json")
+    let weightPath = resolveWeightPath resolvedModelDir weightOverride quantHint
+    if not (File.Exists weightPath) then
+      invalidOp (sprintf "weight file not found: %s" weightPath)
+    if not (File.Exists tokenizerPath) then
+      invalidOp (sprintf "tokenizer file not found: %s" tokenizerPath)
+    if not (File.Exists configPath) then
+      invalidOp (sprintf "config file not found: %s" configPath)
+
+    let cfgLite = loadConfigLite configPath
+    let tokenizer = new Tokenizer(tokenizerPath)
+
+    let baseCfg =
+      {
+        Defaults.trainingConfig with
+            ModelDir = resolvedModelDir
+            ConfigPath = configPath
+            TokenizerPath = tokenizerPath
+            WeightPath = weightPath
+            Device = device
+            SyntheticMode = false
+            StrictLoad = true
+      }
+
+    let runtimeTarget =
+      if device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then Q4RuntimeTarget.Cuda 0 else Q4RuntimeTarget.Cpu
+
+    let backendOverrideEnv = Environment.GetEnvironmentVariable("QWEN3_FS_Q4_BACKEND")
+    let backendOverride =
+      if String.IsNullOrWhiteSpace backendOverrideEnv then
+        None
+      else
+        Some(backendOverrideEnv.Trim().ToLowerInvariant())
+
+    let computePath, backendName =
+      match runtimeTarget, backendOverride with
+      | Q4RuntimeTarget.Cpu, _ -> Q4ComputePath.DequantMatmulOnly, "dequant-matmul"
+      | _, Some "dequant-matmul" -> Q4ComputePath.DequantMatmulOnly, "dequant-matmul"
+      | _, Some "nvfp4-kernel" -> Q4ComputePath.KernelOnly, "nvfp4-kernel"
+      | _, _ -> Q4ComputePath.KernelOnly, "nvfp4-kernel"
+
+    let q4cfg =
+      {
+        Q4.pureNvfp4SessionConfig with
+            RuntimeTarget = runtimeTarget
+            ComputePath = computePath
+            BackendOverride = Some backendName
+      }
+
+    let umEnabled = q4cfg.UnifiedMemoryPolicy <> UnifiedMemoryPolicy.Disabled
+    let weightLoadDevice = if umEnabled then "cpu" else device
+    let baseCfgForQ4 = { baseCfg with Device = weightLoadDevice }
+
+    let rawKeys =
+      [ "model.embed_tokens.weight"; "model.norm.weight" ]
+      |> Set.ofList
+
+    let rawMap =
+      loadRawTensorMap weightPath weightLoadDevice rawKeys
+      |> applyUnifiedPolicyToRawMap q4cfg.UnifiedMemoryPolicy
+
+    let lmState = loadByDims baseCfgForQ4 cfgLite.HiddenSize (int64 cfgLite.VocabSize) 1
+    let lmHead =
+      match lmState.Layers |> List.tryFind (fun l -> l.Name = "lm_head") with
+      | Some l -> new Q4Linear(q4cfg, Q4.pureNvfp4Schema, l.Bundle)
+      | None -> invalidOp "missing lm_head"
+
+    let embedTokens = rawGet "model.embed_tokens.weight" rawMap
+    let finalNorm = rawGet "model.norm.weight" rawMap
+
+    printfn
+      "[InferInitSamplingOnly] hidden=%d vocab=%d backend=%s path=%A"
+      cfgLite.HiddenSize
+      cfgLite.VocabSize
+      backendName
+      computePath
+
+    {
+      Device = device
+      DType = dtype
+      Config = cfgLite
+      Tokenizer = tokenizer
+      Layers = [||]
+      EmbedTokens = embedTokens
+      FinalNorm = finalNorm
+      LmHead = lmHead
+    }
+
   let generateFromRenderedPromptWithStopTokens
     (session: InferenceSession)
     (renderedPrompt: string)

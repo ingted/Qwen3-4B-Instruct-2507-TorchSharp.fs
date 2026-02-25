@@ -50,8 +50,8 @@ let disposeState (state: Nvfp4ModelState) =
     layer.Bundle.Weight.Dispose()
     layer.Bundle.Scale |> Option.iter (fun s -> s.Dispose()))
 
-let withModel cfg state f =
-  let model = Qwen3Model.create cfg state
+let withModel cfg f =
+  let model = Qwen3Model.create cfg
   try
     f model
   finally
@@ -139,7 +139,7 @@ let testModelForward () =
     }
   let st = Nvfp4State.load cfg
   try
-    withModel cfg st (fun model ->
+    withModel cfg (fun model ->
       use x = torch.randn([| 1L; 64L |], dtype = torch.float16, device = "cpu")
       use y = Qwen3Model.forward model x (Some torch.float16)
       ensure (y.shape = [| 1L; 64L |]) "forward output shape mismatch")
@@ -165,7 +165,7 @@ let testTrainerLoop () =
     }
   let st = Nvfp4State.load cfg
   try
-    withModel cfg st (fun model -> Trainer.run cfg model)
+    withModel cfg (fun model -> Trainer.run cfg model)
     ensure (File.Exists(Path.Combine(ckptDir, "meta.json"))) "trainer did not create checkpoint meta"
   finally
     disposeState st
@@ -189,7 +189,7 @@ let testOptimizerUpdatesWeights () =
     }
   let st = Nvfp4State.load cfg
   try
-    withModel cfg st (fun model ->
+    withModel cfg (fun model ->
       use before = model.Layers.Head.MasterWeight.detach().to_type(torch.float32).cpu().clone()
       Trainer.run cfg model
       use after = model.Layers.Head.MasterWeight.detach().to_type(torch.float32).cpu().clone()
@@ -221,14 +221,14 @@ let testCheckpointRecover () =
 
   let st = Nvfp4State.load cfgBase
   try
-    withModel cfgBase st (fun model1 -> Trainer.run cfgBase model1)
+    withModel cfgBase (fun model1 -> Trainer.run cfgBase model1)
 
     let layer0Path = Path.Combine(ckptDir, "layer_0000.pt")
     ensure (File.Exists(layer0Path)) "checkpoint layer file missing"
     use saved = torch.load(layer0Path)
 
     let cfgResume = { cfgBase with ResumeFromCheckpoint = true }
-    withModel cfgResume st (fun model2 ->
+    withModel cfgResume (fun model2 ->
       match Trainer.tryLoadCheckpoint cfgResume model2 with
       | None -> failwith "checkpoint not loaded"
       | Some state ->

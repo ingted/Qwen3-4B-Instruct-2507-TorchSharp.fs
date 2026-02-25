@@ -1,0 +1,44 @@
+  - 新增腳本：alpha/runner-arm64-fp4/run-training-fp2-guarded.sh
+  - 已加執行權限、通過語法檢查（bash -n）。
+  - 已更新紀錄：
+      - alpha/runner-arm64-fp4/SA.md
+      - alpha/runner-arm64-fp4/SD.md
+      - alpha/runner-arm64-fp4/DevLog.md
+
+  使用方式：
+
+  cd /workspace/fsann/alpha/runner-arm64-fp4
+  ./run-training-fp2-guarded.sh
+
+  或帶參數：
+
+  ./run-training-fp2-guarded.sh --max-tokens 4 --timing true --check-logits false --prompt "hi"
+
+  行為：
+
+  - 監看 dotnet fsi 目標 PID 的 GPU 記憶體。
+  - 來源優先用 --query-compute-apps，抓不到時 fallback 解析 nvidia-smi 右下角 process table。
+  - 超過 110GB 且持續 10s 會自動 kill（先 TERM 再 KILL）。
+  - 可調整環境變數：GPU_LIMIT_GB、GPU_OVER_SECS、GPU_POLL_SECS。
+
+  補充：
+
+  - 這個 runtime 實測時，process memory 仍可能顯示 0MiB；腳本已加入警告，會明確提示「目前無法觀測，閾值暫不可執行」。
+
+
+› run-training-fp2.fsx 怎麼跑
+
+
+• cd /workspace/fsann/alpha/runner-arm64-fp4
+  TS_Q4_STE_USE_NATIVE_QUANTIZE=1 QWEN3_FS_DEBUG_TOKENS=1 \
+  dotnet fsi run-training-fp2.fsx --max-tokens 4 --timing true --check-logits false --prompt "hi"
+
+  如果你要帶 watchdog（建議），改跑：
+
+  cd /workspace/fsann/alpha/runner-arm64-fp4
+  ./run-training-fp2-guarded.sh --max-tokens 4 --timing true --check-logits false --prompt "hi"
+
+
+› Use /skills to list available skills
+
+  ? for shortcuts                                                                                                                                           88% context left

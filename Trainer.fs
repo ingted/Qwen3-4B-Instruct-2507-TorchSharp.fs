@@ -34,11 +34,18 @@ module Trainer =
     (batchSize: int64)
     (inFeatures: int64)
     (outFeatures: int64)
+    (sequenceLength: int64)
+    (useKvCache: bool)
     (device: string)
     (dtype: TorchSharp.torch.ScalarType)
     =
-    let input = torch.randn([| batchSize; inFeatures |], dtype = dtype, device = device)
-    let target = torch.randn([| batchSize; outFeatures |], dtype = dtype, device = device)
+    let inputShape, targetShape =
+      if useKvCache then
+        [| batchSize; sequenceLength; inFeatures |], [| batchSize; sequenceLength; outFeatures |]
+      else
+        [| batchSize; inFeatures |], [| batchSize; outFeatures |]
+    let input = torch.randn(inputShape, dtype = dtype, device = device)
+    let target = torch.randn(targetShape, dtype = dtype, device = device)
     input, target
 
   let scalarLoss (output: TorchSharp.torch.Tensor) (target: TorchSharp.torch.Tensor) =
@@ -132,6 +139,7 @@ module Trainer =
       cfg.BatchSize
       cfg.LearningRate
     printfn "[Train] features in=%d out=%d layers=%d" model.InFeatures model.OutFeatures model.Layers.Length
+    printfn "[Train] synthetic=%b useKvc=%b seqLen=%d" cfg.SyntheticMode cfg.UseKvCache cfg.SequenceLength
 
     use optimizer = torch.optim.Adam(Qwen3Model.parameters model, cfg.LearningRate, 0.9, 0.999, 1e-8, 0.0, false, false)
     let computeDtype =
@@ -151,11 +159,24 @@ module Trainer =
     for epoch in startEpoch .. cfg.Epochs do
       let mutable epochLoss = 0.0f
       for _step in 1 .. cfg.StepsPerEpoch do
-        let input, target = createBatch cfg.BatchSize model.InFeatures model.OutFeatures cfg.Device computeDtype
+        let input, target =
+          createBatch
+            cfg.BatchSize
+            model.InFeatures
+            model.OutFeatures
+            cfg.SequenceLength
+            cfg.UseKvCache
+            cfg.Device
+            computeDtype
         use inputTensor = input
         use targetTensor = target
         optimizer.zero_grad()
-        use output = Qwen3Model.forward model inputTensor (Some computeDtype)
+        use output =
+          if cfg.UseKvCache && model.Blocks.Length > 0 then
+            use cache = Qwen3Model.createKvCache model
+            Qwen3Model.forwardWithKvCache model cache inputTensor (Some computeDtype)
+          else
+            Qwen3Model.forward model inputTensor (Some computeDtype)
         use loss = scalarLoss output targetTensor
         loss.backward()
         optimizer.step() |> ignore

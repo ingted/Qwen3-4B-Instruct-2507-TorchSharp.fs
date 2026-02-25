@@ -18,6 +18,8 @@ type TrainingConfig =
     OutFeatures: int64
     MaxLayers: int
     SyntheticMode: bool
+    UseKvCache: bool
+    SequenceLength: int64
     LearningRate: float
     CheckpointDir: string
     SaveEverySteps: int
@@ -45,6 +47,8 @@ module Defaults =
       OutFeatures = 1024L
       MaxLayers = 2
       SyntheticMode = true
+      UseKvCache = false
+      SequenceLength = 8L
       LearningRate = 1e-3
       CheckpointDir = "./checkpoints"
       SaveEverySteps = 0

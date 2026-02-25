@@ -1,0 +1,18 @@
+✦ I have created run-training-fp2-guarded.fsx, which implements the logic of run-training-fp2-guarded.sh in F# and uses FAkka.Argu 1.0.0 for parameter parsing as requested.
+
+
+  The script supports the following parameters:
+   * --gpu-limit-gb <int>: GPU memory limit (default: 110 GB, or from GPU_LIMIT_GB environment variable).
+   * --gpu-over-secs <int>: Duration allowed over the limit before killing (default: 10 seconds, or from GPU_OVER_SECS).
+   * --gpu-poll-secs <int>: Monitoring polling interval (default: 1 second, or from GPU_POLL_SECS).
+   * script: A mandatory positional sub-command.
+   * <script-path>.fsx: The target script to run.
+   * <script-args>...: Arguments passed to the target script.
+
+  Example usage:
+   1 dotnet fsi run-training-fp2-guarded.fsx --gpu-limit-gb 80 script my-script.fsx --arg1 val1
+
+
+  The script monitors the child process's GPU memory usage by summing up results from both nvidia-smi --query-compute-apps and the nvidia-smi process table, ensuring
+  robustness similar to the original bash version. It also ensures that the child process is terminated if the guard script itself is stopped.
+
