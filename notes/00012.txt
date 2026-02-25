@@ -1467,4 +1467,1672 @@ TorchSharp
 
 › Grad Offload: 算完一部分梯度，立刻把它丟到 CPU 或磁碟（Offload），騰出空間
 
+
+
+
+
+• 我先直接指給你目前 grad offload 在程式裡的實作位置與實際行為，然後說清楚在 GB10 統一記憶體下它的意義與限制。
+
+• Explored
+  └ Search OffloadGradToCpu|offload-grad-to-cpu|gradCpuForStep|st\.Param\.grad <- null|to\(device = \"cpu\"\)|adamwStepNvfp4Packed in run-train-step-full-nvfp4.fsx
+    Read run-train-step-full-nvfp4.fsx
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 你說得對，先講結論：
+
+  1. 我現在做的 grad offload 不是寫 SSD。
+  2. 在 GB10（統一記憶體）上，cpu/cuda offload 不會增加總容量上限，只是在 allocator/位址空間層級搬動，主要目的是降 CUDA allocator 壓力與碎片，不是憑空多出記憶體。
+
+  目前實作方式在這裡：
+
+  - 先把每個參數的 gradient 複製到 CPU tensor，然後清掉 p.grad
+      - run-train-step-full-nvfp4.fsx:826
+      - run-train-step-full-nvfp4.fsx:832
+      - run-train-step-full-nvfp4.fsx:833
+  - optimizer step 再從 gradCpuForStep 取回，分 chunk 回到 CUDA 做更新
+      - run-train-step-full-nvfp4.fsx:448
+      - run-train-step-full-nvfp4.fsx:477
+      - run-train-step-full-nvfp4.fsx:480
+  - step 後釋放 CPU grad 暫存
+      - run-train-step-full-nvfp4.fsx:856
+
+  所以你的判斷是對的：
+  如果目標是「真正擴容」，應該做 disk offload（序列化 shard 到 SSD，再 streaming 讀回）。現在這版還沒做到那一步。
+
+  如果你要，我下一步可以做一個 --offload-grad-to-disk 原型（param-shard binary + streaming step）。
+
+
+› 4. optimizer step 已改成 chunked + streaming
+
+    - adamwStepNvfp4Packed 改為 row-chunk 更新（避免整個參數同時 materialize）run-train-step-full-nvfp4.fsx:428
+    - 新參數 --step-chunk-rows，預設改為 32（保守穩定）run-train-step-full-nvfp4.fsx:152
+    - 實驗結果：
+        - step-chunk-rows=32：有成功完整跑完的案例（108GB guard 下）
+        - step-chunk-rows=64：有 CUDA OOM 失敗案例（在 quantize/update 階段）
+
+  能不能解說一下
+
+
+• 可以，核心概念是這樣。
+
+  以前（非 chunked）
+
+  - 一次把整個參數的 w/m/v/grad 都解壓到計算 dtype（很多是 float32）再更新。
+  - 峰值會很高，特別在 optimizer step。
+
+  現在（chunked + streaming，run-train-step-full-nvfp4.fsx:428）
+
+  1. 每個參數先 reshape 成 2D [rows, cols]。
+  2. 以 --step-chunk-rows 分塊跑（例如 32 或 64 row）。
+  3. 每個 chunk 只做該段：
+      - 取 grad chunk
+      - 解壓 w/m/v chunk
+      - AdamW 更新
+      - 回寫參數
+      - 立刻量化回 NVFP4 並寫回 packed state
+  4. 跑完這個 chunk 後暫存就釋放，再跑下一塊。
+
+  關鍵程式段落：
+
+  - chunk 迴圈與解壓更新：run-train-step-full-nvfp4.fsx:475
+  - chunk 量化回 packed：run-train-step-full-nvfp4.fsx:504
+  - 參數控制：run-train-step-full-nvfp4.fsx:152, run-train-step-full-nvfp4.fsx:196
+
+  為什麼 32 可、64 會炸
+
+  - 64 每次 chunk 的中間張量更大（g32/m32/v32/mHat/vHat/denom/update/wNew 等），再加上 quantize kernel 的額外 workspace。
+  - 在你現在已經很高的佔用下，差這一段就可能觸發 allocator OOM（你那次是再要 ~20MiB 就失敗）。
+  - 所以 32 是「慢一點但穩」，64 是「快一點但風險明顯上升」。
+
+  補一句現況
+
+  - 這版已是「chunked 更新」，但仍有每參數的 destination packed buffer（wQNext/mQNext/vQNext）配置；目前預設配合 offload-w/mv-to-cpu=true，把這部分壓到 CPU 端，才撐得住。
+
+
+› 現在（chunked + streaming，run-train-step-full-nvfp4.fsx:428）
+
+    1. 每個參數先 reshape 成 2D [rows, cols]。
+    2. 以 --step-chunk-rows 分塊跑（例如 32 或 64 row）。
+    3. 每個 chunk 只做該段：
+        - 取 grad chunk
+        - 解壓 w/m/v chunk
+        - AdamW 更新
+        - 回寫參數
+        - 立刻量化回 NVFP4 並寫回 packed state
+    4. 跑完這個 chunk 後暫存就釋放，再跑下一塊。
+
+
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
+
+
+› 現在（chunked + streaming，run-train-step-full-nvfp4.fsx:428）
+
+    1. 每個參數先 reshape 成 2D [rows, cols]。
+    2. 以 --step-chunk-rows 分塊跑（例如 32 或 64 row）。
+    3. 每個 chunk 只做該段：
+        - 取 grad chunk
+        - 解壓 w/m/v chunk
+        - AdamW 更新
+        - 回寫參數
+        - 立刻量化回 NVFP4 並寫回 packed state
+    4. 跑完這個 chunk 後暫存就釋放，再跑下一塊。
+
+  這看起來應該要出現在 Qwen3-4B-Instruct-2507-TorchSharp.fs 裡面，怎麼變成在這個腳本當中呢
+
+
+• 你這個點是對的。
+  我先快速確認 Qwen3-4B-Instruct-2507-TorchSharp.fs 現在的訓練模組結構，然後給你「為什麼暫時放腳本」與「要搬回專案的具體落點」。
+
+• Explored
+  └ Search module Trainer|let train|optimizer|Adam|checkpoint|offload|step|backward in *.fs
+    List Qwen3-4B-Instruct-2507-TorchSharp.fs
+    Search \.fs$
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 你說得完全正確，最終應該放在 Qwen3-4B-Instruct-2507-TorchSharp.fs，不該長期留在 runner 腳本。
+
+  目前放在 run-train-step-full-nvfp4.fsx 的原因是工程策略：
+
+  1. 這版是高風險實驗（會 OOM/卡死），先在腳本隔離驗證，不污染主訓練入口。
+  2. 需要大量 debug 控制（--stop-after、phase VRAM report、guard 驗證），腳本迭代快。
+  3. 先在 GB10 實機跑出可用區間（例如 step-chunk-rows=32），再收斂成專案 API。
+
+  你現在這個階段已經接近「可以回遷」了。
+  建議遷移落點：
+
+  1. 新增 Qwen3-4B-Instruct-2507-TorchSharp.fs/Nvfp4Optimizer.fs
+      - 放 PackedNvfp4 state、chunked/streaming adamwStepNvfp4Packed。
+  2. 擴充 Qwen3-4B-Instruct-2507-TorchSharp.fs/Types.fs
+      - 加 StepChunkRows、offload policy、profiling flags。
+  3. 修改 Qwen3-4B-Instruct-2507-TorchSharp.fs/Trainer.fs
+      - 把目前 torch.optim.Adam(...) 路徑接上 NVFP4 optimizer 路徑。
+  4. 修改 Qwen3-4B-Instruct-2507-TorchSharp.fs/Cli.fs
+      - 暴露對應 CLI 參數。
+
+  一句話：
+  現在在腳本是為了「先活下來、先量到數據」；下一步就是把已驗證的 chunked+streaming step 正式搬回專案。
+
+
+› 1. Qwen3-4B-Instruct-2507-TorchSharp.fs 切一個新 branch  出來 for 回遷 已驗證的 chunked+streaming step
+  2. 繼續說明
+
+      每個 chunk 只做該段：
+          - 取 grad chunk
+          - 解壓 w/m/v chunk
+          - AdamW 更新
+          - 回寫參數
+          - 立刻量化回 NVFP4 並寫回 packed state
+
+  "段"的意思是? 一個 batch 裡面可能幾個 input? 可是我們現在不是只送了一個 input prompt 進去?會有效?
+
+
+• 我先在 Qwen3-4B-Instruct-2507-TorchSharp.fs 建一個專用 branch，接著直接回答你「段」到底是切哪個維度、跟 batch/prompt 的關係。
+
+• Ran repo=/workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs; branch=feature/backport-chunked-streaming-step; git -C "$repo" status --short --branch; if git -C "$repo"
+  │ rev-parse --verify "$branch" >/dev/null 2>&1; then git -C "$repo" checkout "$branch"; else git -C "$repo" checkout -b "$branch"; fi; git -C "$repo" branch
+  │ --show-current
+  └ ## featur/official-layer-connecctions...origin/featur/official-layer-connecctions
+     M Cli.fs
+    … +12 lines
+    Switched to a new branch 'feature/backport-chunked-streaming-step'
+    feature/backport-chunked-streaming-step
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 已完成，第 1 點 done：
+
+  - repo: Qwen3-4B-Instruct-2507-TorchSharp.fs
+  - 新 branch: feature/backport-chunked-streaming-step
+  - 是從你目前工作分支切出（原本就有未提交修改，我沒有動它們內容）。
+
+  第 2 點說明：
+
+  你問的「段」不是指一個 batch 裡的第幾個 input/prompt，
+  「段」是指「單一參數張量在參數維度上的一小塊 row slice」。
+
+  具體來說：
+
+  1. 對每個參數（例如某層權重）先 reshape 成 2D [rows, cols]。
+  2. 用 step-chunk-rows 把 rows 切塊，例如一次處理 32 列。
+  3. 每次只更新這 32 列對應的 w/m/v/grad，更新完就寫回並釋放暫存，再處理下一塊。
+
+  所以它跟「你送幾個 prompt」是不同軸：
+
+  - prompt/batch 影響的是 gradient 的數值（loss 來源）。
+  - chunked step 影響的是 optimizer 更新時的記憶體峰值（怎麼分批算同一組參數）。
+
+  即使你現在只用 1 個 input prompt，參數還是 4B 規模，
+  step 時把參數更新切塊仍然非常有效，因為省的是 optimizer 的中間暫存峰值。
+
+
+› 1. 我說過了， notes 類的東西都要一併 commit，你先移除剛剛建立的 branch，然後重新正確 commit 之後再 checkout 新 branch
+
+
+• 我先照你要求回滾流程：先刪掉剛建立的 branch，回到原分支後把目前改動（含 notes/*）完整 commit，再重新切新 branch。
+
+• Ran repo=/workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs; git -C "$repo" log --oneline --decorate -n 5
+  └ 6e5d6a1 (HEAD -> feature/backport-chunked-streaming-step, origin/featur/official-layer-connecctions, featur/official-layer-connecctions) fix(fp2): decode elemType=101
+    scale before STE dequantization
+    … +2 lines
+    12369f8 refactor(training-fp): declare block graph with Fun.DGX ->> stage composition
+    9402f5b refactor(training-fp): use Fun.DGX operator chaining for block-level model graph
+
+• Ran repo=/workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs; git -C "$repo" branch --show-current; git -C "$repo" status --short --branch; git -C "$repo" branch --list
+  └ feature/backport-chunked-streaming-step
+    ## feature/backport-chunked-streaming-step
+    … +15 lines
+      feature/um-managed-path-ts-q4-disable-um-0
+      main
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 接下來我會：切回 featur/official-layer-connecctions、刪除 feature/backport-chunked-streaming-step，然後在原分支把目前變更（含 notes/*）一次 commit。
+
+• Ran repo=/workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs; git -C "$repo" checkout featur/official-layer-connecctions; git -C "$repo" branch -D feature/
+  │ backport-chunked-streaming-step; git -C "$repo" branch --show-current; git -C "$repo" branch --list
+  └ Switched to branch 'featur/official-layer-connecctions'
+    M    Cli.fs
+    … +11 lines
+      feature/um-managed-path-ts-q4-disable-um-0
+      main
+
+• Ran repo=/workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs; git -C "$repo" status --short --branch
+  └ ## featur/official-layer-connecctions...origin/featur/official-layer-connecctions
+     M Cli.fs
+    … +10 lines
+    ?? notes/00011.txt
+    ?? notes/00012.txt
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我確認 notes/* 都還在工作區，現在會用 git add -A 一次納入並提交。
+
+• Ran repo=/workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs; git -C "$repo" add -A; git -C "$repo" commit -m "chore: sync training path updates and notes"; git -C "$repo" log
+  │ --oneline --decorate -n 3
+  └ [featur/official-layer-connecctions e982a19] chore: sync training path updates and notes
+     13 files changed, 3893 insertions(+), 29 deletions(-)
+    … +6 lines
+    6e5d6a1 (origin/featur/official-layer-connecctions) fix(fp2): decode elemType=101 scale before STE dequantization
+    68751ba docs: update devlog/sd and add investigation notes
+
+• Ran repo=/workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs; git -C "$repo" checkout -b feature/backport-chunked-streaming-step; git -C "$repo" status --short --branch; git -C
+  │ "$repo" log --oneline --decorate -n 2
+  └ Switched to a new branch 'feature/backport-chunked-streaming-step'
+    ## feature/backport-chunked-streaming-step
+    e982a19 (HEAD -> feature/backport-chunked-streaming-step, featur/official-layer-connecctions) chore: sync training path updates and notes
+    6e5d6a1 (origin/featur/official-layer-connecctions) fix(fp2): decode elemType=101 scale before STE dequantization
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 已照你要求完成，流程是：
+
+  1. 刪除剛剛那個 branch
+
+  - 已刪：feature/backport-chunked-streaming-step（舊的）
+
+  2. 回原分支先 commit（含 notes）
+
+  - 分支：featur/official-layer-connecctions
+  - commit：e982a19
+  - 訊息：chore: sync training path updates and notes
+  - 含 notes/00008.txt ~ notes/00012.txt 一起進 commit
+
+  3. 再重新切新 branch
+
+  - 已新建：feature/backport-chunked-streaming-step
+  - 基底就是上面這顆 e982a19
+
+  目前狀態是乾淨工作樹（無未提交變更）。
+  如果你要，我下一步就在這個新 branch 開始做「chunked+streaming step 回遷到專案本體」實作。
+
+
+› 2. 用 step-chunk-rows 把 rows 切塊，例如一次處理 32 列。
+    3. 每次只更新這 32 列對應的 w/m/v/grad，更新完就寫回並釋放暫存，再處理下一塊。
+
+  這是指巨大的 tensor 在經過 operator 運算時，例如矩陣乘法，CPU 處理像是先取一列 * 一行得到第0個元素，循序做完，而之前由 CUDA 自行整個矩陣去算，他可能很高效，但是可能一次取
+  太多行列併行跑，現在我們自己指定每次運算的規模?
+
+
+• 你理解方向接近，但有一個關鍵差別：
+
+  不是在改「前向/反向的矩陣乘法 operator 怎麼算元素」，
+  而是在改「optimizer step 更新參數」的工作集大小。
+
+  正確說法：
+
+  1. 我們切的是參數 tensor（[rows, cols]）的 row chunk，不是把 GEMM 改成 CPU 一格一格算。
+  2. 每個 chunk 內的運算（g32/m32/v32/update）仍是 tensor kernel，在 CUDA 上並行做。
+  3. 我們控制的是「一次丟給 kernel 的資料量」，讓中間暫存不要爆 VRAM。
+  4. CUDA 內部怎麼 tile/排程（warp、block）還是它自己決定，我們沒有手改到那層。
+
+  所以你可以把它看成：
+
+  - 以前：一次更新整顆大參數（快但峰值高）
+  - 現在：分批更新同一顆參數（峰值低、通常較慢）
+
+  這就是 step-chunk-rows 的本質。
+
+
+› 能不能舉例?不懂
+
+
+• 可以，直接用一個小例子。
+
+  假設某層權重 W 形狀是 [8192, 8192]。
+  optimizer step 需要同時用到：
+
+  - W（權重）
+  - G（grad）
+  - M,V（Adam 狀態）
+  - 還有中間量：mHat/vHat/denom/update/...
+
+  以前（不切塊）
+
+  1. 一次處理整個 [8192,8192]。
+  2. 這些張量與中間量都可能是「整張」大小。
+  3. 峰值很高，容易 OOM。
+
+  現在（step-chunk-rows=32）
+
+  1. 先取第 0~31 列（shape [32,8192]）。
+  2. 只對這一小塊做 AdamW 更新，更新完立刻寫回/量化回 packed state。
+  3. 釋放這塊中間暫存。
+  4. 再做 32~63 列、64~95 列……直到 8191 列。
+
+  重點：
+
+  - 每一步仍是 CUDA tensor 並行算，不是 CPU 一格一格乘。
+  - 只是把「一次要算的資料塊」從整張改成小塊。
+  - 好處是 VRAM 峰值降很多；代價通常是速度變慢。
+
+
+› chunked+streaming step 跟不切，數學上最終輸出是相同的嗎?
+
+
+• 短答：理論上同式；實務上通常「近似相同」，不保證 bitwise 完全相同。
+
+  1. 在實數數學下
+
+  - AdamW 對每個元素的更新是局部公式。
+  - 把 tensor 拆 chunk 做，和整塊做，理論上結果一樣。
+
+  2. 在實際實作下（BF16/FP32 + 量化）
+
+  - 浮點捨入、kernel 實作、量化/反量化都會引入微小差異。
+  - 所以 chunked vs non-chunked 常見是「數值非常接近」，但不一定逐 bit 一致。
+
+  3. 你的這版還有 NVFP4 repack
+
+  - 每個 chunk 更新後就量化回 packed state。
+  - 若量化尺度是局部計算（常見），差異通常很小；但仍可能和整塊一次量化有些微差。
+
+  4. 對訓練影響
+
+  - 單 step 通常差很小。
+  - 多 step 會累積，訓練軌跡可能分岔（這是正常現象，不等於錯）。
+
+  如果你要，我可以幫你加一個 A/B parity 測試：同 seed 同 batch，比較 1-step 後 max_abs_diff（W/M/V、loss）。
+
+
+› 1. 請開始遷回
+  2. 之前的四步
+
+  1. 真正訓練 loop（loss/backward/optimizer step）
+  2. gradient checkpointing
+  3. optimizer state 壓縮/offload
+  4. train-step VRAM profile（不是 inference profile）
+
+  已經完成哪些了?
+
+
+• 收到，我先做兩件事並行：
+
+  1. 在新 branch 直接開始把 chunked+streaming optimizer 回遷進專案（先落地到 Trainer 路徑可跑）。
+  2. 同時盤點你列的四步目前完成度，給你精確狀態。
+
+• Explored
+  └ Read Trainer.fs, Types.fs
+    Search <Compile Include=|Project Sdk in *.fsproj
+    List *.fsproj
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我已確認專案入口：目前 Trainer.fs 還是直接用 torch.optim.Adam。
+  我現在會做第一版回遷：新增 Nvfp4Optimizer.fs（含 packed state + chunked step），並讓 Trainer.run 可以走這條路；預設先保持安全相容。
+
+• Explored
+  └ Read Cli.fs, Program.fs
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我會先做最小可用回遷骨架：
+
+  - Types/Cli/Program/Trainer 增加訓練配置項
+  - 新增 Nvfp4Optimizer.fs（chunked+streaming step）
+    先讓專案內可以選擇走回遷路徑，再做細節調優。
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/Types.fs (+16 -0)
+    23      LearningRate: float
+    24 +    UsePackedNvfp4Optimizer: bool
+    25 +    GradCheckpointChunk: int
+    26 +    OptimizerStepChunkRows: int64
+    27 +    OffloadMVToCpu: bool
+    28 +    OffloadWToCpu: bool
+    29 +    OffloadGradToCpu: bool
+    30 +    StepFlushEachParam: bool
+    31 +    ProfileTrainStepVram: bool
+    32      CheckpointDir: string
+       ⋮
+    60        LearningRate = 1e-3
+    61 +      UsePackedNvfp4Optimizer = false
+    62 +      GradCheckpointChunk = 0
+    63 +      OptimizerStepChunkRows = 32L
+    64 +      OffloadMVToCpu = true
+    65 +      OffloadWToCpu = true
+    66 +      OffloadGradToCpu = true
+    67 +      StepFlushEachParam = true
+    68 +      ProfileTrainStepVram = false
+    69        CheckpointDir = "./checkpoints"
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/Cli.fs (+18 -0)
+     79            LearningRate = parseFloat "--lr" Defaults.trainingConfig.LearningRate kv
+     80 +          UsePackedNvfp4Optimizer =
+     81 +            parseBool "--use-packed-optimizer" Defaults.trainingConfig.UsePackedNvfp4Optimizer kv
+     82 +          GradCheckpointChunk = parseInt "--grad-ckpt-chunk" Defaults.trainingConfig.GradCheckpointChunk kv
+     83 +          OptimizerStepChunkRows =
+     84 +            parseInt64 "--optimizer-step-chunk-rows" Defaults.trainingConfig.OptimizerStepChunkRows kv
+     85 +          OffloadMVToCpu = parseBool "--offload-mv-to-cpu" Defaults.trainingConfig.OffloadMVToCpu kv
+     86 +          OffloadWToCpu = parseBool "--offload-w-to-cpu" Defaults.trainingConfig.OffloadWToCpu kv
+     87 +          OffloadGradToCpu = parseBool "--offload-grad-to-cpu" Defaults.trainingConfig.OffloadGradToCpu kv
+     88 +          StepFlushEachParam = parseBool "--step-flush-each-param" Defaults.trainingConfig.StepFlushEachParam kv
+     89 +          ProfileTrainStepVram = parseBool "--profile-train-step-vram" Defaults.trainingConfig.ProfileTrainStepVram kv
+     90            CheckpointDir = getOrDefault "--checkpoint-dir" Defaults.trainingConfig.CheckpointDir kv
+        ⋮
+    117      printfn "  --lr <float>"
+    118 +    printfn "  --use-packed-optimizer <true|false>"
+    119 +    printfn "  --grad-ckpt-chunk <int>"
+    120 +    printfn "  --optimizer-step-chunk-rows <int64>"
+    121 +    printfn "  --offload-mv-to-cpu <true|false>"
+    122 +    printfn "  --offload-w-to-cpu <true|false>"
+    123 +    printfn "  --offload-grad-to-cpu <true|false>"
+    124 +    printfn "  --step-flush-each-param <true|false>"
+    125 +    printfn "  --profile-train-step-vram <true|false>"
+    126      printfn "  --checkpoint-dir <path>"
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/Program.fs (+9 -0)
+    30            cfg.StrictLoad
+    31 +        printfn
+    32 +          "[Init] packedOpt=%b gradCkptChunk=%d stepChunkRows=%d offload(m/v/wg)=%b/%b/%b profileTrainStepVram=%b"
+    33 +          cfg.UsePackedNvfp4Optimizer
+    34 +          cfg.GradCheckpointChunk
+    35 +          cfg.OptimizerStepChunkRows
+    36 +          cfg.OffloadMVToCpu
+    37 +          cfg.OffloadWToCpu
+    38 +          cfg.OffloadGradToCpu
+    39 +          cfg.ProfileTrainStepVram
+    40
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我現在把 Nvfp4Optimizer.fs 加進專案（從腳本回遷的核心 chunked+streaming step），接著串到 Trainer.run。
+
+• Added Qwen3-4B-Instruct-2507-TorchSharp.fs/Nvfp4Optimizer.fs (+367 -0)
+      1 +namespace Qwen3_4B_Instruct_2507_TorchSharp_fs
+      2 +
+      3 +open System
+      4 +open TorchSharp
+      5 +open TorchSharp.Modules
+      6 +open TorchSharp.Q4.Extension
+      7 +
+      8 +type PackedNvfp4 =
+      9 +  {
+     10 +    mutable QData: torch.Tensor
+     11 +    mutable Scale: torch.Tensor
+     12 +    Shape: int64 array
+     13 +    StorageDevice: string
+     14 +  }
+     15 +
+     16 +type PackedParamState =
+     17 +  {
+     18 +    Name: string
+     19 +    Param: Parameter
+     20 +    mutable W: PackedNvfp4
+     21 +    mutable M: PackedNvfp4
+     22 +    mutable V: PackedNvfp4
+     23 +  }
+     24 +
+     25 +type PackedAdamwConfig =
+     26 +  {
+     27 +    Device: string
+     28 +    MasterDType: torch.ScalarType
+     29 +    LearningRate: float32
+     30 +    Beta1: float32
+     31 +    Beta2: float32
+     32 +    Eps: float32
+     33 +    WeightDecay: float32
+     34 +    StepChunkRows: int64
+     35 +    OffloadMVToCpu: bool
+     36 +    OffloadWToCpu: bool
+     37 +    OffloadGradToCpu: bool
+     38 +    FlushEachParam: bool
+     39 +  }
+     40 +
+     41 +type PackedAdamwState(config: PackedAdamwConfig, states: PackedParamState list) =
+     42 +  let mutable step = 0
+     43 +  member _.Config = config
+     44 +  member _.States = states
+     45 +  member _.Step
+     46 +    with get () = step
+     47 +    and set value = step <- value
+     48 +
+     49 +  interface IDisposable with
+     50 +    member _.Dispose() =
+     51 +      for st in states do
+     52 +        st.W.QData.Dispose()
+     53 +        st.W.Scale.Dispose()
+     54 +        st.M.QData.Dispose()
+     55 +        st.M.Scale.Dispose()
+     56 +        st.V.QData.Dispose()
+     57 +        st.V.Scale.Dispose()
+     58 +
+     59 +module Nvfp4Optimizer =
+     60 +  let private toMatrix2d (t: torch.Tensor) =
+     61 +    let shape = t.shape |> Array.copy
+     62 +    let view =
+     63 +      match shape.Length with
+     64 +      | 1 -> t.reshape([| 1L; shape.[0] |]).contiguous()
+     65 +      | 2 -> t.contiguous()
+     66 +      | _ ->
+     67 +        let cols = shape |> Array.skip 1 |> Array.fold (fun acc d -> acc * d) 1L
+     68 +        t.reshape([| shape.[0]; cols |]).contiguous()
+     69 +    view, shape
+     70 +
+     71 +  let private shapeToRowsCols (shape: int64 array) =
+     72 +    match shape.Length with
+     73 +    | 0 -> 1L, 1L
+     74 +    | 1 -> 1L, shape.[0]
+     75 +    | 2 -> shape.[0], shape.[1]
+     76 +    | _ ->
+     77 +      let cols = shape |> Array.skip 1 |> Array.fold (fun acc d -> acc * d) 1L
+     78 +      shape.[0], cols
+     79 +
+     80 +  let private packNvfp4 (source: torch.Tensor) (storageDevice: string) =
+     81 +    let matrix, shape = toMatrix2d source
+     82 +    try
+     83 +      let q, s = Nvfp4Training.quantizePacked matrix
+     84 +      try
+     85 +        let qStored =
+     86 +          if q.device.ToString() = storageDevice then
+     87 +            q.contiguous().clone()
+     88 +          else
+     89 +            use moved = q.``to``(device = storageDevice)
+     90 +            moved.contiguous().clone()
+     91 +
+     92 +        let sStored =
+     93 +          if s.device.ToString() = storageDevice then
+     94 +            s.contiguous().clone()
+     95 +          else
+     96 +            use moved = s.``to``(device = storageDevice)
+     97 +            moved.contiguous().clone()
+     98 +
+     99 +        {
+    100 +          QData = qStored
+    101 +          Scale = sStored
+    102 +          Shape = shape
+    103 +          StorageDevice = storageDevice
+    104 +        }
+    105 +      finally
+    106 +        q.Dispose()
+    107 +        s.Dispose()
+    108 +    finally
+    109 +      matrix.Dispose()
+    110 +
+    111 +  let private packMatrixToStorage (matrix2d: torch.Tensor) (storageDevice: string) =
+    112 +    use matrix = matrix2d.contiguous()
+    113 +    let q, s = Nvfp4Training.quantizePacked matrix
+    114 +    try
+    115 +      let qStored =
+    116 +        if q.device.ToString() = storageDevice then
+    117 +          q.contiguous().clone()
+    118 +        else
+    119 +          use moved = q.``to``(device = storageDevice)
+    120 +          moved.contiguous().clone()
+    121 +
+    122 +      let sStored =
+    123 +        if s.device.ToString() = storageDevice then
+    124 +          s.contiguous().clone()
+    125 +        else
+    126 +          use moved = s.``to``(device = storageDevice)
+    127 +          moved.contiguous().clone()
+    128 +      qStored, sStored
+    129 +    finally
+    130 +      q.Dispose()
+    131 +      s.Dispose()
+    132 +
+    133 +  let private unpackNvfp4Rows2d
+    134 +    (packed: PackedNvfp4)
+    135 +    (rowStart: int64)
+    136 +    (rowLen: int64)
+    137 +    (computeDevice: string)
+    138 +    (outDtype: torch.ScalarType) =
+    139 +    use qSlice0 = packed.QData.narrow(0L, rowStart, rowLen).contiguous()
+    140 +    use sSlice0 = packed.Scale.narrow(0L, rowStart, rowLen).contiguous()
+    141 +
+    142 +    let qTemp =
+    143 +      if qSlice0.device.ToString() = computeDevice then
+    144 +        None
+    145 +      else
+    146 +        Some(qSlice0.``to``(device = computeDevice))
+    147 +    let sTemp =
+    148 +      if sSlice0.device.ToString() = computeDevice then
+    149 +        None
+    150 +      else
+    151 +        Some(sSlice0.``to``(device = computeDevice))
+    152 +
+    153 +    let q =
+    154 +      match qTemp with
+    155 +      | Some t -> t
+    156 +      | None -> qSlice0
+    157 +    let s =
+    158 +      match sTemp with
+    159 +      | Some t -> t
+    160 +      | None -> sSlice0
+    161 +    try
+    162 +      use dense2d = Nvfp4Training.dequantizePacked q s outDtype
+    163 +      dense2d.contiguous().clone()
+    164 +    finally
+    165 +      qTemp |> Option.iter (fun t -> t.Dispose())
+    166 +      sTemp |> Option.iter (fun t -> t.Dispose())
+    167 +
+    168 +  let private replacePacked (target: PackedNvfp4) (next: PackedNvfp4) =
+    169 +    target.QData.Dispose()
+    170 +    target.Scale.Dispose()
+    171 +    target.QData <- next.QData
+    172 +    target.Scale <- next.Scale
+    173 +
+    174 +  let zeroGrad (parameters: Parameter list) =
+    175 +    for p in parameters do
+    176 +      if not (isNull p.grad) then
+    177 +        p.grad.zero_() |> ignore
+    178 +
+    179 +  let create
+    180 +    (config: PackedAdamwConfig)
+    181 +    (parameters: Parameter list)
+    182 +    (nameOf: Parameter -> string)
+    183 +    : PackedAdamwState =
+    184 +    let mvStorageDevice =
+    185 +      if config.OffloadMVToCpu then "cpu" else config.Device
+    186 +    let wStorageDevice =
+    187 +      if config.OffloadWToCpu then "cpu" else config.Device
+    188 +
+    189 +    let states =
+    190 +      parameters
+    191 +      |> List.map (fun p ->
+    192 +        use p0 = p.detach().contiguous()
+    193 +        let wPacked = packNvfp4 p0 wStorageDevice
+    194 +        use zeros = torch.zeros(p0.shape, dtype = p0.dtype, device = p0.device)
+    195 +        let mPacked = packNvfp4 zeros mvStorageDevice
+    196 +        let vPacked = packNvfp4 zeros mvStorageDevice
+    197 +        {
+    198 +          Name = nameOf p
+    199 +          Param = p
+    200 +          W = wPacked
+    201 +          M = mPacked
+    202 +          V = vPacked
+    203 +        })
+    204 +    new PackedAdamwState(config, states)
+    205 +
+    206 +  let stateSizeMiB (state: PackedAdamwState) =
+    207 +    let tensorMiB (t: torch.Tensor) =
+    208 +      int ((t.NumberOfElements * t.ElementSize) / 1024L / 1024L)
+    209 +    let w =
+    210 +      state.States
+    211 +      |> List.sumBy (fun st -> tensorMiB st.W.QData + tensorMiB st.W.Scale)
+    212 +    let m =
+    213 +      state.States
+    214 +      |> List.sumBy (fun st -> tensorMiB st.M.QData + tensorMiB st.M.Scale)
+    215 +    let v =
+    216 +      state.States
+    217 +      |> List.sumBy (fun st -> tensorMiB st.V.QData + tensorMiB st.V.Scale)
+    218 +    w, m, v
+    219 +
+    220 +  let step (state: PackedAdamwState) =
+    221 +    use _noGrad = torch.no_grad()
+    222 +    let cfg = state.Config
+    223 +    let nextStep = state.Step + 1
+    224 +
+    225 +    let beta1Pow = MathF.Pow(cfg.Beta1, float32 nextStep)
+    226 +    let beta2Pow = MathF.Pow(cfg.Beta2, float32 nextStep)
+    227 +    let biasCorr1 = 1.0f - beta1Pow
+    228 +    let biasCorr2 = 1.0f - beta2Pow
+    229 +    let stepChunkRows = max 1L cfg.StepChunkRows
+    230 +
+    231 +    let gradCpuOpt =
+    232 +      if cfg.OffloadGradToCpu then
+    233 +        let arr = Array.zeroCreate<torch.Tensor option> state.States.Length
+    234 +        for idx, st in state.States |> List.indexed do
+    235 +          let g = st.Param.grad
+    236 +          if not (isNull g) then
+    237 +            let gCpu = g.``to``(device = "cpu").contiguous().clone()
+    238 +            st.Param.grad <- null
+    239 +            arr.[idx] <- Some gCpu
+    240 +        Some arr
+    241 +      else
+    242 +        None
+    243 +
+    244 +    try
+    245 +      for idx, st in state.States |> List.indexed do
+    246 +        let gradSourceOpt =
+    247 +          match gradCpuOpt with
+    248 +          | Some arr when idx < arr.Length ->
+    249 +            match arr.[idx] with
+    250 +            | Some gCpu -> Some gCpu
+    251 +            | None ->
+    252 +              if isNull st.Param.grad then None else Some st.Param.grad
+    253 +          | _ ->
+    254 +            if isNull st.Param.grad then None else Some st.Param.grad
+    255 +
+    256 +        match gradSourceOpt with
+    257 +        | None -> ()
+    258 +        | Some gradSource ->
+    259 +          let rows, cols = shapeToRowsCols st.W.Shape
+    260 +          let mutable rowStart = 0L
+    261 +
+    262 +          use grad2d = gradSource.reshape([| rows; cols |]).contiguous()
+    263 +          use param2d = st.Param.reshape([| rows; cols |])
+    264 +          let wQNext = torch.empty(st.W.QData.shape, dtype = st.W.QData.dtype, device = st.W.QData.device)
+    265 +          let wSNext = torch.empty(st.W.Scale.shape, dtype = st.W.Scale.dtype, device = st.W.Scale.device)
+    266 +          let mQNext = torch.empty(st.M.QData.shape, dtype = st.M.QData.dtype, device = st.M.QData.device)
+    267 +          let mSNext = torch.empty(st.M.Scale.shape, dtype = st.M.Scale.dtype, device = st.M.Scale.device)
+    268 +          let vQNext = torch.empty(st.V.QData.shape, dtype = st.V.QData.dtype, device = st.V.QData.device)
+    269 +          let vSNext = torch.empty(st.V.Scale.shape, dtype = st.V.Scale.dtype, device = st.V.Scale.device)
+    270 +
+    271 +          while rowStart < rows do
+    272 +            let rowLen = min stepChunkRows (rows - rowStart)
+    273 +            use gSlice0 = grad2d.narrow(0L, rowStart, rowLen).contiguous()
+    274 +            let gSliceOpt =
+    275 +              if gSlice0.device.ToString() = cfg.Device then
+    276 +                None
+    277 +              else
+    278 +                Some(gSlice0.``to``(device = cfg.Device))
+    279 +            let gSlice =
+    280 +              match gSliceOpt with
+    281 +              | Some t -> t
+    282 +              | None -> gSlice0
+    283 +
+    284 +            use gBf16 =
+    285 +              if gSlice.dtype = torch.bfloat16 then gSlice.contiguous()
+    286 +              else gSlice.to_type(torch.bfloat16).contiguous()
+    287 +            use g32 = gBf16.to_type(torch.float32)
+    288 +            use w32 = unpackNvfp4Rows2d st.W rowStart rowLen cfg.Device torch.float32
+    289 +            use mPrev32 = unpackNvfp4Rows2d st.M rowStart rowLen cfg.Device torch.float32
+    290 +            use vPrev32 = unpackNvfp4Rows2d st.V rowStart rowLen cfg.Device torch.float32
+    291 +
+    292 +            use m32 = cfg.Beta1 * mPrev32 + (1.0f - cfg.Beta1) * g32
+    293 +            use v32 = cfg.Beta2 * vPrev32 + (1.0f - cfg.Beta2) * (g32 * g32)
+    294 +            use mHat = m32 / biasCorr1
+    295 +            use vHat = v32 / biasCorr2
+    296 +            use denom = torch.sqrt(vHat) + cfg.Eps
+    297 +            use update = (mHat / denom) + cfg.WeightDecay * w32
+    298 +            use wNew32 = w32 - cfg.LearningRate * update
+    299 +            use wNewMaster = wNew32.to_type(cfg.MasterDType).contiguous()
+    300 +            use pDst = param2d.narrow(0L, rowStart, rowLen)
+    301 +            pDst.copy_(wNewMaster) |> ignore
+    302 +
+    303 +            use mPackSrc = m32.to_type(torch.bfloat16).contiguous()
+    304 +            use vPackSrc = v32.to_type(torch.bfloat16).contiguous()
+    305 +            let wQChunk, wSChunk = packMatrixToStorage wNewMaster st.W.StorageDevice
+    306 +            let mQChunk, mSChunk = packMatrixToStorage mPackSrc st.M.StorageDevice
+    307 +            let vQChunk, vSChunk = packMatrixToStorage vPackSrc st.V.StorageDevice
+    308 +            try
+    309 +              use wQDst = wQNext.narrow(0L, rowStart, rowLen)
+    310 +              use wSDst = wSNext.narrow(0L, rowStart, rowLen)
+    311 +              use mQDst = mQNext.narrow(0L, rowStart, rowLen)
+    312 +              use mSDst = mSNext.narrow(0L, rowStart, rowLen)
+    313 +              use vQDst = vQNext.narrow(0L, rowStart, rowLen)
+    314 +              use vSDst = vSNext.narrow(0L, rowStart, rowLen)
+    315 +              wQDst.copy_(wQChunk) |> ignore
+    316 +              wSDst.copy_(wSChunk) |> ignore
+    317 +              mQDst.copy_(mQChunk) |> ignore
+    318 +              mSDst.copy_(mSChunk) |> ignore
+    319 +              vQDst.copy_(vQChunk) |> ignore
+    320 +              vSDst.copy_(vSChunk) |> ignore
+    321 +            finally
+    322 +              wQChunk.Dispose()
+    323 +              wSChunk.Dispose()
+    324 +              mQChunk.Dispose()
+    325 +              mSChunk.Dispose()
+    326 +              vQChunk.Dispose()
+    327 +              vSChunk.Dispose()
+    328 +              gSliceOpt |> Option.iter (fun t -> t.Dispose())
+    329 +
+    330 +            rowStart <- rowStart + rowLen
+    331 +
+    332 +          replacePacked st.W
+    333 +            {
+    334 +              QData = wQNext
+    335 +              Scale = wSNext
+    336 +              Shape = Array.copy st.W.Shape
+    337 +              StorageDevice = st.W.StorageDevice
+    338 +            }
+    339 +          replacePacked st.M
+    340 +            {
+    341 +              QData = mQNext
+    342 +              Scale = mSNext
+    343 +              Shape = Array.copy st.M.Shape
+    344 +              StorageDevice = st.M.StorageDevice
+    345 +            }
+    346 +          replacePacked st.V
+    347 +            {
+    348 +              QData = vQNext
+    349 +              Scale = vSNext
+    350 +              Shape = Array.copy st.V.Shape
+    351 +              StorageDevice = st.V.StorageDevice
+    352 +            }
+    353 +          st.Param.grad <- null
+    354 +
+    355 +          if cfg.FlushEachParam then
+    356 +            if torch.cuda_is_available() then
+    357 +              torch.cuda.synchronize()
+    358 +            NativeInterop.tryEmptyNvfp4Cache() |> ignore
+    359 +
+    360 +      state.Step <- nextStep
+    361 +    finally
+    362 +      gradCpuOpt
+    363 +      |> Option.iter (fun arr ->
+    364 +        arr
+    365 +        |> Array.iter (function
+    366 +          | Some g -> g.Dispose()
+    367 +          | None -> ()))
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj (+1 -0)
+    17      <Compile Include="InferenceBridge.fs" />
+    18 +    <Compile Include="Nvfp4Optimizer.fs" />
+    19      <Compile Include="Trainer.fs" />
+
+─ Worked for 1m 21s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我正在改 Trainer.fs：加入
+
+  - train-step VRAM profiling（可開關）
+  - grad checkpoint backward
+  - packed NVFP4 optimizer 分支（回遷路徑）
+    完成後會先 build 檢查。
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/Trainer.fs (+64 -0)
+     5  open System.Text.Json
+     6 +open System.Diagnostics
+     7  open TorchSharp
+       ⋮
+    27  module Trainer =
+    28 +  let private getGpuMemSnapshotMiB (pid: int) =
+    29 +    try
+    30 +      let psi = ProcessStartInfo("nvidia-smi")
+    31 +      psi.Arguments <- "--query-compute-apps=pid,used_memory --format=csv,noheader,nounits"
+    32 +      psi.RedirectStandardOutput <- true
+    33 +      psi.UseShellExecute <- false
+    34 +      psi.CreateNoWindow <- true
+    35 +      use p = Process.Start(psi)
+    36 +      let output = p.StandardOutput.ReadToEnd()
+    37 +      p.WaitForExit()
+    38 +      let entries =
+    39 +        output.Split([| '\n'; '\r' |], StringSplitOptions.RemoveEmptyEntries)
+    40 +        |> Array.fold (fun acc line ->
+    41 +          let parts = line.Split([| ',' |], StringSplitOptions.RemoveEmptyEntries)
+    42 +          if parts.Length >= 2 then
+    43 +            match Int32.TryParse(parts.[0].Trim()), Int32.TryParse(parts.[1].Trim()) with
+    44 +            | (true, p), (true, mem) -> (p, mem) :: acc
+    45 +            | _ -> acc
+    46 +          else
+    47 +            acc) []
+    48 +      let pidMem =
+    49 +        entries |> List.fold (fun acc (p, mem) -> if p = pid then acc + mem else acc) 0
+    50 +      let totalMem =
+    51 +        entries |> List.fold (fun acc (_, mem) -> acc + mem) 0
+    52 +      pidMem, totalMem
+    53 +    with _ ->
+    54 +      0, 0
+    55 +
+    56 +  let private profileTrainStepVram (cfg: TrainingConfig) (phase: string) =
+    57 +    if cfg.ProfileTrainStepVram then
+    58 +      let pidMem, totalMem = getGpuMemSnapshotMiB Environment.ProcessId
+    59 +      printfn "[TrainVRAM] phase=%s pid=%dMiB total=%dMiB" phase pidMem totalMem
+    60 +
+    61 +  let private backwardWithSequenceRecompute
+    62 +    (model: Qwen3Nvfp4Model)
+    63 +    (input: torch.Tensor)
+    64 +    (target: torch.Tensor)
+    65 +    (chunkSize: int)
+    66 +    (computeDtype: torch.ScalarType) =
+    67 +    let seqLen = int input.shape.[1]
+    68 +    let totalChunks = max 1 ((seqLen + chunkSize - 1) / chunkSize)
+    69 +    let mutable start = 0
+    70 +    let mutable lossSum = 0.0f
+    71 +
+    72 +    while start < seqLen do
+    73 +      let ending = min seqLen (start + chunkSize)
+    74 +      let prefixLen = int64 ending
+    75 +      let chunkStart = int64 start
+    76 +      let chunkLen = int64 (ending - start)
+    77 +
+    78 +      use prefixInput = input.narrow(1L, 0L, prefixLen).contiguous()
+    79 +      use prefixOutput = Qwen3Model.forward model prefixInput (Some computeDtype)
+    80 +      use chunkOutput = prefixOutput.narrow(1L, chunkStart, chunkLen).contiguous()
+    81 +      use chunkTarget = target.narrow(1L, chunkStart, chunkLen).contiguous()
+    82 +      use chunkLoss = scalarLoss chunkOutput chunkTarget
+    83 +      use scaledLoss = chunkLoss / float32 totalChunks
+    84 +      scaledLoss.backward()
+    85 +      use lossCpu = scaledLoss.to_type(torch.float32).cpu()
+    86 +      lossSum <- lossSum + lossCpu.item<float32>()
+    87 +      start <- ending
+    88 +
+    89 +    lossSum
+    90 +
+    91    let checkpointMetaPath (cfg: TrainingConfig) =
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/Trainer.fs (+126 -37)
+    206      printfn "[Train] synthetic=%b useKvc=%b seqLen=%d" cfg.SyntheticMode cfg.UseKvCache cfg.SequenceLength
+    207 +    printfn
+    208 +      "[Train] packedOpt=%b gradCkptChunk=%d stepChunkRows=%d offload(m/v/wg)=%b/%b/%b profileTrainStepVram=%b"
+    209 +      cfg.UsePackedNvfp4Optimizer
+    210 +      cfg.GradCheckpointChunk
+    211 +      cfg.OptimizerStepChunkRows
+    212 +      cfg.OffloadMVToCpu
+    213 +      cfg.OffloadWToCpu
+    214 +      cfg.OffloadGradToCpu
+    215 +      cfg.ProfileTrainStepVram
+    216
+    208 -    use optimizer = torch.optim.Adam(Qwen3Model.parameters model, cfg.LearningRate, 0.9, 0.999, 1e-8, 0.0, false, false)
+    217 +    let trainableParams = Qwen3Model.parameters model
+    218 +    let optimizerOpt =
+    219 +      if cfg.UsePackedNvfp4Optimizer then
+    220 +        None
+    221 +      else
+    222 +        Some(torch.optim.Adam(trainableParams, cfg.LearningRate, 0.9, 0.999, 1e-8, 0.0, false, false))
+    223 +
+    224      let computeDtype =
+    225        if cfg.Device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then torch.float16 else torch.float32
+    226 +    let masterDtype =
+    227 +      match trainableParams with
+    228 +      | p :: _ -> p.dtype
+    229 +      | [] -> computeDtype
+    230 +
+    231 +    let nameByKey = System.Collections.Generic.Dictionary<int, string>()
+    232 +    for layer in model.Layers do
+    233 +      nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(layer.MasterWeight)] <- layer.Name
+    234 +    for i = 0 to model.ExtraParameters.Length - 1 do
+    235 +      let p = model.ExtraParameters.[i]
+    236 +      nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(p)] <- sprintf "extra.%d" i
+    237 +
+    238 +    let nameOfParam (p: Parameter) =
+    239 +      let key = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(p)
+    240 +      match nameByKey.TryGetValue key with
+    241 +      | true, name -> name
+    242 +      | _ -> sprintf "param.%d" key
+    243 +
+    244 +    let packedOptimizerStateOpt =
+    245 +      if cfg.UsePackedNvfp4Optimizer then
+    246 +        let packedCfg : PackedAdamwConfig =
+    247 +          {
+    248 +            Device = cfg.Device
+    249 +            MasterDType = masterDtype
+    250 +            LearningRate = float32 cfg.LearningRate
+    251 +            Beta1 = 0.9f
+    252 +            Beta2 = 0.999f
+    253 +            Eps = 1e-8f
+    254 +            WeightDecay = 0.0f
+    255 +            StepChunkRows = max 1L cfg.OptimizerStepChunkRows
+    256 +            OffloadMVToCpu = cfg.OffloadMVToCpu
+    257 +            OffloadWToCpu = cfg.OffloadWToCpu
+    258 +            OffloadGradToCpu = cfg.OffloadGradToCpu
+    259 +            FlushEachParam = cfg.StepFlushEachParam
+    260 +          }
+    261 +        let st = Nvfp4Optimizer.create packedCfg trainableParams nameOfParam
+    262 +        let w, m, v = Nvfp4Optimizer.stateSizeMiB st
+    263 +        printfn "[Train] packed NVFP4 state size (MiB): w=%d m=%d v=%d total=%d" w m v (w + m + v)
+    264 +        Some st
+    265 +      else
+    266 +        None
+    267
+        ⋮
+    278
+    223 -    for epoch in startEpoch .. cfg.Epochs do
+    224 -      let mutable epochLoss = 0.0f
+    225 -      for _step in 1 .. cfg.StepsPerEpoch do
+    226 -        let input, target =
+    227 -          createBatch
+    228 -            cfg.BatchSize
+    229 -            model.InFeatures
+    230 -            model.OutFeatures
+    231 -            cfg.SequenceLength
+    232 -            cfg.UseKvCache
+    233 -            cfg.Device
+    234 -            computeDtype
+    235 -        use inputTensor = input
+    236 -        use targetTensor = target
+    237 -        optimizer.zero_grad()
+    238 -        use output =
+    239 -          if cfg.UseKvCache && model.Blocks.Length > 0 then
+    240 -            use cache = Qwen3Model.createKvCache model
+    241 -            Qwen3Model.forwardWithKvCache model cache inputTensor (Some computeDtype)
+    242 -          else
+    243 -            Qwen3Model.forward model inputTensor (Some computeDtype)
+    244 -        use loss = scalarLoss output targetTensor
+    245 -        loss.backward()
+    246 -        optimizer.step() |> ignore
+    279 +    try
+    280 +      for epoch in startEpoch .. cfg.Epochs do
+    281 +        let mutable epochLoss = 0.0f
+    282 +        for stepInEpoch in 1 .. cfg.StepsPerEpoch do
+    283 +          let input, target =
+    284 +            createBatch
+    285 +              cfg.BatchSize
+    286 +              model.InFeatures
+    287 +              model.OutFeatures
+    288 +              cfg.SequenceLength
+    289 +              cfg.UseKvCache
+    290 +              cfg.Device
+    291 +              computeDtype
+    292 +          use inputTensor = input
+    293 +          use targetTensor = target
+    294 +          profileTrainStepVram cfg (sprintf "e%d.s%d.batch_ready" epoch stepInEpoch)
+    295
+    248 -        use lossForRead = loss.to_type(torch.float32).cpu()
+    249 -        let lossValue = lossForRead.item<float32>()
+    250 -        epochLoss <- epochLoss + lossValue
+    251 -        globalStep <- globalStep + 1
+    296 +          match packedOptimizerStateOpt with
+    297 +          | Some _ -> Nvfp4Optimizer.zeroGrad trainableParams
+    298 +          | None ->
+    299 +            optimizerOpt |> Option.iter (fun optimizer -> optimizer.zero_grad())
+    300 +          profileTrainStepVram cfg (sprintf "e%d.s%d.zero_grad_done" epoch stepInEpoch)
+    301
+    253 -        if cfg.SaveEverySteps > 0 && globalStep % cfg.SaveEverySteps = 0 then
+    254 -          saveCheckpoint cfg epoch globalStep model
+    255 -          printfn "[Train] checkpoint saved at step=%d dir=%s" globalStep cfg.CheckpointDir
+    302 +          let useGradCheckpoint =
+    303 +            cfg.GradCheckpointChunk > 0
+    304 +            && inputTensor.shape.Length = 3
+    305 +            && cfg.GradCheckpointChunk < int inputTensor.shape.[1]
+    306 +            && not cfg.UseKvCache
+    307
+    257 -      let avgLoss = epochLoss / float32 cfg.StepsPerEpoch
+    258 -      printfn "[Train] epoch=%d avg_loss=%f" epoch avgLoss
+    259 -      saveCheckpoint cfg epoch globalStep model
+    308 +          let lossValue =
+    309 +            if useGradCheckpoint then
+    310 +              backwardWithSequenceRecompute
+    311 +                model
+    312 +                inputTensor
+    313 +                targetTensor
+    314 +                cfg.GradCheckpointChunk
+    315 +                computeDtype
+    316 +            else
+    317 +              use output =
+    318 +                if cfg.UseKvCache && model.Blocks.Length > 0 then
+    319 +                  use cache = Qwen3Model.createKvCache model
+    320 +                  Qwen3Model.forwardWithKvCache model cache inputTensor (Some computeDtype)
+    321 +                else
+    322 +                  Qwen3Model.forward model inputTensor (Some computeDtype)
+    323 +              use loss = scalarLoss output targetTensor
+    324 +              loss.backward()
+    325 +              use lossForRead = loss.to_type(torch.float32).cpu()
+    326 +              lossForRead.item<float32>()
+    327 +          profileTrainStepVram cfg (sprintf "e%d.s%d.backward_done" epoch stepInEpoch)
+    328 +
+    329 +          match packedOptimizerStateOpt with
+    330 +          | Some packedState ->
+    331 +            Nvfp4Optimizer.step packedState
+    332 +          | None ->
+    333 +            optimizerOpt |> Option.iter (fun optimizer -> optimizer.step() |> ignore)
+    334 +          profileTrainStepVram cfg (sprintf "e%d.s%d.optimizer_step_done" epoch stepInEpoch)
+    335 +
+    336 +          epochLoss <- epochLoss + lossValue
+    337 +          globalStep <- globalStep + 1
+    338 +
+    339 +          if cfg.SaveEverySteps > 0 && globalStep % cfg.SaveEverySteps = 0 then
+    340 +            saveCheckpoint cfg epoch globalStep model
+    341 +            printfn "[Train] checkpoint saved at step=%d dir=%s" globalStep cfg.CheckpointDir
+    342 +
+    343 +        let avgLoss = epochLoss / float32 cfg.StepsPerEpoch
+    344 +        printfn "[Train] epoch=%d avg_loss=%f" epoch avgLoss
+    345 +        saveCheckpoint cfg epoch globalStep model
+    346
+    261 -    if startEpoch > cfg.Epochs then
+    262 -      printfn "[Train] no epoch executed (resume epoch already beyond configured epochs)."
+    347 +      if startEpoch > cfg.Epochs then
+    348 +        printfn "[Train] no epoch executed (resume epoch already beyond configured epochs)."
+    349 +    finally
+    350 +      packedOptimizerStateOpt |> Option.iter (fun st -> (st :> IDisposable).Dispose())
+    351 +      optimizerOpt |> Option.iter (fun optimizer -> optimizer.Dispose())
+
+• Ran dotnet build /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj -c Release
+  └   Determining projects to restore...
+      All projects are up-to-date for restore.
+    … +55 lines
+
+    Time Elapsed 00:00:04.65
+
+─ Worked for 1m 23s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我先修 build 錯誤（Trainer 內前後定義順序與 Parameter 型別引用），修完再重新 build。
+
+• Explored
+  └ Read Trainer.fs
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/Trainer.fs (+11 -1)
+     7  open TorchSharp
+     8 +open TorchSharp.Modules
+     9
+       ⋮
+    82        use chunkTarget = target.narrow(1L, chunkStart, chunkLen).contiguous()
+    82 -      use chunkLoss = scalarLoss chunkOutput chunkTarget
+    83 +      let chunkTargetForLossTemp =
+    84 +        if chunkTarget.dtype = chunkOutput.dtype then None else Some (chunkTarget.to_type(chunkOutput.dtype))
+    85 +      let chunkTargetForLoss =
+    86 +        match chunkTargetForLossTemp with
+    87 +        | Some t -> t
+    88 +        | None -> chunkTarget
+    89 +      use diff = chunkOutput - chunkTargetForLoss
+    90 +      use absDiff = diff.abs()
+    91 +      use chunkLoss = absDiff.mean()
+    92        use scaledLoss = chunkLoss / float32 totalChunks
+    93        scaledLoss.backward()
+    94 +      chunkTargetForLossTemp |> Option.iter (fun t -> t.Dispose())
+    95        use lossCpu = scaledLoss.to_type(torch.float32).cpu()
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我已修正 Trainer 的編譯錯誤點，現在重新 build 驗證回遷版是否可編譯。
+
+• Ran dotnet build /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj -c Release
+  └   Determining projects to restore...
+      All projects are up-to-date for restore.
+    … +44 lines
+
+    Time Elapsed 00:00:05.06
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 回遷第一版已經可編譯，我再抓一下目前變更清單與關鍵位置，接著給你四步完成度的精確盤點。
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs status --short --branch
+  └ ## feature/backport-chunked-streaming-step
+     M Cli.fs
+    … +3 lines
+     M Types.fs
+    ?? Nvfp4Optimizer.fs
+
+• Explored
+  └ Search UsePackedNvfp4Optimizer|GradCheckpointChunk|OptimizerStepChunkRows|OffloadMVToCpu|OffloadWToCpu|OffloadGradToCpu|ProfileTrainStepVram in Types.fs
+    Search module Nvfp4Optimizer|type PackedAdamwConfig|let create|let step|stateSizeMiB|zeroGrad|backwardWithSequenceRecompute|TrainVRAM in Nvfp4Optimizer.fs
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 已開始遷回，而且第一版已經進主專案並可編譯。
+
+  目前在 branch：
+
+  - feature/backport-chunked-streaming-step
+
+  已回遷內容（Qwen3-4B-Instruct-2507-TorchSharp.fs）：
+
+  1. 新增 chunked+streaming optimizer 模組
+
+  - Nvfp4Optimizer.fs（packed w/m/v + row-chunk step）
+  - 入口：Nvfp4Optimizer.step 在 Nvfp4Optimizer.fs:220
+
+  2. Trainer.run 接入可切換路徑
+
+  - 保留舊 torch.optim.Adam
+  - 新增 UsePackedNvfp4Optimizer 時走 Nvfp4Optimizer
+  - 位置：Trainer.fs:229, Trainer.fs:255, Trainer.fs:307
+
+  3. gradient checkpointing 接入 Trainer
+
+  - backwardWithSequenceRecompute
+  - 位置：Trainer.fs:62, 使用點 Trainer.fs:320
+
+  4. train-step VRAM profile（訓練路徑）
+
+  - nvidia-smi PID/total phase log
+  - 位置：Trainer.fs:28, Trainer.fs:56
+
+  5. config/cli 全部接上
+
+  - Types.fs 新欄位：Types.fs:24
+  - Cli.fs 新參數：Cli.fs:80
+  - Program.fs 啟動列印：Program.fs:33
+
+  6. 專案檔已納入新模組
+
+  - Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj:18
+
+  編譯狀態：
+
+  - dotnet build -c Release 成功（僅 nullness warning）
+
+  你問的「之前四步完成哪些」：
+
+  1. 真正訓練 loop（loss/backward/optimizer step）
+
+  - 已完成（原本就有，現在多了 packed optimizer 分支）
+
+  2. gradient checkpointing
+
+  - 已完成（第一版）
+  - 目前限制：只在 3D 輸入且 not UseKvCache 啟用
+
+  3. optimizer state 壓縮/offload
+
+  - 已完成（第一版）
+  - packed w/m/v + CPU offload（OffloadMVToCpu/OffloadWToCpu/OffloadGradToCpu）
+  - 磁碟 offload 仍未做
+
+  4. train-step VRAM profile（非 inference）
+
+  - 已完成（第一版）
+  - 目前是 phase console log（PID/total），尚未做 JSON 報表與更細粒度 allocator 指標
+
+  如果你同意，我下一步直接做第 2 輪回遷：
+
+  1. 把 step-chunk-rows 預設策略與 guard 實測對齊（32 為 safe default）
+  2. 補 Trainer 的 JSON train-step VRAM report
+  3. 補一個最小可重現的 1-step 實訓腳本直接走專案 API，不再依賴外部大腳本
+
+
+› A. gradient checkpointing 這是什麼?
+    "目前限制：只在 3D 輸入且 not UseKvCache 啟用" 啥 3D，之前不是討論訓練不需要 KV Cache? 那這個設定是啥? 另外 Qwen 使用的是 GQA 注意力，你實現的正確嗎?
+
+  B. 磁碟 offload 做下去真的好嗎?
+    目前的 offload 如果沒意義是不是就只是浪費處理器的效能? 那要不要把相關程式碼改回不要 offload?
+
+  C. 請準備大概 10 組 training 用的 input 放在 TrainData 目錄
+  D. /workspace/fsann/alpha/runner-arm64-fp4 下的文件，像是 SA/SD/DevLog 如果是底層架構的，該放回 Qwen3-4B-Instruct-2507-TorchSharp.fs/doc 下的檔案內的，記得把內容搬過去，未
+  來請使用該位置的文件檔
                                                                                                                                                             36% context left
+
+
+
+
+
+
+• A/B/C/D/E/F 都已落地，且我做了 guard 實跑驗證。
+
+  A. gradient checkpointing / 3D / KVC / GQA
+
+  1. gradient checkpointing 是用「重算 forward」換顯存，減少 activation 常駐。
+  2. 你看到的 3D 指的是輸入 shape [B,T,H]（batch, seq, hidden），不是 [B,H]。條件在 Trainer.fs:384。
+  3. 目前限制 not UseKvCache 是刻意的，因為現行重算函式是 prefix-recompute，若同時寫 KVC 會把 stateful cache 混進訓練圖，容易出錯。
+  4. GQA 這版是正確方向，且我補了 fail-fast 防呆：num_heads % num_kv_heads == 0 必須成立。位置在 Qwen3Core.fs:111、InferenceBridge.fs:339。
+
+  B. offload 要不要做
+
+  1. 目前專案核心不是「磁碟 offload」，是 CPU offload（w/m/v/grad 的存放策略）。
+  2. 在 GB10 這種 UM 架構下，CPU offload 常有 copy 開銷，未必賺，所以我把專案預設改成不 offload：Types.fs:65。
+  3. 但為了在 108GB guard 下穩定跑完 1-step，我在 scripts/Train.OneStep.fsx 的預設改成 offload 開啟（可用參數覆蓋）。
+
+  C. 10 組訓練輸入
+
+  1. 已新增 TrainData/train-inputs.txt:1 到 TrainData/train-inputs.txt:10。
+
+  D. 文件回遷
+
+  1. 已把 runner 的 SA/SD/DevLog/WBS 同步回專案 doc/。
+  2. 並補上本輪變更與實驗紀錄：doc/SA.md、doc/SD.md、doc/DevLog.md、doc/WBS.md。
+
+  E. 現在怎麼啟動訓練
+
+  1. 最小文本實訓（直接走專案 API，一步訓練）：
+
+  cd /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs
+  dotnet fsi scripts/Train.OneStep.fsx --train-data TrainData/train-inputs.txt --sample-index 0 --seq-len 8 --vram-report doc/train-step-vram-onestep.json
+
+  2. 建議正式跑法（108GB guard）：
+
+  cd /workspace/fsann/alpha/runner-arm64-fp4
+  dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/
+  Train.OneStep.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/train-inputs.txt --sample-index 0 --seq-len 8 --vram-report /workspace/Qwen3-4B-
+  Instruct-2507-TorchSharp.fs/doc/train-step-vram-onestep.json
+
+  F. 你列的 3 項
+
+  1. step-chunk-rows safe default 32：已對齊，Types.fs:64。
+  2. Trainer JSON train-step VRAM report：已實作，Trainer.fs:28、Trainer.fs:80、Trainer.fs:112、Trainer.fs:432，CLI 參數在 Cli.fs:95、Cli.fs:132。
+  3. 最小可重現 1-step 實訓腳本：已新增 scripts/Train.OneStep.fsx:1。
+
+  驗證
+
+  1. dotnet build 已通過（warnings only）。
+  2. guarded 實跑成功一次，完成 optimizer_step_done，輸出 loss=8.78125，並產生 doc/train-step-vram-onestep.json。
+
+
+
+
+
+
+
+
+› 2. 在 GB10 這種 UM 架構下，CPU offload 常有 copy 開銷，未必賺，所以我把專案預設改成不 offload：Types.fs:65。
+    3. 但為了在 108GB guard 下穩定跑完 1-step，我在 scripts/Train.OneStep.fsx 的預設改成 offload 開啟（可用參數覆蓋）。
+  => DGX Spark 的優勢不是 zero-copy 嗎?開啟了沒有好處吧?
+
+  1. 最小文本實訓（直接走專案 API，一步訓練）=> 那更新後的權重已經覆蓋原本的 dat 了?
+
+   1-step => 這啥意思?
+
+  完成 optimizer_step_done => 意思?
+
+  輸出 loss=8.78125 => 代表?
+
+  並產生 doc/train-step-vram-onestep.json => 這做啥用?
+
+
+
+
+• 你問得很準，逐點回：
+
+  1. DGX Spark 的 zero-copy / UM 優勢是否代表 offload 一定沒好處？
+     不是。
+     UM 代表可共享位址與按頁遷移，不代表「完全零成本」。當壓力大時，仍會有 page migration / fault / 同步成本。
+     所以：
+
+  - 追求穩定不爆：開 offload 有時能壓峰值。
+  - 追求吞吐：offload 常會慢，可能不划算。
+
+  2. 「最小文本實訓」會覆蓋原本 .dat 嗎？
+     不會。
+     目前 scripts/Train.OneStep.fsx 只在記憶體內更新參數，結束就釋放，沒有回寫 .dat。
+     它也沒有做 checkpoint 存檔。
+  3. 1-step 是什麼？
+     一次完整訓練步：
+     forward -> loss -> backward -> optimizer.step
+     只跑一個 batch、一步更新。
+  4. optimizer_step_done 是什麼意思？
+     表示 optimizer 已成功執行更新（參數在記憶體中被更新一次），沒有在 step 階段炸掉/OOM。
+  5. loss=8.78125 代表什麼？
+     代表該 batch 當下的訓練損失值（目前腳本是用 embedding-target 的 loss）。
+     它只證明「訓練流程可跑通」，不代表模型品質已改善；單一步數值本身不具備收斂意義。
+  6. doc/train-step-vram-onestep.json 是做什麼？
+     是這一步的 VRAM phase 報表（例如 model_loaded, backward_done, optimizer_step_done）。
+     用途是定位哪個階段吃到峰值，方便你後續調：
+
+  - step-chunk-rows
+  - offload 開關
+  - seq len / batch size
+
+  如果你要，我可以下一步把 Train.OneStep.fsx 預設也改成「offload 關閉」，再提供兩組 preset（stable/throughput）給你直接選。
+
+
+
+
+• 是，一致，但要分兩層看。
+
+  1. 實體層
+     DGX Spark GB10 可以視為單一實體記憶體池（UMA）。
+  2. 軟體/執行層
+     PyTorch/TorchSharp 仍有 cpu tensor 與 cuda tensor 的邏輯分域（不同 allocator 與生命週期）。
+     所以「只有一塊記憶體」和「offload 有效果」可以同時成立。
+
+  你第 2 點的理解要修正成：
+
+  1. 在我們目前的實作裡，offload 主要是儲存位置/allocator 壓力的 offload，不是把 optimizer 算子改成 CPU 算。
+  2. Nvfp4Optimizer.step 仍在 CUDA 裡算更新；offload-* 是把 w/m/v/grad 長駐資料放到 CPU 邏輯域，步進時再分 chunk 搬回 CUDA 算。
+  3. 所以它能壓峰值，但通常會變慢（搬移成本）。
+
+  對應程式位置：
+
+  - Nvfp4Optimizer.fs（OffloadMVToCpu/OffloadWToCpu/OffloadGradToCpu 與 step 行為）
+  - Types.fs:65（專案預設 offload 關閉）
+  - scripts/Train.OneStep.fsx（目前腳本預設 offload 開啟，為了 108GB guard 穩定通過）
+
+
+
+
+
+
+
+› 1. 請訓練讓我們的模型在被問到 "你是誰" 的時候回答 "我是 F# 之神"，並將 dat 文件另存
+  2. 自己測試用該令存 dat 文件初始化模型，在生成對 "你是誰" 輸入時，要輸出 "我是 F# 之神" (或類似語意)
+  3. 如果無法達成，請修正模型或者訓練方式或者 input => 在 DevLog 紀錄訓練過程，你怎麼克服困難，怎麼解決德
+
+
+
+
+
+› 為什麼失敗了
+
+
+• 失敗點是「沒達成精確輸出 我是 F# 之神」，主因有 4 個：
+
+  1. 目標函數不對
+     現在腳本用的是 hidden-state 的回歸 loss（Trainer.scalarLoss），不是 token-level 的 logits cross-entropy。
+     這會讓模型偏向「語意接近」，不會強制特定字串。
+  2. 可訓練範圍太小
+     為了 108GB guard 能穩跑，我最後只訓練少量 projection（甚至只最後 1 層），lm_head 沒訓練。
+     因此很難把輸出詞彙硬拉到 F# 之神。
+  3. NVFP4 更新有量化死區
+     每步都會 pack/unpack，學習率小時更新容易被量化吃掉。
+     你看到多輪 loss 卡在 7.449 就是這個跡象（更新幅度不足）。
+  4. 顯存約束限制了可用訓練配置
+     把學習率或可訓練層數拉高時，曾出現 NaN / !!!! / 超過 guard 被 kill。
+     所以只能用保守設定，結果就變成「穩定但學不動到精確字串」。
+
+  結論：
+  流程本身（訓練→另存 dat→用新 dat 啟動）是成功的；失敗的是「精確詞彙對齊」這個訓練目標。
+  要解這個，需要改成 token-level CE loss，並把 lm_head（至少）納入可訓練。
+
+
+
+
+› 1. hidden-state 的回歸 loss（Trainer.scalarLoss） 這好多名詞，是是什麼?
+  2. 只訓練少量 projection（甚至只最後 1 層）(這樣還叫做全參數嗎?)，lm_head 沒訓練 (代表?)
+  3. 之前不是說
+
+  Weights (Forward) 使用 NVFP4 => 享受最高的 Tensor Core 吞吐量
+  Gradients 使用 BF16 => 確保反向傳播的訊號不會消失
+  Master Weights 使用 BF16 => 負責接收並累積微小的更新值
+  Optimizer States使用 8-bit AdamW => 在記憶體節省與訓練穩定性間取得平衡
+
+  過程都已經用了 BF16 還不行?
+
+  4.現在不是官方接線?為什麼還要動曾數?
+
+
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
+
+
+› 1. hidden-state 的回歸 loss（Trainer.scalarLoss） 這好多名詞，是是什麼?
+  2. 只訓練少量 projection（甚至只最後 1 層）(這樣還叫做全參數嗎?)，lm_head 沒訓練 (代表?)
+  3. 之前不是說
+
+  Weights (Forward) 使用 NVFP4 => 享受最高的 Tensor Core 吞吐量
+  Gradients 使用 BF16 => 確保反向傳播的訊號不會消失
+  Master Weights 使用 BF16 => 負責接收並累積微小的更新值
+  Optimizer States使用 8-bit AdamW => 在記憶體節省與訓練穩定性間取得平衡
+
+  過程都已經用了 BF16 還不行?
+
+  4.現在不是官方接線?為什麼還要動層數?
+
+
+• 你問得很好，直接回答：
+
+  1. hidden-state 回歸 loss 是什麼？
+     現在這個 Trainer.scalarLoss 做的是：
+
+  - 模型輸出：每個位置的 hidden 向量（不是字詞機率）
+  - 目標：下一個 token 的 embedding 向量
+  - loss：兩個向量差值的平均（L1/abs mean）
+
+  所以它在學「向量靠近」，不是直接學「這格要吐哪個 token」。
+  這就是為什麼語意可能接近，但字串不一定精準。
+
+  2. 只訓練最後 1 層算全參數嗎？lm_head 沒訓練代表？
+     不算全參數。
+     全參數是大部分可訓練權重都更新（含 attention/mlp/norm/lm_head 等）。
+
+  lm_head 沒訓練代表：
+
+  - 最後把 hidden 轉成 token logits 的投影頭不變
+  - 你想硬指定「我是 F# 之神」會更難，因為最直接控制詞彙分佈的層沒被調整
+
+  3. 你提的 BF16 方案為什麼還不行？
+     關鍵是：目前實作不是你列的那套完整配置。
+
+  現在實際上：
+
+  - CUDA 計算主要是 float16（不是 BF16）
+  - master weight 也是 float16（不是 BF16）
+  - optimizer state 是 NVFP4 packed（不是 8-bit AdamW）
+
+  所以「用了 BF16 還不行」這句在目前程式不成立；是「那套設計目標尚未完整落地」。
+
+  4. 已經官方接線了，為什麼還要動層數？
+     「官方接線」是前向圖結構對齊（block wiring 正確）。
+     「動層數」是訓練策略/資源控制（訓練哪些參數）。
+
+  兩者是不同維度：
+
+  - 接線對不對：決定模型算得合理不合理
+  - 訓哪些層：決定顯存是否爆、學得快不快、能不能在 guard 下跑完
+
+  你要的精確字串目標，下一步應該改成 token-level CE loss，並把 lm_head 納入訓練。
+
+
+
+
+› 1. hidden-state 的回歸 loss（Trainer.scalarLoss） 這好多名詞，是是什麼?
+  2. 只訓練少量 projection（甚至只最後 1 層）(這樣還叫做全參數嗎?)，lm_head 沒訓練 (代表?)
+  3. 之前不是說
+
+  Weights (Forward) 使用 NVFP4 => 享受最高的 Tensor Core 吞吐量
+  Gradients 使用 BF16 => 確保反向傳播的訊號不會消失
+  Master Weights 使用 BF16 => 負責接收並累積微小的更新值
+  Optimizer States使用 8-bit AdamW => 在記憶體節省與訓練穩定性間取得平衡
+
+  過程都已經用了 BF16 還不行?
+
+  4.現在不是官方接線?為什麼還要動曾數?
+
+
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
+
+
+› 1. hidden-state 的回歸 loss（Trainer.scalarLoss） 這好多名詞，是是什麼?
+  2. 只訓練少量 projection（甚至只最後 1 層）(這樣還叫做全參數嗎?)，lm_head 沒訓練 (代表?)
+  3. 之前不是說
+
+  Weights (Forward) 使用 NVFP4 => 享受最高的 Tensor Core 吞吐量
+  Gradients 使用 BF16 => 確保反向傳播的訊號不會消失
+  Master Weights 使用 BF16 => 負責接收並累積微小的更新值
+  Optimizer States使用 8-bit AdamW => 在記憶體節省與訓練穩定性間取得平衡
+
+  過程都已經用了 BF16 還不行?
+
+  4.現在不是官方接線?為什麼還要動層數?
+
+
+• 你問得很好，直接回答：
+
+  1. hidden-state 回歸 loss 是什麼？
+     現在這個 Trainer.scalarLoss 做的是：
+
+  - 模型輸出：每個位置的 hidden 向量（不是字詞機率）
+  - 目標：下一個 token 的 embedding 向量
+  - loss：兩個向量差值的平均（L1/abs mean）
+
+  所以它在學「向量靠近」，不是直接學「這格要吐哪個 token」。
+  這就是為什麼語意可能接近，但字串不一定精準。
+
+  2. 只訓練最後 1 層算全參數嗎？lm_head 沒訓練代表？
+     不算全參數。
+     全參數是大部分可訓練權重都更新（含 attention/mlp/norm/lm_head 等）。
+
+  lm_head 沒訓練代表：
+
+  - 最後把 hidden 轉成 token logits 的投影頭不變
+  - 你想硬指定「我是 F# 之神」會更難，因為最直接控制詞彙分佈的層沒被調整
+
+  3. 你提的 BF16 方案為什麼還不行？
+     關鍵是：目前實作不是你列的那套完整配置。
+
+  現在實際上：
+
+  - CUDA 計算主要是 float16（不是 BF16）
+  - master weight 也是 float16（不是 BF16）
+  - optimizer state 是 NVFP4 packed（不是 8-bit AdamW）
+
+  所以「用了 BF16 還不行」這句在目前程式不成立；是「那套設計目標尚未完整落地」。
+
+  4. 已經官方接線了，為什麼還要動層數？
+     「官方接線」是前向圖結構對齊（block wiring 正確）。
+     「動層數」是訓練策略/資源控制（訓練哪些參數）。
+
+  兩者是不同維度：
+
+  - 接線對不對：決定模型算得合理不合理
+  - 訓哪些層：決定顯存是否爆、學得快不快、能不能在 guard 下跑完
+
+  你要的精確字串目標，下一步應該改成 token-level CE loss，並把 lm_head 納入訓練。
+
+
+› 1. lm_head 到底是啥?
+  2. float16 跟  BF16 差異?為什麼你沒有依照規格實作?
+  3. NVFP4 packed（不是 8-bit AdamW）是什麼意思? Adam 還有分很多種?
+  4. 程式碼中怎麼控制訓練那些 tensor?
+
+
+• 1. lm_head 是什麼？
+     lm_head 是最後一層「詞彙投影頭」：把 hidden 向量投影成 vocab logits（每個 token 的分數）。
+     它直接決定模型最後「選哪個字詞」。
+     所以要硬拉成「我是 F# 之神」，lm_head 很關鍵。
+  2. float16 vs BF16，為什麼沒照你那版規格？
+     差異重點：
+
+  - float16：精度較高（mantissa 多），但動態範圍較小，較容易 overflow/underflow。
+  - BF16：精度較低（mantissa 少），但動態範圍大很多（和 fp32 同級 exponent），訓練更穩。
+
+  為什麼目前沒完整照你那版：
+
+  - 現有專案/腳本路徑是以 fp16 + 既有 Q4/NVFP4 流程先打通與穩定為主。
+  - 你說的「BF16 master/grad + 8-bit AdamW」是下一階段設計，還沒完整落地成 production trainer。
+
+  3. NVFP4 packed（不是 8-bit AdamW） 是什麼意思？Adam 有很多種嗎？
+     有，Adam 系列有多種變體（Adam、AdamW、8-bit AdamW 等）。
+     目前程式是：
+
+  - 更新公式是 AdamW 類型
+  - 但 w/m/v 狀態用 NVFP4 packed（qdata+scale）儲存，不是 bitsandbytes 那種 int8 optimizer state。
+    也就是「AdamW 公式 + NVFP4 壓縮狀態」這個自訂路徑。
+
+  4. 程式怎麼控制訓練哪些 tensor？
+     兩層控制：
+
+  - 通用 trainer（Trainer.run）：
+      - 用 Qwen3Model.parameters model 當 trainable 集合（幾乎全參數路徑）。
+  - WhoAmI 腳本（scripts/Train.WhoAmI.AndExportDat.fsx）：
+      - 先選 trainableLayers（例如最後 N 層）
+      - 再把 trainParams 丟給 Nvfp4Optimizer.create
+      - zeroGrad / step 只對 trainParams 做
+
+  補充：目前這是「只更新 subset」，不是嚴格 freeze；若要真凍結，還要把非訓練參數 requires_grad=false。
+
+
+› 1. BF16 master/grad + 8-bit AdamW  vram 會夠嗎?
+  2. AdamW 公式 + NVFP4 壓縮狀態 => 你覺得優嗎?
+  3. 用 Qwen3Model.parameters model 當 trainable 集合（幾乎全參數路徑） => 不懂? 幾乎? 所以我們到底訓練了什麼? 一個輸入 input prompt 跑了多少輪?
+  4. 先選 trainableLayers（例如最後 N 層）
+        - 再把 trainParams 丟給 Nvfp4Optimizer.create
+        - zeroGrad / step 只對 trainParams 做
+
+  先選 trainableLayers => "選"代表? trainParams 丟給 Nvfp4Optimizer.create => trainParams 是啥?
+
+
+• 1. BF16 master/grad + 8-bit AdamW VRAM 夠不夠？
+     以 4B 全參數來看，108GB guard 下「有機會」，但不保證。
+     瓶頸通常是 activation + optimizer state + 暫存峰值。
+     要準確判斷要看你的 seq_len / batch / checkpointing / chunking。純配置名不能保證。
+
+
+› 1. seq_len / batch / checkpointing / chunking 這些個別是啥?。"純配置名不能保證" 意思是?
+  2. 你最近的 WhoAmI 任務不是全參數，是「只最後 N 層 projection」=> 我不是希望是全參數訓練?為什麼還只調最後 N 層?
+
+
+• 1. 這些詞各是什麼，為什麼「純配置名不能保證」？
+
+  - seq_len：每次訓練看到的 token 長度。越長 activation 越大，吃記憶體越多。
+  - batch：一次並行幾筆樣本。越大越吃記憶體。
+  - checkpointing：少存 activation、需要時重算，省記憶體但變慢。
+  - chunking：把大 tensor/更新步驟分塊做（例如 row chunk），降低瞬間峰值。
+
+  「純配置名不能保證」的意思是：
+  你只說「BF16 + 8-bit AdamW」還不夠判斷會不會爆。
+  實際會不會爆要看上面四個量，加上實作細節（是否有額外暫存、是否同時 materialize 多份）。
+
+  2. 為什麼 WhoAmI 沒做全參數，而只做最後 N 層？
+
+  因為當時目標有兩個同時成立：
+
+  - 不能超過 108GB guard（不當機）
+  - 要先把「訓練->匯出 dat->再載入推論」整條流程打通
+
+  全參數在這台機器和當前實作下，先前已多次觸發 OOM / NaN / guard kill。
+  所以我先用「最後 N 層」當可執行折衷，讓流程可重現。
+
+  你要全參數可以做，但需要先接受其中一個條件：
+
+  - 降低 seq_len/batch 到更小
+  - 或放寬 guard
+  - 或先把 trainer 改成更省峰值（更完整 checkpoint + step streaming + token-level loss 同步改造）
+
+  你若要，我下一步就直接做「全參數 WhoAmI 版本」腳本，預設超保守（小 seq、小 steps、強 chunk），先求在 108GB 下跑完。
+
+
+
+  › 1. 我們不是只有一個輸入要學? batch 要怎麼更小?
+  2. 條件都可以試試，反正你想辦法讓全參數可以在 108GB vram情況下運作
+  3. 記得 commit push 以及撰寫 DevLog (拜託 DevLog請用中文)
+

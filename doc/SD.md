@@ -1,501 +1,336 @@
-# SD (System Design)
+# SD - fp2 Safe Diagnostic Design (2026-02-24)
 
-## Design Principles
-- Pure F# at the application layer.
-- NVFP4-first.
-- Diagnostics-first (all fallback/unavailable conditions must be observable).
+## 1. Problem Statement
+- `run-training-fp2.fsx` is used to validate inference via training-style block graph.
+- Historical failures show two distinct risks:
+  1. Runtime instability / OOM (especially fallback quantize path).
+  2. Semantic collapse (`!!!!`) caused by repeated token id `0`.
 
-## Module Design
-- `Types.fs`
-  - `TrainingConfig`, defaults, pure NVFP4 Q4 settings.
-- `Cli.fs`
-  - CLI -> `TrainingConfig`.
-- `Nvfp4State.fs`
-  - `load : TrainingConfig -> Nvfp4ModelState`.
-  - v1: synthetic.
-  - v2: real `.dat` parser.
-- `Qwen3Model.fs`
-  - `create : TrainingConfig -> Nvfp4ModelState -> Qwen3Nvfp4Model`.
-  - Manage `Q4Session` diagnostics + trainable master-weight layers.
-  - Forward path uses `Nvfp4Training.linearSte`.
-- `Trainer.fs`
-  - `run : TrainingConfig -> Qwen3Nvfp4Model -> unit`.
-  - Executes forward/loss/backward/optimizer update.
-  - Supports save/recover checkpoint (metadata + layer tensors).
-- `Program.fs`
-  - App entry + exception boundary.
+## 2. Design Goal
+- Keep diagnostics reproducible without multi-turn stress.
+- Fail fast before host-level instability escalates.
+- Isolate STE path behavior from non-STE block-graph behavior.
 
-## Data Flow
-1. Parse CLI config.
-2. Load NVFP4 state.
-3. Create Q4 session.
-   - CUDA runtime: `KernelOnly` + `nvfp4-kernel`.
-   - CPU runtime: `DequantMatmulOnly` + `dequant-matmul` fallback.
-4. Build model layers.
-5. Run training loop with optimizer update.
-6. Save checkpoint by step/epoch policy.
+## 3. Diagnostic Paths
+1. Path A (`A.infer`): baseline inference (`InferenceBridge.forwardModel`).
+2. Path B (`B.fp2_ste`): fp2 training-style path (`Qwen3Model.forward`, uses `linearSte`).
+3. Path C (`C.noste_graph`): block graph control (`Qwen3Core.forwardBlockNoCache` + `InferenceBridge.linearQ4`).
 
-## Error Handling
-- Startup failures (config/native/schema): fail fast.
-- Training failures: unified reporting at `Program` boundary.
+Interpretation rule:
+- If A ~= C but B diverges, bug is likely in STE path (`linearSte/steWeight` semantics).
+- If A diverges from both B/C, check shared components (tokenizer, weight load, config).
 
-## Future Extensions
-- Parser: `.dat` -> exact Qwen3 full-layer mapping.
-- Optimizer: add optimizer-state serialization and resume.
-- Scheduler: learning-rate schedule and warmup.
+## 4. Safety Controls
+1. Single-turn only (no chained dialogue turns).
+2. `TS_Q4_STE_USE_NATIVE_QUANTIZE=1` required for fp2-safe scripts.
+3. Fail-fast when first output contains `!!!!`.
+4. `--max-tokens` safety cap (`<= 8`) in safe script.
+5. External watchdog + timeout wrapping all fp2 tests.
 
-## Inference Parity Design (2026-02-12)
-### Scope
-- Build a pure F# inference path with no `Qwen3.dll` dependency.
-- Align runtime semantics with `run2.fsx` directionally by matching tokenizer, layer families, and decode flow.
+## 5. Implemented Scripts
+1. `run-training-fp2-safe.fsx`
+   - Single-turn STE test with guardrails.
+2. `run-training-fp2-noste.fsx`
+   - Single-turn no-STE block-graph control.
+3. `compare-first-token-fp2.fsx`
+   - One-prompt top-k logits/token-id diagnostic for A/B/C.
 
-### Components
-- `InferenceBridge.fs`
-  - `ModelConfigLite`: parse `config.json` fields (`hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `head_dim`, `vocab_size`, `eos_token_id`).
-  - `Q4WeightBank`: load required NVFP4 tensors by layer family:
-    - `self_attn.q_proj`, `self_attn.k_proj`, `self_attn.v_proj`, `self_attn.o_proj`
-    - `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj`
-    - `lm_head`
-  - `TokenizerBridge`: use `Tokenizers.DotNet` over `tokenizer.json`.
-  - `ForwardEngine`: explicit block wiring (`embedding -> attn projections -> mlp projections -> lm_head`).
+## 6. Runtime Prerequisite
+- CUDA must initialize successfully in the same container/session before fp2 diagnostics:
+  - `torch.cuda.is_available() == True`
+  - `torch.cuda.device_count() > 0`
+- If CUDA initialization fails (`Error 304`), abort fp2 experiments and recover runtime first.
 
-### Data Flow (Inference)
-1. Load config/tokenizer/weights.
-2. Encode prompt using `tokenizer.json`.
-3. Build token embeddings from tied `lm_head` rows.
-4. Run per-layer Qwen3-like projection flow.
-5. Compute logits with `lm_head`.
-6. Decode generated token ids using tokenizer.
+## 7. Latest Validation Snapshot (2026-02-24)
+1. `run-training-fp2-safe.fsx`:
+   - first turn output: `!!!!`
+   - generated ids: `[0;0;0;0]`
+2. `run-training-fp2-noste.fsx`:
+   - first turn output: `Hi! 😊`
+3. `compare-first-token-fp2.fsx`:
+   - `A.infer`: finite hidden/logits, reasonable top10.
+   - `B.fp2_ste`: NaN hidden/logits, top10 dominated by low-id punctuation.
+   - `C.noste_graph`: finite hidden/logits, top10 close to `A.infer`.
 
-### Validation Strategy
-- Compare `run-training.fsx` output with `run2.fsx` under same prompt/seed/device/quant.
-- Track parity at two levels:
-  - lexical readability (non-garbled decode)
-  - semantic closeness (manual/spot-check before full metric automation)
+## 8. Design Decision
+1. Keep fp2 diagnostics single-turn and guard-railed until STE path is fixed.
+2. Prioritize STE internals (`linearSte`, `steWeight`, quantize/dequantize semantics) over tokenizer/block wiring.
 
-### Implementation Status Snapshot
-- Implemented:
-  - tokenizer-based encode/decode (`tokenizer.json`)
-  - raw fp16 tensor loading for `embed_tokens` and norm weights
-  - 36-layer projection wiring (`q/k/v/o`, `gate/up/down`) with causal attention skeleton
-- Not yet implemented:
-  - RoPE position encoding (critical for attention semantics)
-  - exact Qwen3 KV-cache execution path
-  - full parity sampler behavior
+## 9. Fix Applied
+1. Root-cause hypothesis confirmed:
+   - NVFP4 `scale` from dat uses `elemType=101` (byte-encoded FP8-like scale), not plain uint8-linear scale.
+2. Implementation:
+   - Decode `uint8` scale to FP8(E4M3FN) float domain before `dequantizePacked` in `Qwen3Model.materializeMasterWeight`.
+3. Post-fix acceptance:
+   - `B.fp2_ste` hidden/logits must be finite.
+   - First-token top-k of `B.fp2_ste` should be semantically close to `A.infer` and `C.noste_graph`.
 
-## 設計原則
-- Pure F# at app layer。
-- NVFP4-first。
-- Diagnostics-first（任何 fallback/不可用都可觀測）。
+## 10. Regression Status (main runner)
+1. Main script `run-training-fp2.fsx` now uses the same single-turn safety contract as `run-training-fp2-safe.fsx`.
+2. Re-validated with prompt `hi`:
+   - output is normal text (`Hello! 👋`)
+   - no first-turn `!!!!` collapse
+3. Platform caveat:
+   - `nvidia-smi` on this GB10 setup returns `Memory-Usage: Not Supported`.
+   - The design therefore relies on script-level fail-fast and timeout-based guardrails instead of numeric VRAM polling.
 
-## 模組設計
-- `Types.fs`
-  - `TrainingConfig`, defaults, pure NVFP4 Q4 settings。
-- `Cli.fs`
-  - CLI -> `TrainingConfig`。
-- `Nvfp4State.fs`
-  - `load : TrainingConfig -> Nvfp4ModelState`。
-  - v1: synthetic。
-  - v2: real `.dat` parser。
-- `Qwen3Model.fs`
-  - `create : TrainingConfig -> Nvfp4ModelState -> Qwen3Nvfp4Model`。
-  - 管理 `Q4Session` diagnostics + 可訓練 master-weight layers。
-  - forward 使用 `Nvfp4Training.linearSte`。
-- `Trainer.fs`
-  - `run : TrainingConfig -> Qwen3Nvfp4Model -> unit`。
-  - 執行 forward/loss/backward/optimizer update。
-  - 支援 checkpoint 儲存與 recover（metadata + layer tensor）。
-- `Program.fs`
-  - app entry + exception boundary。
+## 11. Guarded Execution Contract
+1. Added wrapper `run-training-fp2-guarded.sh` for operational safety.
+2. Watch source:
+   - Primary: `nvidia-smi --query-compute-apps=pid,used_memory`
+   - Fallback: parse `nvidia-smi` process table (`GPU Memory` column).
+3. Enforcement:
+   - kill target PID when memory exceeds threshold (`110GB`) for continuous window (`10s`).
+4. Failure mode handling:
+   - if process memory is unobservable (stays `0MiB`), wrapper emits explicit warning that threshold enforcement is currently unavailable.
 
-## 資料流
-1. CLI 解析設定。
-2. 載入 NVFP4 state。
-3. 建立 Q4 session。
-   - CUDA runtime: `KernelOnly` + `nvfp4-kernel`。
-   - CPU runtime: `DequantMatmulOnly` + `dequant-matmul` fallback。
-4. 建立模型層。
-5. 跑訓練 loop 並更新參數。
-6. 依 step/epoch 政策儲存 checkpoint。
+## 12. No-Env Startup Contract
+1. `run-training-fp2.fsx` auto-enforces native STE quantize.
+2. Behavior:
+   - if `TS_Q4_STE_USE_NATIVE_QUANTIZE` is not enabled, script sets it to `1` at startup.
+3. Rationale:
+   - preserve OOM safety without requiring caller-side env var setup.
+4. Default safety alignment:
+   - default `--max-tokens` is now `8` so zero-arg invocation stays within cap.
 
-## 錯誤處理策略
-- 啟動階段（配置、native、schema）失敗：直接 fail fast。
-- 訓練階段失敗：在 `Program` 一層統一回報。
+## 13. Multi-turn Execution Contract
+1. `run-training-fp2.fsx` now supports multi-turn execution in-process.
+2. Added options:
+   - `--turns`
+   - `--followup-prompt`
+3. Turn behavior:
+   - turn 1 uses `--prompt`
+   - turn 2..N use `--followup-prompt`
+4. Safety behavior retained:
+   - any turn containing `!!!!` triggers fail-fast.
+5. Token cap policy:
+   - removed hard `MaxTokens <= 8` fail gate; caller controls `--max-tokens` explicitly.
 
-## 後續擴充點
-- Parser：`.dat` -> Qwen3 全層精確 mapping。
-- Optimizer：補 optimizer state 序列化與 resume。
-- Scheduler：加入 learning rate schedule/warmup。
+## 14. Zero-Arg Default Profile
+1. `run-training-fp2.fsx` now defaults to a multi-turn smoke profile:
+   - turns=3
+   - prompt=hi
+   - followup-prompt=continue.
+   - max-tokens=8
+2. This enables no-arg execution for routine regression checks.
 
-## 推論一致性設計（2026-02-12）
-### 範圍
-- 建立 pure F# 推論路徑，不依賴 `Qwen3.dll`。
-- 透過對齊 tokenizer、權重族群、解碼流程，讓語意品質方向性接近 `run2.fsx`。
+## 15. Default Prompt Parity
+1. No-arg default prompt in `run-training-fp2.fsx` restored to:
+   - `Write one short sentence about UFO and you.`
+2. Rationale: keep parity with `run-training2.fsx` comparison baseline.
 
-### 元件
-- `InferenceBridge.fs`
-  - `ModelConfigLite`：解析 `config.json` 必要欄位（`hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `head_dim`, `vocab_size`, `eos_token_id`）。
-  - `Q4WeightBank`：按 layer family 載入 NVFP4 權重：
-    - `self_attn.q_proj`, `self_attn.k_proj`, `self_attn.v_proj`, `self_attn.o_proj`
-    - `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj`
-    - `lm_head`
-  - `TokenizerBridge`：使用 `Tokenizers.DotNet` 讀取 `tokenizer.json`。
-  - `ForwardEngine`：明確接線（`embedding -> attn projections -> mlp projections -> lm_head`）。
+## 16. One-shot Repro Default Contract
+1. No-arg defaults are reset to prioritize first valid output:
+   - `turns=1`
+   - `max-tokens=4`
+2. Multi-turn remains an opt-in mode via explicit CLI args.
 
-### 推論資料流
-1. 載入 config/tokenizer/weights。
-2. 使用 `tokenizer.json` 編碼 prompt。
-3. 由 tied `lm_head` 權重列建立 token embeddings。
-4. 跑逐層 Qwen3-like projection 流程。
-5. 以 `lm_head` 計算 logits。
-6. 用 tokenizer 解碼生成 token ids。
+## 17. Guard Runner Contract (F# only)
+1. Use `run-script-with-guard.fsx` as the guard launcher.
+2. Mandatory observability:
+   - print `guard_pid`
+   - print child `dotnet_pid`
+3. Preflight checks:
+   - guard parameters must be positive
+   - target script path must exist
 
-### 驗證策略
-- 在相同 prompt/seed/device/quant 下，對照 `run-training.fsx` 與 `run2.fsx` 輸出。
-- 分兩層追蹤：
-  - 可讀性（非亂碼）
-  - 語意接近度（先人工 spot-check，後續再補指標化）
+## 18. Guard Default Policy (Crash Prevention)
+1. Default guard policy is now aggressive:
+   - limit=110GB
+   - over-secs=0 (kill on first observed breach)
+   - poll-secs=0.5
+2. Breach evaluation uses both:
+   - child PID memory
+   - total GPU process memory
+3. Fixed immediate-mode branch bug to avoid false unconditional kill.
 
-### 目前實作狀態
-- 已完成：
-  - 使用 `tokenizer.json` 的 encode/decode
-  - 載入 `embed_tokens` 與 norm 類 raw fp16 權重
-  - 36 層投影接線（`q/k/v/o`, `gate/up/down`）與 causal attention 骨架
-- 尚未完成：
-  - RoPE 位置編碼（對注意力語意至關重要）
-  - 完整對齊 Qwen3 的 KV-cache 執行路徑
-  - 取樣器細節與 parity 完整對齊
+## 19. KVC Design For fp2 Runner
+1. Goal:
+   - replace decode-time full replay with cache-based incremental decode in `run-training-fp2.fsx`.
+2. Strategy:
+   - prefill once on full rendered prompt.
+   - decode token-by-token using persistent `Qwen3Core.ModelKvCache`.
+3. Control:
+   - `--use-kvc` switch (default `true`) to keep replay fallback for A/B checks.
+4. Peak-risk notes:
+   - even with KVC, process still holds two model families if not trimmed (`InferenceBridge` + `Qwen3Model`).
+   - must reduce duplicate residency before expecting stable `max-tokens>=6` under strict VRAM limits.
 
-## Runtime Stability Hardening (2026-02-12)
-### Problem
-- Intermittent SIGSEGV in repeated `run-training2.fsx` runs, especially around mode switches (`KVCacheOut false -> true`).
-- Native stack indicates crash in tensor host->device transfer path (`THSTensor_to_device` / `at::to_copy`).
+## 20. Memory Mitigation Design
+1. Keep only required `InferenceBridge` components for fp2 sampling:
+   - tokenizer
+   - embed tokens
+   - final norm
+   - lm head
+2. Dispose unused `InferenceBridge` per-layer weights immediately after init in KVC mode.
+3. Use `torch.inference_mode()` during generation path.
 
-### Design adjustments
-- Loader lifecycle discipline:
-  - release temporary CPU tensors immediately after CUDA copy in `.dat` parser path.
-- Init scan reduction:
-  - avoid duplicate full-file scans for same dimension groups.
-  - reuse one parsed state for:
-    - `k_proj` + `v_proj`
-    - `gate_proj` + `up_proj`
-- Operational guardrails:
-  - keep `--empty-cache-each-turn` as explicit runtime switch.
-  - require stress test matrix (`KVC on/off`, repeated runs) before declaring stable.
+## 21. Guard Policy Update
+1. Default guard baseline tightened to:
+   - limit=108GB
+   - over-secs=0
+   - poll-secs=0.5
+2. This is now the required default for fp2 bring-up experiments.
 
-### Expected effect
-- Lower allocation spikes during init.
-- Reduce allocator fragmentation pressure and intermittent native crash probability.
-- Faster model init due to fewer `.dat` passes.
+## 22. KVC Backend Strategy
+1. Introduce `--kvc-backend` in `run-training-fp2.fsx`:
+   - `bridge` (default)
+   - `fp2-model`
+2. Runtime policy:
+   - default to `bridge` for reliable output and low VRAM.
+   - keep `fp2-model` as diagnostic parity path.
+3. Model residency policy:
+   - when backend is `bridge`, skip `Qwen3Model.create` to avoid duplicate heavy model residency.
+4. Acceptance target:
+   - with guard `(108GB, over=0, poll=0.5)`, `max-tokens=8/10/16` should complete without watchdog kill in default mode.
+5. Current status:
+   - `bridge`: meets acceptance target.
+   - `fp2-model`: still exceeds 108GB at `max-tokens=6` (optimization backlog remains).
 
-## Managed-UM Runtime Path (2026-02-12)
-### Design
-- Keep default path unchanged (`TS_Q4_DISABLE_UM` unset => existing defaults apply).
-- When `TS_Q4_DISABLE_UM=0`:
-  - `Types.fs` enables `PreferUnified`.
-  - `InferenceBridge.fs` promotes persistent raw tensors (`embed/norm family`) via `UnifiedMemory.applyMutablePolicy`.
-  - `Q4Linear` path (inside Q4 extension) promotes quantized weight bundles through managed allocator policy.
+## 23. Training-Path-Only Runtime Contract (2026-02-25)
+1. `run-training-fp2.fsx` policy:
+   - default backend = `fp2-model`
+   - `bridge` backend is rejected (hard fail)
+2. Rationale:
+   - enforce training graph as primary runtime for pre-training bring-up.
+   - remove accidental drift back to inference-only path.
 
-### Observability
-- Init prints:
-  - `[InferInit] UM(raw tensors): managed=<n> total=<m>`
-- This provides direct runtime evidence that raw tensor promotion happened.
+## 24. Sampling Session Split Design
+1. Added `InferenceBridge.initSamplingOnly(...)`.
+2. Loaded assets:
+   - tokenizer
+   - embed tokens
+   - final norm
+   - lm head (`Q4Linear`)
+3. Not loaded:
+   - per-layer q/k/v/o/mlp q4 weights.
+4. Purpose:
+   - eliminate startup double-residency peak when `Qwen3Model.create` is also loaded.
 
-### Compatibility
-- If UM capability is unavailable, policy falls back without changing non-UM behavior.
+## 25. STE Eval-Cache Design
+1. Added `Nvfp4Training` eval-only cache for dequantized STE weights.
+2. Activation condition:
+   - `torch.is_inference_mode_enabled() || not(torch.is_grad_enabled())`
+   - and `TS_Q4_STE_CACHE_EVAL_WEIGHT=1` (default enabled by runner).
+3. Invalidation:
+   - explicit API `Nvfp4Training.clearEvalWeightCache()` called in runner `finally`.
+4. Safety:
+   - training/grad-enabled flow still uses non-cached `steWeight` path.
 
-## Managed-UM 執行路徑（2026-02-12）
-### 設計
-- 預設路徑不變（`TS_Q4_DISABLE_UM` 未設定時維持既有預設）。
-- 當 `TS_Q4_DISABLE_UM=0`：
-  - `Types.fs` 啟用 `PreferUnified`。
-  - `InferenceBridge.fs` 會將持久 raw tensors（`embed/norm` 族群）透過 `UnifiedMemory.applyMutablePolicy` 升級。
-  - `Q4Linear` 路徑（Q4 extension 內）會依 policy 將量化權重 bundle 升級為 managed allocator 路徑。
+## 26. Native Quantize Strictness
+1. `run-training-fp2.fsx` now checks:
+   - `NativeInterop.hasLibTorchFp4Quantize() = true`
+2. Failure behavior:
+   - if missing, fail immediately.
+3. Purpose:
+   - prevent silent fallback quantize path in fp2 bring-up.
 
-### 可觀測性
-- init 輸出：
-  - `[InferInit] UM(raw tensors): managed=<n> total=<m>`
-- 可直接確認 raw tensor 升級是否發生。
+## 27. Current Acceptance Snapshot
+1. Guarded command:
+   - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx`
+2. Result:
+   - completed without kill.
+   - peak total process memory observed around `44GB`.
+   - output is coherent full sentence (no `!!!!` collapse).
 
-### 相容性
-- 若 UM 能力不可用，policy 可 fallback，不改變非 UM 行為。
+## 28. Persistent Multi-turn KVC Design (fp2-model)
+1. State model:
+   - `ModelKvCache` is allocated once per script run (not per turn).
+   - `contextTokens` tracks token count expected to be materialized in cache.
+2. Turn protocol:
+   - encode only current turn prefix:
+     - `<|im_start|>user ... <|im_end|>\n<|im_start|>assistant\n`
+   - prefill cache with this turn prefix.
+   - decode token-by-token.
+3. Cache consistency rule:
+   - every accepted generated token is immediately forwarded once (`forwardWithKvCache [token]`) so cache always includes the latest output token.
+   - at turn end, append and prefill `<|im_end|>\n` to close assistant message in cache.
+4. Benefits:
+   - avoids per-turn full history replay.
+   - supports real multi-turn continuation with persistent KV state.
+5. Observability:
+   - debug logs print `kvc seqLen` and `contextTokens` each turn.
 
-## 執行期穩定性強化（2026-02-12）
-### 問題
-- `run-training2.fsx` 重複執行時出現間歇性 SIGSEGV，特別是 `KVCacheOut false -> true` 切換後。
-- native stack 指向 host->device 張量搬移路徑（`THSTensor_to_device` / `at::to_copy`）。
+## 29. Persistent KVC Acceptance
+1. Guarded run (`turns=3`, `max-tokens=8`) must satisfy:
+   - no watchdog kill.
+   - `seqLen` strictly increases across turns.
+   - turn-2/3 generation latency significantly below turn-1 baseline.
+2. Semantic continuation check:
+   - with followup prompt requesting continuation, turn-2 output should continue prior clause rather than reset topic.
 
-### 設計調整
-- Loader 生命週期約束：
-  - `.dat` parser 在 CUDA copy 後立即釋放 CPU 暫存 tensor。
-- Init 掃描減量：
-  - 避免同維度群組的重複全檔掃描。
-  - 下列群組改共用一次解析結果：
-    - `k_proj` + `v_proj`
-    - `gate_proj` + `up_proj`
-- 執行防護：
-  - `--empty-cache-each-turn` 維持顯式參數控制。
-  - 在宣告穩定前，要求壓力測試矩陣（`KVC on/off` + repeated runs）。
+## 30. Full-NVFP4 1-step Training Design (2026-02-25)
+1. Script:
+   - `run-train-step-full-nvfp4.fsx`
+2. Diagnostics design:
+   - phase sampling adds:
+     - `pid_mem_mib`
+     - `total_gpu_mem_mib`
+     - `cuda_used_mib` / `cuda_total_mib` (from `cudaMemGetInfo`)
+     - `proc_rss_mib`
+   - tensor-byte summary groups by:
+     - kind
+     - device
+     - dtype
+3. Allocator-stat constraint:
+   - this TorchSharp build does not expose public `memory_allocated/reserved`.
+   - replacement telemetry is explicitly documented in script logs.
+4. Load-time memory reduction:
+   - optional `--dispose-session-after-load` (default true)
+   - optional `--compact-after-model-load` (default true)
+   - compact operation:
+     - `cuda.synchronize`
+     - `Nvfp4Training.clearEvalWeightCache()`
+     - `NativeInterop.tryEmptyNvfp4Cache()`
+     - managed GC cycle
+5. Optimizer-step redesign:
+   - `adamwStepNvfp4Packed` now supports row-chunk streaming via `--step-chunk-rows`.
+   - algorithm:
+     - dequantize `w/m/v` in row chunks
+     - compute AdamW update per chunk
+     - write updated chunk to parameter view
+     - repack chunk back to NVFP4 and copy into destination packed tensors
+   - objective:
+     - avoid full-parameter simultaneous materialization during step.
+6. Stability policy:
+   - default `step-chunk-rows=32` (conservative, memory-first).
+   - `64` is not default due observed OOM risk in stressed runs.
+7. Guard contract for train-step validation:
+   - always run through `run-script-with-guard.fsx`
+   - baseline:
+     - `--gpu-limit-gb 108`
+     - `--gpu-over-secs 0`
+     - `--gpu-poll-secs 0.5`
 
-### 預期效果
-- 降低 init 階段配置尖峰。
-- 降低 allocator fragmentation 壓力與間歇性 native crash 機率。
-- 減少 `.dat` 掃描次數，加快初始化。
+## 31. 2026-02-25 設計更新：訓練 VRAM JSON + 1-step 文本實訓
+1. `TrainingConfig` 擴充：
+   - 新增 `TrainStepVramReportPath: string option`。
+2. `Trainer` VRAM profiling 設計：
+   - 保留 console phase log（`ProfileTrainStepVram=true`）。
+   - 另支援 JSON 落檔（`TrainStepVramReportPath=Some path`）。
+   - 採樣欄位：`timestamp/epoch/stepInEpoch/globalStep/phase/pidMem/totalMem`。
+3. 採樣觸發時機：
+   - `batch_ready`
+   - `zero_grad_done`
+   - `backward_done`
+   - `optimizer_step_done`
+4. JSON 報告寫出策略：
+   - 在 `Trainer.run` finally 階段寫檔，避免中途例外導致報告遺失。
+5. 1-step 實訓腳本設計（專案 API 直連）：
+   - `scripts/Train.OneStep.fsx`。
+   - 從 `TrainData/train-inputs.txt` 取樣本。
+   - 用 `InferenceBridge.initSamplingOnly` + tokenizer + `buildTokenEmbeddings` 建立 `[1,T,H]` 輸入與 shift target。
+   - 用 `Qwen3Model.forward -> Trainer.scalarLoss -> backward -> Nvfp4Optimizer.step` 完成單步訓練。
+6. Safe default 對齊：
+   - `OptimizerStepChunkRows` 預設維持 `32`。
 
-## Training Wiring Parity Design (2026-02-14)
-### Goal
-- Replace scaffold training forward with full Qwen3 block wiring and keep training/inference graph semantics aligned.
-
-### Design
-- Introduce shared block-forward module (new logical component):
-  - `Qwen3Core.ForwardBlock(...)`
-  - Inputs:
-    - hidden states
-    - layer projection handles (`q/k/v/o`, `gate/up/down`)
-    - norm tensors (`input/post/q/k norm`)
-    - config (`heads`, `kv_heads`, `head_dim`, `rope_theta`, `rms_eps`)
-  - Output:
-    - next hidden states
-- `InferenceBridge` and `Qwen3Model` both call the same block-forward core.
-- Training-specific behavior:
-  - keep master trainable weights and STE quant/dequant path.
-  - preserve autograd graph in training mode.
-- Inference-specific behavior:
-  - use `torch.no_grad()` and existing generation APIs.
-
-### Parity Validation Plan
-1. Structural parity:
-   - assert each layer has required projections and norm tensors.
-2. Layer-wise parity:
-   - compare hidden states after each block (`max_abs`, `mean_abs`, `cosine`).
-   - report first layer index exceeding threshold.
-3. Logits parity:
-   - compare final logits/top-k under fixed prompt + seed.
-
-### Acceptance
-- `Qwen3Model.forward` no longer uses scaffold `List.fold + linearSte` chain.
-- Shared block-forward is used by both training and inference paths.
-- Layer-wise and logits parity scripts report pass within configured tolerance.
-
-## 訓練接線一致性設計（2026-02-14）
-### 目標
-- 以完整 Qwen3 block 接線取代訓練 scaffold forward，並讓 train/infer 圖語意對齊。
-
-### 設計
-- 新增 shared block-forward 模組（邏輯元件）：
-  - `Qwen3Core.ForwardBlock(...)`
-  - 輸入：
-    - hidden states
-    - 各層投影句柄（`q/k/v/o`, `gate/up/down`）
-    - norm tensors（`input/post/q/k norm`）
-    - config（`heads`, `kv_heads`, `head_dim`, `rope_theta`, `rms_eps`）
-  - 輸出：
-    - 下一層 hidden states
-- `InferenceBridge` 與 `Qwen3Model` 都改呼叫同一份 block-forward core。
-- 訓練特化行為：
-  - 保留 master trainable weights 與 STE quant/dequant 路徑。
-  - 訓練模式保留 autograd graph。
-- 推論特化行為：
-  - 使用 `torch.no_grad()` 與既有生成 API。
-
-### 一致性驗證計畫
-1. 結構一致性：
-   - 驗證每層是否具備必要 projection 與 norm tensors。
-2. Layer-wise 一致性：
-   - 比較每層 hidden state（`max_abs`, `mean_abs`, `cosine`）。
-   - 回報第一個超門檻層。
-3. Logits 一致性：
-   - 固定 prompt + seed，比較最終 logits/top-k。
-
-### 驗收標準
-- `Qwen3Model.forward` 不再是 scaffold `List.fold + linearSte` 串接。
-- train/infer 皆共用同一份 block-forward。
-- layer-wise 與 logits parity 腳本在設定門檻內通過。
-
-## Functional Operator Design For Training Graph (2026-02-14)
-### Reference evaluation
-- Reviewed and cloned:
-  - `TorchSharp.Fun` (`TorchSharp.Fun.fs`): `->>`/`=>>` composition and module-to-model adaptation patterns.
-  - `DiffSharp`: `-->` operator usage for both model composition and tensor application.
-- Decision:
-  - Do not import full external source files into this repo.
-  - Implement a minimal training-focused FP operator layer in-project to avoid extra dependency surface.
-
-### New training-only module
-- `TrainingFunctional.fs` (new):
-  - Type aliases:
-    - `TensorOp = torch.Tensor -> torch.Tensor`
-  - Operators:
-    - `->>`: compose two `TensorOp` stages
-    - `-->`: apply tensor to `TensorOp`
-  - Graph combinators:
-    - `id`, `stage`, `chain`
-    - `residual` (for skip connection form)
-    - `parallel2` + `merge2` (for branch/merge form)
-  - NVFP4 adapters:
-    - `linearSte weight outDtype : TensorOp`
-
-### Integration strategy
-- Keep inference files unchanged.
-- Migrate `Qwen3Model.forward` training path to:
-  - build stage list (`linearSte` per trainable layer)
-  - compose via `->>` / `chain`
-  - execute via `input --> trainingGraph`
-- Keep autograd behavior unchanged (functional style only, no numerical-path rewrite).
-
-### Acceptance checks
-- `Qwen3Model.forward` has no scaffold `List.fold` wiring.
-- Training path uses `TrainingFunctional` operators explicitly.
-- Build succeeds and existing training scripts still run.
-
-## 訓練圖 Functional Operator 設計（2026-02-14）
-### 參考評估
-- 已 clone 並審閱：
-  - `TorchSharp.Fun`（`TorchSharp.Fun.fs`）：`->>`/`=>>` 的組線與 module 適配模式。
-  - `DiffSharp`：`-->` 在 model 組線與 tensor 套用上的語意。
-- 決策：
-  - 不直接整包引入外部原始碼到本專案。
-  - 在專案內實作最小化、訓練專用的 FP operator 層，降低依賴面與維護風險。
-
-### 新增訓練專用模組
-- `TrainingFunctional.fs`（新檔）：
-  - 型別別名：
-    - `TensorOp = torch.Tensor -> torch.Tensor`
-  - Operators：
-    - `->>`：組合兩個 `TensorOp` 階段
-    - `-->`：將 tensor 套用到 `TensorOp`
-  - 圖組合子：
-    - `id`, `stage`, `chain`
-    - `residual`（skip connection 形式）
-    - `parallel2` + `merge2`（branch/merge 形式）
-  - NVFP4 適配器：
-    - `linearSte weight outDtype : TensorOp`
-
-### 整合策略
-- 推論檔案不改。
-- `Qwen3Model.forward` 訓練路徑改為：
-  - 建立 stage 清單（每層 `linearSte`）
-  - 用 `->>` / `chain` 組線
-  - 以 `input --> trainingGraph` 執行
-- 保持 autograd 行為不變（僅改風格，不改數值路徑）。
-
-### 驗收檢查
-- `Qwen3Model.forward` 不再使用 scaffold `List.fold` 接線。
-- 訓練路徑明確使用 `TrainingFunctional` operators。
-- build 通過，既有訓練腳本可執行。
-
-## Official-Equivalent Wiring Contract Freeze (WBS-26, 2026-02-14)
-### Block contract (shape/order/norm path)
-- Input hidden state: `[B, T, Hidden]`.
-- Attention projection order:
-  - `input_rms_norm -> q_proj/k_proj/v_proj`
-  - reshape:
-    - `q`: `[B, heads, T, head_dim]`
-    - `k/v`: `[B, kv_heads, T, head_dim]`
-  - `q_norm/k_norm` on transposed view, then RoPE on q/k
-  - `k/v` expand from `kv_heads` to `heads`
-  - SDPA (causal for full prefill block path)
-  - merge heads -> `o_proj`
-- Residual path #1: `hidden + attn_out`
-- MLP order:
-  - `post_attn_rms_norm -> gate_proj/up_proj`
-  - `silu(gate) * up`
-  - `down_proj`
-- Residual path #2: `resid1 + down`
-
-### Shared-core implementation rule
-- One shared pure function for no-cache block forward:
-  - `Qwen3Core.forwardBlockNoCache`
-- Inference no-cache path must call this function directly.
-- Training path migration target: call same function with training projection adapters (STE).
-
-### Implementation status (2026-02-14)
-- `Qwen3Core.buildBlockGraphNoCache` implemented with `TrainingFunctional` operators (`->>`, branch/merge, residual).
-- `InferenceBridge.forwardLayer` (no-cache) and `Qwen3Model.forward` now both execute through the same block-graph core API.
-
-## 官方等價接線契約凍結（WBS-26，2026-02-14）
-### Block 契約（shape/順序/norm 路徑）
-- 輸入 hidden state：`[B, T, Hidden]`。
-- Attention 投影順序：
-  - `input_rms_norm -> q_proj/k_proj/v_proj`
-  - reshape：
-    - `q`: `[B, heads, T, head_dim]`
-    - `k/v`: `[B, kv_heads, T, head_dim]`
-  - 在轉置視圖套 `q_norm/k_norm`，再對 q/k 套 RoPE
-  - 將 `k/v` 從 `kv_heads` 擴展到 `heads`
-  - SDPA（full prefill block 路徑採 causal）
-  - merge heads -> `o_proj`
-- 殘差路徑 #1：`hidden + attn_out`
-- MLP 順序：
-  - `post_attn_rms_norm -> gate_proj/up_proj`
-  - `silu(gate) * up`
-  - `down_proj`
-- 殘差路徑 #2：`resid1 + down`
-
-### Shared-core 實作規則
-- no-cache block forward 使用同一個 pure function：
-  - `Qwen3Core.forwardBlockNoCache`
-- 推論 no-cache 路徑必須直接呼叫此函式。
-- 訓練路徑遷移目標：以 training projection adapters（STE）呼叫同一函式。
-
-## Training Graph Explicitness and KV-cache Design (2026-02-22)
-### Why grouped stages were used first (not fully explicit split)
-- The block graph intentionally grouped:
-  - `qkvContextStage`
-  - `gateUpMergeStage`
-- Reasoning:
-  - keep the migration from scaffold to functional graph stable.
-  - keep one replacement point between no-cache and cache implementations.
-  - avoid over-fragmented `IModel` dependency graph while parity is still under active verification.
-- This is a staging choice, not a limitation of the operator system.
-
-### KV-cache in training path
-- Added cache model in core:
-  - `Qwen3Core.BlockKvCache`
-  - `Qwen3Core.ModelKvCache`
-- Added cache-aware block execution:
-  - `Qwen3Core.buildBlockGraphWithCache`
-  - `Qwen3Core.forwardBlockWithCache`
-- Added model APIs:
-  - `Qwen3Model.createKvCache`
-  - `Qwen3Model.resetKvCache`
-  - `Qwen3Model.forwardWithKvCache`
-- Added training config toggles:
-  - `UseKvCache` (`--use-kvc`)
-  - `SequenceLength` (`--seq-len`)
-
-### Design principle
-- Default training path remains no-cache for full-sequence parallel training.
-- KV-cache path is opt-in for chunked/streaming style training/evaluation where replay cost matters.
-- Keep both paths in one shared block contract to avoid train/infer semantic drift.
-
-## 訓練圖顯式度與 KV-cache 設計（2026-02-22）
-### 為何先採「分組 stage」而非完全拆分
-- block graph 先刻意分組：
-  - `qkvContextStage`
-  - `gateUpMergeStage`
-- 原因：
-  - 先把 scaffold -> functional graph 的遷移做穩定。
-  - 讓 no-cache / cache 只有一個替換點。
-  - 在 parity 尚在持續驗證階段時，避免 `IModel` 相依圖過度碎裂。
-- 這是階段性設計選擇，不是 operator 能力限制。
-
-### 訓練路徑 KV-cache
-- core 新增快取模型：
-  - `Qwen3Core.BlockKvCache`
-  - `Qwen3Core.ModelKvCache`
-- 新增 cache-aware block 執行：
-  - `Qwen3Core.buildBlockGraphWithCache`
-  - `Qwen3Core.forwardBlockWithCache`
-- 模型層新增 API：
-  - `Qwen3Model.createKvCache`
-  - `Qwen3Model.resetKvCache`
-  - `Qwen3Model.forwardWithKvCache`
-- 訓練設定新增：
-  - `UseKvCache`（`--use-kvc`）
-  - `SequenceLength`（`--seq-len`）
-
-### 設計精神
-- 預設仍採 no-cache 以對齊 full-sequence 並行訓練。
-- KV-cache 為 opt-in，服務 chunked/streaming 訓練或評估場景，降低 replay 成本。
-- 兩路徑共用同一份 block 契約，避免 train/infer 語意漂移。
+## 32. 2026-02-25 GQA 驗證性設計補強
+1. 在 head 展開函式新增配置防呆：
+   - `numHeads > 0`
+   - `numKvHeads > 0`
+   - `numHeads % numKvHeads = 0`
+2. 目的：
+   - 避免錯誤模型配置在展開 KV head 時被隱性吞掉，導致後續 attention 結果失真。
+3. 實作點：
+   - `Qwen3Core.expandKvHeads`
+   - `InferenceBridge.expandKvHeads`

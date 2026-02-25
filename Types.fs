@@ -21,6 +21,15 @@ type TrainingConfig =
     UseKvCache: bool
     SequenceLength: int64
     LearningRate: float
+    UsePackedNvfp4Optimizer: bool
+    GradCheckpointChunk: int
+    OptimizerStepChunkRows: int64
+    OffloadMVToCpu: bool
+    OffloadWToCpu: bool
+    OffloadGradToCpu: bool
+    StepFlushEachParam: bool
+    ProfileTrainStepVram: bool
+    TrainStepVramReportPath: string option
     CheckpointDir: string
     SaveEverySteps: int
     ResumeFromCheckpoint: bool
@@ -50,6 +59,15 @@ module Defaults =
       UseKvCache = false
       SequenceLength = 8L
       LearningRate = 1e-3
+      UsePackedNvfp4Optimizer = false
+      GradCheckpointChunk = 0
+      OptimizerStepChunkRows = 32L
+      OffloadMVToCpu = false
+      OffloadWToCpu = false
+      OffloadGradToCpu = false
+      StepFlushEachParam = true
+      ProfileTrainStepVram = false
+      TrainStepVramReportPath = None
       CheckpointDir = "./checkpoints"
       SaveEverySteps = 0
       ResumeFromCheckpoint = false

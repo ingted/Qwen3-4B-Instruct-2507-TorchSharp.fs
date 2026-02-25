@@ -1,0 +1,10 @@
+Write one short sentence about UFO and you.
+Explain in one sentence why clean logs matter during training.
+Describe in one sentence how you debug a NaN loss.
+Write one sentence about balancing speed and correctness.
+In one sentence, describe what gradient clipping protects against.
+Write one sentence about why tokenizer alignment matters.
+Explain in one short sentence why KV cache can reduce decode cost.
+Write one sentence about memory-safe experimentation with guard rails.
+Describe in one sentence how you verify optimizer updates are real.
+Write one sentence about why reproducible scripts are important.

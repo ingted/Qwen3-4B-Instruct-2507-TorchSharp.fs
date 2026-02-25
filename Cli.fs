@@ -58,6 +58,11 @@ module Cli =
         | _ -> None)
     |> Option.defaultValue def
 
+  let parseStringOption key (m: Map<string, string>) =
+    match m.TryFind key with
+    | Some v when not (String.IsNullOrWhiteSpace v) -> Some(v.Trim())
+    | _ -> None
+
   let parse (args: string array) : TrainingConfig =
     let kv = readMap args
     {
@@ -77,6 +82,17 @@ module Cli =
           UseKvCache = parseBool "--use-kvc" Defaults.trainingConfig.UseKvCache kv
           SequenceLength = parseInt64 "--seq-len" Defaults.trainingConfig.SequenceLength kv
           LearningRate = parseFloat "--lr" Defaults.trainingConfig.LearningRate kv
+          UsePackedNvfp4Optimizer =
+            parseBool "--use-packed-optimizer" Defaults.trainingConfig.UsePackedNvfp4Optimizer kv
+          GradCheckpointChunk = parseInt "--grad-ckpt-chunk" Defaults.trainingConfig.GradCheckpointChunk kv
+          OptimizerStepChunkRows =
+            parseInt64 "--optimizer-step-chunk-rows" Defaults.trainingConfig.OptimizerStepChunkRows kv
+          OffloadMVToCpu = parseBool "--offload-mv-to-cpu" Defaults.trainingConfig.OffloadMVToCpu kv
+          OffloadWToCpu = parseBool "--offload-w-to-cpu" Defaults.trainingConfig.OffloadWToCpu kv
+          OffloadGradToCpu = parseBool "--offload-grad-to-cpu" Defaults.trainingConfig.OffloadGradToCpu kv
+          StepFlushEachParam = parseBool "--step-flush-each-param" Defaults.trainingConfig.StepFlushEachParam kv
+          ProfileTrainStepVram = parseBool "--profile-train-step-vram" Defaults.trainingConfig.ProfileTrainStepVram kv
+          TrainStepVramReportPath = parseStringOption "--train-step-vram-report" kv
           CheckpointDir = getOrDefault "--checkpoint-dir" Defaults.trainingConfig.CheckpointDir kv
           SaveEverySteps = parseInt "--save-every-steps" Defaults.trainingConfig.SaveEverySteps kv
           ResumeFromCheckpoint = parseBool "--resume" Defaults.trainingConfig.ResumeFromCheckpoint kv
@@ -105,6 +121,15 @@ module Cli =
     printfn "  --use-kvc <true|false>"
     printfn "  --seq-len <int64>"
     printfn "  --lr <float>"
+    printfn "  --use-packed-optimizer <true|false>"
+    printfn "  --grad-ckpt-chunk <int>"
+    printfn "  --optimizer-step-chunk-rows <int64>"
+    printfn "  --offload-mv-to-cpu <true|false>"
+    printfn "  --offload-w-to-cpu <true|false>"
+    printfn "  --offload-grad-to-cpu <true|false>"
+    printfn "  --step-flush-each-param <true|false>"
+    printfn "  --profile-train-step-vram <true|false>"
+    printfn "  --train-step-vram-report <path>"
     printfn "  --checkpoint-dir <path>"
     printfn "  --save-every-steps <int>"
     printfn "  --resume <true|false>"

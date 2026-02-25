@@ -337,6 +337,10 @@ module InferenceBridge =
     (x * cos + rotated * sin).contiguous()
 
   let expandKvHeads (numHeads: int) (numKvHeads: int) (kv: torch.Tensor) =
+    if numHeads <= 0 || numKvHeads <= 0 then
+      invalidOp (sprintf "invalid attention head config: numHeads=%d numKvHeads=%d" numHeads numKvHeads)
+    if numHeads % numKvHeads <> 0 then
+      invalidOp (sprintf "GQA head mismatch: numHeads=%d must be divisible by numKvHeads=%d" numHeads numKvHeads)
     let batchSize = kv.shape.[0]
     let seqLen = kv.shape.[2]
     let headDim = kv.shape.[3]

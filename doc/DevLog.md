@@ -1,957 +1,856 @@
-# DevLog
+# Developer Log - 2026-02-14
 
-## 2026-02-12
-### Context
-- Source note: `notes/00001.txt`
-- Goal: move `run-training.fsx` from runnable scaffold output to semantic output closer to `run2.fsx`.
-- Constraint: no dependency on `Qwen3-4B-Instruct-2507-TorchSharp` project or `Qwen3.dll`.
+## Issue: Intermittent Timeout at Stage [6] in `run-training2.fsx`
 
-### Findings From Note/Code Review
-- Same weight file does not guarantee same output quality unless model wiring + tokenizer + decode path are equivalent.
-- Current pure F# inference path had four major gaps:
-  - tokenizer mismatch (byte-token fallback)
-  - embedding mismatch (handcrafted features)
-  - block wiring mismatch (scaffold linear stack)
-  - layer coverage mismatch (2-layer fallback)
+### 1. Troubleshooting
+- **Symptoms**: Running `dotnet fsi run-training2.fsx --KVCacheOut false --no-kvc-mode full-replay --timing true` often hangs at stage `[6]`.
+- **Observation**: While normal execution takes ~5s, it occasionally exceeds the 40s timeout. This usually happens during consecutive runs.
+- **Environment**: DGX Spark (GB10) with 128GB Unified Memory (no HBM).
+- **Hypothesis**: 
+    - In `full-replay` mode, the prompt grows each turn, requiring larger contiguous memory for activation buffers.
+    - Unified Memory fragmentation causes the CUDA allocator or OS to trigger memory compaction/page migration, leading to significant latency spikes.
+    - Zombie `dotnet` processes from previous failed runs might be cluttering the system.
 
-### Documentation Changes
-- Updated `doc/SA.md` with parity gaps and new FR-05..FR-08.
-- Updated `doc/SD.md` with inference parity design (`ModelConfigLite`, `Q4WeightBank`, `TokenizerBridge`, `ForwardEngine`).
-- Updated `doc/Test.md` with parity-focused test addendum.
-- Appended `doc/WBS.md` with WBS-12..WBS-17.
+### 2. Change Planning
+- **Goal**: Ensure clean memory state before the critical stage `[6]` and throughout the session.
+- **Actions**:
+    - Move `forceCleanUp()` (GC + CUDA Sync + Empty Cache) to the beginning of each `runTurn`.
+    - Slightly increase the timeout for stage `[6]` to 48s (below the 50s system lockup threshold) to allow for minor OS-level memory management jitter.
 
-### Technical Direction
-- Short-term implementation order:
-  1. tokenizer parity (`tokenizer.json`)
-  2. embedding lookup parity
-  3. Qwen3-like projection wiring (`q/k/v/o`, `gate/up/down`, `lm_head`)
-  4. full layer coverage and parity smoke checks
+### 3. Dev / Debug
+- **Implementation**:
+    - Relocated `forceCleanUp` definition above `runTurn`.
+    - Inserted `forceCleanUp()` call at the start of `runTurn`.
+    - Updated `runTurn (Some "6")` timeout from `40000` to `48000`.
+- **Debugging**: Initially encountered `FS0039` error due to function definition order; fixed by moving the function block.
 
-### Change Tracking
-- Relevant recent commits:
-  - `2e1f3b1` (`Qwen3-4B-Instruct-2507-TorchSharp.fs`): switched inference bridge to pure F# explicit wiring.
-  - `a1b686e` (`fsann`): `run-training.fsx` uses pure F# inference DLL only.
+### 4. Test
+- **Execution**: Ran a loop of 5 consecutive executions.
+- **Result**: Successfully reproduced the hang *without* the fix in the loop. With the fix, stage `[6]` consistently completed in ~4.4s across multiple runs.
 
-### Implementation Update (same day, parity track)
-- Implemented in `InferenceBridge.fs`:
-  - tokenizer integration via `Tokenizers.DotNet` (`tokenizer.json`)
-  - full layer-family loading for 36 layers (`q/k/v/o`, `gate/up/down`) + `lm_head`
-  - raw tensor loading from `.dat` for:
-    - `model.embed_tokens.weight`
-    - per-layer norm weights (`input_layernorm`, `post_attention_layernorm`, `q_norm`, `k_norm`)
-    - `model.norm.weight`
-  - Qwen3-like forward skeleton with causal attention + MLP
-- Validation result:
-  - `dotnet build -c Release` passed.
-  - `dotnet fsi run-training.fsx --max-tokens 16` now runs full 36-layer path, but output is still repetitive (`!!!!!!!!!!!!!!!`), so semantic parity is not yet reached.
-- Current blocker hypothesis:
-  - RoPE and exact decode/KV behavior remain missing and likely dominate quality gap.
+### 5. Solution Verificated
+- **Status**: Verified. The combination of proactive GC and CUDA cache clearing before each turn prevents the accumulation of memory fragments that trigger the 40s+ latency in the GB10 Unified Memory architecture.
+- **Final Logic**: Every turn now starts with a synchronized and defragmented memory state.
 
-### Implementation Update #2 (same day, parity track)
-- Implemented:
-  - added RoPE in attention path (pure F# implementation over `[heads, seq, head_dim]`)
-  - switched projection execution from dense dequant matmul to `Q4Linear` NVFP4 path for:
-    - `q/k/v/o`
-    - `gate/up/down`
-    - `lm_head`
-  - added BOS prepend and kept assistant-generation prompt template.
-- Validation:
-  - `run-training.fsx` no longer collapses to token id `0` / repeated `!`.
-  - output is now non-trivial but still semantically unstable compared with `run2.fsx`.
-- Updated blocker:
-  - exact Qwen3 parity still needs stricter alignment for decode/sampling details and KV-path semantics.
+---
 
-## 2026-02-12（中文）
-### 背景
-- 來源備註：`notes/00001.txt`
-- 目標：將 `run-training.fsx` 從「可執行但 scaffold 輸出」推進到語意接近 `run2.fsx`。
-- 限制：不可依賴 `Qwen3-4B-Instruct-2507-TorchSharp` 專案與 `Qwen3.dll`。
+# Developer Log - 2026-02-24
 
-### 備註/程式審閱結論
-- 同一份權重若模型接線、tokenizer、解碼流程不一致，語意品質不會一致。
-- 目前 pure F# 推論路徑有四個主要缺口：
-  - tokenizer 不一致（byte-token fallback）
-  - embedding 不一致（手工特徵）
-  - block 接線不一致（scaffold 線性堆疊）
-  - 層覆蓋不一致（2 層 fallback）
+## Objective
+- Stabilize fp2 experiments to avoid host crash.
+- Reproduce `!!!!` in single-turn mode only.
+- Prepare A/B/C first-token diagnostics for weight/tokenizer alignment analysis.
 
-### 文件修訂
-- `doc/SA.md`：新增 parity gap 與 FR-05..FR-08。
-- `doc/SD.md`：新增推論一致性設計（`ModelConfigLite`, `Q4WeightBank`, `TokenizerBridge`, `ForwardEngine`）。
-- `doc/Test.md`：新增 parity 導向測試補充。
-- `doc/WBS.md`：append WBS-12..WBS-17。
+## Changes Implemented
+1. Added `run-training-fp2-safe.fsx`.
+   - Based on `run-training-fp2-single.fsx`.
+   - Single-turn only.
+   - Fail-fast when first output contains `!!!!`.
+   - Requires `TS_Q4_STE_USE_NATIVE_QUANTIZE=1`; otherwise exits immediately.
+   - Safety cap: `--max-tokens <= 8`.
+   - Default log path moved to:
+     - `alpha/log/tee-object-chat-session-fp-safe.txt`
+     - `alpha/log/tee-object-chat-session-fp-safe.jsonl`
+2. Added `run-training-fp2-noste.fsx`.
+   - Single-turn only.
+   - Uses `Qwen3Core.forwardBlockNoCache` with `InferenceBridge.linearQ4` projections.
+   - Purpose: no-STE control path while keeping block-graph style execution.
+3. Added `compare-first-token-fp2.fsx`.
+   - One-prompt first-token diagnostic.
+   - Compares three paths:
+     - `A.infer`: `InferenceBridge.forwardModel`
+     - `B.fp2_ste`: `Qwen3Model.forward` (training/STE path)
+     - `C.noste_graph`: block graph + `linearQ4` (no STE)
+   - Prints hidden/logits NaN/Inf health + top10 token ids and decoded token text.
 
-### 技術路線
-- 短期實作順序：
-  1. 對齊 tokenizer（`tokenizer.json`）
-  2. 對齊 embedding lookup
-  3. 實作 Qwen3-like projection 接線（`q/k/v/o`, `gate/up/down`, `lm_head`）
-  4. 補齊全層載入與 parity smoke 測試
+## Key Findings (from successful prior CUDA window)
+1. `!!!!` corresponds to repeated token id `0`.
+   - Evidence: `QWEN3_FS_DEBUG_TOKENS=1` showed `[0; 0; 0; 0]` in first turn.
+   - Tokenizer check:
+     - `decode(0) = "!"`
+     - `encode("!") = [0]`
+2. `debug-fp2-parity.fsx` indicated divergence at layer 0.
+   - Path A healthy, Path B goes NaN from layer0 onward.
+   - `q/k/v` in Path B had much larger absolute magnitude than Path A.
 
-### 變更追蹤
-- 近期相關 commit：
-  - `2e1f3b1`（`Qwen3-4B-Instruct-2507-TorchSharp.fs`）：InferenceBridge 改為 pure F# 明確接線。
-  - `a1b686e`（`fsann`）：`run-training.fsx` 僅使用 pure F# inference DLL。
+## Runtime Incident During This Session
+1. `run-training-fp2-safe.fsx` attempt failed at CUDA init:
+   - `cudaGetDeviceCount Error 304: OS call failed or operation not supported on this OS`
+   - `Torch device type CUDA did not initialise on the current machine`
+2. Confirmed this was environment-state dependent:
+   - `nvidia-smi` initially looked normal.
+   - Python check in same container then reported:
+     - `torch.cuda.is_available() = False`
+     - `torch.cuda.device_count() = 0`
+   - Therefore this round’s fp2 runs were blocked by CUDA runtime availability, not script syntax.
 
-### 實作更新（同日，parity 路線）
-- `InferenceBridge.fs` 已補上：
-  - 以 `Tokenizers.DotNet` 讀取 `tokenizer.json`
-  - 載入 36 層完整投影族群（`q/k/v/o`, `gate/up/down`）與 `lm_head`
-  - 從 `.dat` 載入 raw tensor：
-    - `model.embed_tokens.weight`
-    - 每層 norm 權重（`input_layernorm`, `post_attention_layernorm`, `q_norm`, `k_norm`）
-    - `model.norm.weight`
-  - Qwen3-like forward 骨架（causal attention + MLP）
-- 驗證結果：
-  - `dotnet build -c Release` 通過。
-  - `dotnet fsi run-training.fsx --max-tokens 16` 可跑滿 36 層，但輸出仍偏重複（`!!!!!!!!!!!!!!!`），尚未達到語意 parity。
-- 目前阻塞推測：
-  - RoPE 與精確 decode/KV 行為尚未補齊，應是語意落差主要來源。
+## Commands Used (representative)
+1. Safe run:
+   - `TS_Q4_STE_USE_NATIVE_QUANTIZE=1 QWEN3_FS_DEBUG_TOKENS=1 timeout 120s dotnet fsi run-training-fp2-safe.fsx --prompt "hi" --max-tokens 4 --timing true`
+2. CUDA status check:
+   - `nvidia-smi`
+   - `python3 - <<'PY' ... torch.cuda.is_available()/device_count ... PY`
 
-### 實作更新 #2（同日，parity 路線）
-- 已補上：
-  - attention 路徑 RoPE（pure F#，作用於 `[heads, seq, head_dim]`）
-  - 投影計算改走 `Q4Linear` NVFP4 路徑，不再使用 dense dequant matmul：
-    - `q/k/v/o`
-    - `gate/up/down`
-    - `lm_head`
-  - 補上 BOS prepend 與 assistant generation prompt template。
-- 驗證：
-  - `run-training.fsx` 已不再退化成 token id `0` 或連續 `!`。
-  - 目前輸出雖然非 trivial，但與 `run2.fsx` 相比語意仍不穩定。
-- 最新阻塞：
-  - 要達成嚴格 parity，仍需對齊 decode/sampling 細節與 KV-path 語意。
+## Next Action (once CUDA becomes available again)
+1. Re-run `run-training-fp2-safe.fsx` (single-turn).
+2. Run `run-training-fp2-noste.fsx` with same prompt.
+3. Run `compare-first-token-fp2.fsx` and persist top10 diff in log.
+4. Prioritize fixes in STE path (`linearSte/steWeight`) if A/C align but B diverges.
 
-### 實作更新 #3（同日，parity 路線）
-- 問題定位：
-  - `run-training.fsx` 的 `Q4Linear` NVFP4 路徑語意失真，`run2.fsx` 同權重可正常輸出。
-  - 差異點確認為 native interop 路徑：`TorchSharp.Q4.Extension` 原先走 `LibTorchSharp` 的 `THSFP4_quantize/THSTensor_scaled_mm` 包裝；`run2` 實際可用路徑為 `libNVFP4.so` 直接呼叫。
-- 修正內容：
-  - 在 `TorchSharp.Q4.Extension/NativeInterop.fs` 改為直接使用 `NVFP4_quantize`、`NVFP4_scaled_mm`。
-  - `InferenceBridge.fs` 同步對齊：
-    - 以 `[B,H,T,D]` 形狀走 `scaled_dot_product_attention`；
-    - 取消 BOS prepend，與 `run2` prompt 編碼行為一致；
-    - `temperature <= 0` 時改為 greedy (`argmax`)。
-- 驗證結果（同 prompt）：
-  - `run2.fsx`: 維持可讀語意輸出。
-  - `run-training.fsx`: 已從亂碼/多語碎片提升為可讀且語意合理句子：
-    - `I’ve never seen a UFO, but I’ve spent countless nights wondering what it would be like to encounter one.`
+## Execution Update - 2026-02-24 (CUDA available window)
+### Experiment 1: `run-training-fp2-safe.fsx`
+- Command:
+  - `TS_Q4_STE_USE_NATIVE_QUANTIZE=1 QWEN3_FS_DEBUG_TOKENS=1 timeout 180s dotnet fsi run-training-fp2-safe.fsx --prompt "hi" --max-tokens 4 --timing true`
+- Result:
+  - output: `!!!!`
+  - generated ids: `[0; 0; 0; 0]`
+  - process exited by guard fail-fast (`first output is !!!!`)
+  - VRAM peak observed by watchdog: ~93.5GB (under 110GB kill threshold)
 
-## 2026-02-12 (run-training2 stall analysis and fix)
-### Symptom
-- `run-training2.fsx` could appear to "hang" around turn `[3]` or `[5]` when using default settings.
+### Experiment 2: `run-training-fp2-noste.fsx`
+- Initial run failed with missing assembly reference (`TorchSharp.Fun.DGX`).
+- Fix:
+  - Added `#r "/workspace/TorchSharp.Fun.DGX/TorchSharp.Fun.DGX/bin/Release/net10.0/TorchSharp.Fun.DGX.dll"`.
+- Command:
+  - `QWEN3_FS_DEBUG_TOKENS=1 timeout 180s dotnet fsi run-training-fp2-noste.fsx --prompt "hi" --max-tokens 4 --timing true`
+- Result:
+  - generated ids: `[13048; 0; 26525; 232]`
+  - output: `Hi! 😊`
+  - VRAM peak: ~5.4GB
 
-### Root Cause (combined factors)
-- Full-prompt replay decode path in `run-training2`: each token step re-runs the entire accumulated prompt, so latency grows per turn.
-- Stop token mismatch: generation did not consistently stop on `<|im_end|>` (`151645`) and `<|endoftext|>` (`151643`), increasing long-tail decode.
-- Timeout model with `Task.Run + Wait(timeout)`: timeout could throw while the background task kept running, leaving residual CPU/GPU load.
-- Host-side append overhead: repeated list concatenation (`list @`) in the generation loop created avoidable O(n^2)-style overhead.
+### Experiment 3: `compare-first-token-fp2.fsx`
+- Initial compile fixes:
+  1. `torch.topk` argument type fixes (`int` vs `int64`).
+  2. Added `TorchSharp.Fun.DGX` reference.
+- Command:
+  - `TS_Q4_STE_USE_NATIVE_QUANTIZE=1 timeout 240s dotnet fsi compare-first-token-fp2.fsx "hi"`
+- Key observations:
+  - `A.infer`: hidden/logits finite, top1 token `id=2132 ("It")`.
+  - `B.fp2_ste`: hidden/logits contain NaN; top10 all NaN logits with low-id punctuation (`id=0` included).
+  - `C.noste_graph`: hidden/logits finite; top10 highly similar to `A.infer`.
+- VRAM peak: ~83.8GB (under threshold).
 
-### Changes
-- `InferenceBridge.fs`
-  - Added explicit stop-token flow for rendered prompt generation.
-  - Aligned default stop tokens to `151645/151643`.
-  - Replaced per-step list append with `ResizeArray` for running/generated token buffers.
-- `run-training2.fsx`
-  - Replaced background timeout wrapper with same-thread execution and over-budget warning.
-  - Aligned rendered prompt path and stop tokens to `151645/151643`.
-  - Reduced default `--max-tokens` from `64` to `20` for full-prompt replay stability.
-  - Added per-turn prompt token count timing output.
+### Conclusion
+- Root-cause is now strongly isolated to STE path (`Qwen3Model.forward` + `Nvfp4Training.linearSte`), not tokenizer and not block-graph wiring itself.
 
-### Validation
-- Condition: `--KVCacheOut false --timing true --max-tokens 20`
-- `run2.fsx`: `ELAPSED=28.407s`
-- `run-training2.fsx`: `ELAPSED=36.835s`
-- Outcome: `[5]` no longer stalls; script runs through `[6]` and exits at designed `stop  here`.
+### Re-run Confirmation (prompt=`"hi"`, after arg parsing fix)
+- `compare-first-token-fp2.fsx "hi"` now correctly uses prompt `hi`.
+- A/C top tokens are highly aligned and semantically correct:
+  - top1 both are `id=13048 ("Hi")`, followed by `Hello/Hey/HI/...`.
+- B remains invalid:
+  - hidden/logits contain NaN
+  - top10 collapses to low-id punctuation tokens with NaN logits.
+- This removes prior ambiguity from incorrect prompt parsing and further confirms STE-specific failure.
 
-### Change Tracking
-- `8d7af00` (`Qwen3-4B-Instruct-2507-TorchSharp.fs`): stabilize rendered prompt generation + stop token behavior.
-- `c988023` (`fsann`): make `run-training2` complete reliably on FP4 path.
+## Fix Execution - 2026-02-24 (STE recovery)
+### Root-cause evidence added
+- Parsed dat entries and confirmed:
+  - `*.qdata`: `elemType=0`
+  - `*.scale`: `elemType=101` (1-byte encoded scale), shape `[out, in/16]`
 
-## 2026-02-12（run-training2 卡住分析與修正）
-### 現象
-- `run-training2.fsx` 在預設設定下，可能在第 `[3]` 或 `[5]` 輪看起來「卡住」。
+### Code fix
+- File: `Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3Model.fs`
+- Change:
+  - In `materializeMasterWeight`, when `scale.dtype = uint8`, decode scale bytes as FP8(E4M3FN) to float first, then call `Nvfp4Training.dequantizePacked`.
+  - Added LUT-based decode helper (`fp8E4M3FnToFloat32`, `decodeFp8E4M3FnTensor`).
 
-### 根因（多因素疊加）
-- `run-training2` 採 full-prompt replay：每個 token 都重跑整段累積 prompt，輪次越後面越慢。
-- stop token 不一致：未穩定以 `<|im_end|>`（`151645`）與 `<|endoftext|>`（`151643`）停止，增加長尾生成。
-- `Task.Run + Wait(timeout)` 超時模型：拋例外後背景任務可能仍在執行，造成 CPU/GPU 殘留負載。
-- host 端 append 開銷：生成迴圈反覆 `list @`，帶來可避免的 O(n^2) 級開銷。
+### Validation after fix
+1. `run-training-fp2-safe.fsx --prompt "hi"`:
+   - generated ids: `[9707; 0; 61804; 233]`
+   - output: `Hello! 👋`
+   - no `!!!!` fail-fast triggered
+2. `compare-first-token-fp2.fsx "hi"`:
+   - `A.infer`: finite, top1 `Hi`
+   - `B.fp2_ste`: finite (no NaN), top tokens `Hello/Hi/Hey/...`
+   - `C.noste_graph`: finite, aligned with `A`
 
-### 修正內容
-- `InferenceBridge.fs`
-  - 新增 rendered prompt 生成的 stop-token 控制流程。
-  - 預設 stop token 對齊為 `151645/151643`。
-  - 生成 token buffer 由 list append 改為 `ResizeArray`。
-- `run-training2.fsx`
-  - timeout 包裝改為同執行緒執行，超時只警告不留下背景殘留任務。
-  - rendered prompt 與 stop token 對齊為 `151645/151643`。
-  - full-prompt replay 預設 `--max-tokens` 由 `64` 降至 `20`。
-  - 新增每輪 prompt token 數與時間輸出。
+### Decision
+- Keep single-turn guardrails for stability, but STE path is no longer in NaN-collapse state for the tested prompt.
 
-### 驗證
-- 條件：`--KVCacheOut false --timing true --max-tokens 20`
-- `run2.fsx`：`ELAPSED=28.407s`
-- `run-training2.fsx`：`ELAPSED=36.835s`
-- 結果：`[5]` 不再卡住，可跑到 `[6]`，並在設計的 `stop  here` 結束。
+## Regression Check - 2026-02-24 (run-training-fp2 main script)
+### Command
+- `cd /workspace/fsann/alpha/runner-arm64-fp4`
+- `TS_Q4_STE_USE_NATIVE_QUANTIZE=1 QWEN3_FS_DEBUG_TOKENS=1 dotnet fsi run-training-fp2.fsx --max-tokens 4 --timing true --check-logits false --prompt "hi"`
 
-### 變更追蹤
-- `8d7af00`（`Qwen3-4B-Instruct-2507-TorchSharp.fs`）：穩定 rendered prompt 生成與 stop token 行為。
-- `c988023`（`fsann`）：修正 `run-training2` 使 FP4 路徑可穩定完成。
+### Result
+- Script completed in single-turn guard mode.
+- generated ids: `[9707; 0; 61804; 233]`
+- output: `Hello! 👋`
+- no `!!!!` fail-fast triggered.
 
-## 2026-02-12 (memory fluctuation review from `notes/00002.txt`)
-### Symptom
-- `run-training2.fsx` showed large and unstable GPU memory footprint (roughly `96~116 GiB` observed by `nvidia-smi` in the reported environment).
+### Runtime note
+- On this host/GPU, `nvidia-smi` reports `Memory-Usage: Not Supported`, so the external `>110GB for 10s` VRAM kill rule cannot be enforced via NVML query in this environment.
+- Effective fallback during this run: strict single-turn mode + script fail-fast + command timeout pattern.
 
-### Review Conclusion
-- Not all growth indicates a hard leak; a significant part can be CUDA allocator reservation behavior.
-- Still, there were identifiable lifecycle gaps that could amplify peak/reserved memory drift.
+## Guard Script - 2026-02-24
+### Goal
+- Add a reusable launcher that enforces the user's GPU safety rule from `nvidia-smi` process table (`GPU Memory`) when available.
 
-### Fixes Applied
-- NVFP4 kernel temp tensor lifecycle hardening:
-  - explicitly scoped `qweight.t()` with `use`.
-  - explicitly disposed temporary `inputOnDevice` when created via `.to(...)`.
-  - disposed intermediate reshaped tensor on dtype conversion branch.
-- Added native cache control hook:
-  - exposed `NVFP4_empty_cache` via `NativeInterop.tryEmptyNvfp4Cache()`.
-- Added runner-level mitigation:
-  - `run-training2.fsx` now supports `--empty-cache-each-turn` (default `true`) to clear allocator cache between turns.
-  - KV flags remain available (`--KVCacheOut`, `--TokenByTokenOrPromptByPrompt`).
-
-### Residual Risk
-- `run-training2` still rebuilds full prompt history each turn; even with per-turn KV path, long-history prefill pressure can still raise memory peaks.
-- A persistent cross-turn KV-cache architecture is still recommended for tighter memory stability.
-
-### Change Tracking
-- Q4 extension commit: `7cbed57` (`TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension`)
-- Runner commit: `45bdfbf` (`fsann`)
-- Note: push status in that execution window was blocked by DNS resolution failure (`github.com` unresolved).
-
-## 2026-02-12（`notes/00002.txt` 記憶體波動審閱）
-### 現象
-- `run-training2.fsx` 在回報環境中出現明顯且不穩定的顯存占用（`nvidia-smi` 觀測約 `96~116 GiB` 區間）。
-
-### 審閱結論
-- 並非所有成長都代表硬性 leak；相當部分可能是 CUDA allocator 的保留策略。
-- 但程式確實存在會放大峰值/保留量波動的生命週期缺口，已進行修補。
-
-### 已套用修正
-- NVFP4 kernel 暫存 tensor 生命週期強化：
-  - `qweight.t()` 明確以 `use` 受控。
-  - `.to(...)` 產生的 `inputOnDevice` 在必要時顯式釋放。
-  - dtype 轉換分支中的中間 `reshaped` 顯式釋放。
-- native cache 控制介面補齊：
-  - 透過 `NativeInterop.tryEmptyNvfp4Cache()` 暴露 `NVFP4_empty_cache`。
-- runner 緩解機制：
-  - `run-training2.fsx` 新增 `--empty-cache-each-turn`（預設 `true`），每輪後可清 allocator cache。
-  - 同時保留 KV 參數路徑（`--KVCacheOut`、`--TokenByTokenOrPromptByPrompt`）。
-
-### 殘餘風險
-- `run-training2` 仍是「每輪重建 full prompt history」腳本；即便單輪使用 KV，長歷史 prefill 壓力仍可能推高峰值。
-- 若要更穩定壓峰值，仍建議改為跨輪持久 KV-cache 架構。
-
-### 變更追蹤
-- Q4 extension commit：`7cbed57`（`TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension`）
-- runner commit：`45bdfbf`（`fsann`）
-- 備註：該次執行窗口因 DNS 解析失敗（`github.com` 無法解析）導致 push 阻塞。
-
-## 2026-02-12 (KVC instability / intermittent segfault follow-up)
-### User-reported symptom
-- Sequence observed:
-  1. run `run-training2.fsx` with `--KVCacheOut false` (often completes to designed `stop here`)
-  2. immediately run again (or switch to `--KVCacheOut true`)
-  3. intermittently stalls around `[5]` or crashes with SIGSEGV
-- Crash signature: stack in `libtorch_cpu.so` (`at::to_copy/copy_`) via `THSTensor_to_device`.
-
-### What changed recently (scope)
-- `Qwen3-4B-Instruct-2507-TorchSharp.fs`:
-  - `1679c7d`: introduced KV-cache generation path (`generate...KvCache`) and default UM disabled behavior.
-- `fsann`:
-  - `647f2c3`: wired `run-training2.fsx` to support `KVCacheOut` + prefill mode.
-  - `45bdfbf`: enabled per-turn `NVFP4_empty_cache` switch (default true).
-  - `30d24c3`: removed reflection workaround; direct `TorchSharp.Q4.Extension` reference.
-
-### Root-cause analysis (current confidence)
-- Most likely issue is native allocator pressure/fragility during repeated large tensor host->device transfers in init/load path, not a deterministic KVC logic bug alone.
-- Specific defect fixed:
-  - `Nvfp4State.readTensorAsByte` created a temporary CPU tensor, copied to CUDA, but did not dispose the CPU temporary in CUDA path.
-  - Repeated full-file scans in init can amplify this pressure.
-
-### Fixes applied now
-- `Nvfp4State.fs`
-  - release temporary CPU tensor immediately after `.to(device)` copy.
-- `InferenceBridge.fs`
-  - reduce repeated `.dat` scans during init:
-    - reuse one load result for `k_proj/v_proj` map extraction.
-    - reuse one load result for `gate_proj/up_proj` map extraction.
-  - expected impact: fewer allocation spikes and less init-time instability.
-
-### Verification snapshot
-- `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj`: PASS.
-- `run-training2.fsx` smoke:
-  - `--KVCacheOut false --timing true`: PASS to designed `stop here`.
-  - `--KVCacheOut true --timing true`: PASS to designed `stop here`.
-
-### Open risk
-- SIGSEGV is intermittent and native-side; cannot claim complete closure from one pass.
-- Need stress loop validation (`N>=10`) for both `KVC on/off` with same prompt set.
-
-## 2026-02-12（KVC 不穩定 / 間歇性 segfault 追蹤）
-### 使用者回報現象
-- 觀察序列：
-  1. 先跑 `run-training2.fsx --KVCacheOut false`（通常可到設計的 `stop here`）
-  2. 立即再跑一次（或改成 `--KVCacheOut true`）
-  3. 偶發在 `[5]` 卡住，或直接 SIGSEGV
-- crash 特徵：`libtorch_cpu.so`（`at::to_copy/copy_`）經由 `THSTensor_to_device`。
-
-### 最近變更範圍
-- `Qwen3-4B-Instruct-2507-TorchSharp.fs`：
-  - `1679c7d`：加入 KV-cache 生成路徑（`generate...KvCache`）與預設關閉 UM。
-- `fsann`：
-  - `647f2c3`：`run-training2.fsx` 接入 `KVCacheOut` 與 prefill mode。
-  - `45bdfbf`：加入 per-turn `NVFP4_empty_cache`（預設 true）。
-  - `30d24c3`：移除反射 workaround，改為直接引用 `TorchSharp.Q4.Extension`。
-
-### 目前根因判斷（信心等級：中）
-- 較可能是 init/load 階段重複大量 host->device 轉移帶來的 native allocator 壓力/脆弱性，不是單一可重現的 KVC 邏輯錯誤。
-- 已確認並修正的缺陷：
-  - `Nvfp4State.readTensorAsByte` 在 CUDA 路徑中，CPU 暫存 tensor `.to(device)` 後未立即釋放。
-  - init 期間多次全檔掃描會放大此壓力。
-
-### 本次已套用修正
-- `Nvfp4State.fs`
-  - `.to(device)` 後立即 `Dispose` CPU 暫存 tensor。
-- `InferenceBridge.fs`
-  - 減少 init 時重複 `.dat` 掃描：
-    - `k_proj/v_proj` 共用一次載入結果再分別抽 map。
-    - `gate_proj/up_proj` 共用一次載入結果再分別抽 map。
-  - 預期效益：降低配置尖峰與 init 不穩定性。
-
-### 驗證快照
-- `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj`：PASS。
-- `run-training2.fsx` smoke：
-  - `--KVCacheOut false --timing true`：可跑到設計的 `stop here`。
-  - `--KVCacheOut true --timing true`：可跑到設計的 `stop here`。
-
-### 殘餘風險
-- SIGSEGV 屬間歇性 native crash，單次驗證不能宣告完全結案。
-- 需補 `N>=10` 壓力回歸（同 prompt、`KVC on/off` 各一組）。
-
-## 2026-02-12 (WBS-16 / WBS-20 closure)
-### Deliverables
-- Added parity smoke script: `scripts/Tests.Parity.fsx`
-- Added KVC stress matrix script: `scripts/Tests.KVCStress.fsx`
-- Updated `doc/Test.md` with execution commands and acceptance criteria.
-- Updated `doc/WBS.md`: set WBS-16 and WBS-20 to `Done`.
-
-### Results
-- `dotnet fsi scripts/Tests.Parity.fsx`
-  - PASS (`run2` + `run-training2` first `out:` readable, no segfault, reached designed stop marker)
-- `dotnet fsi scripts/Tests.KVCStress.fsx`
-  - PASS (`cases=3`, `iterations=3`, `total=9`, no segfault)
-
-## 2026-02-12（WBS-16 / WBS-20 完工）
-### 交付內容
-- 新增 parity smoke 腳本：`scripts/Tests.Parity.fsx`
-- 新增 KVC 壓力矩陣腳本：`scripts/Tests.KVCStress.fsx`
-- 更新 `doc/Test.md` 執行方式與驗收標準。
-- 更新 `doc/WBS.md`：WBS-16 與 WBS-20 改為 `Done`。
-
-### 驗證結果
-- `dotnet fsi scripts/Tests.Parity.fsx`
-  - PASS（`run2` 與 `run-training2` 第一個 `out:` 可讀、無 segfault、到達設計 stop）
-- `dotnet fsi scripts/Tests.KVCStress.fsx`
-  - PASS（`cases=3`、`iterations=3`、`total=9`，無 segfault）
-
-## 2026-02-12 (Managed-UM branch for `TS_Q4_DISABLE_UM=0`)
-### Branch
-- `feature/um-managed-path-ts-q4-disable-um-0`
-
-### Scope
-- Keep existing runtime logic.
-- Add managed-memory promotion for persistent inference raw tensors when UM policy is enabled.
-- Integrate with upgraded `TorchSharp.Q4.Extension` managed allocator path.
-
-### Code changes
-- `InferenceBridge.fs`
-  - added `applyUnifiedPolicyToRawMap`.
-  - raw tensors from `.dat` now pass through `UnifiedMemory.applyMutablePolicy` under session policy.
-  - added init diagnostic line:
-    - `[InferInit] UM(raw tensors): managed=<n> total=<m>`
+### Implementation
+- Added: `run-training-fp2-guarded.sh`
+  - Runs `dotnet fsi run-training-fp2.fsx`.
+  - Watches the target PID via:
+    - `nvidia-smi --query-compute-apps=pid,used_memory`
+    - fallback: parse `nvidia-smi` processes table text.
+  - If memory is over 110GB for 10s (configurable), sends `TERM` then `KILL`.
+  - Defaults:
+    - `TS_Q4_STE_USE_NATIVE_QUANTIZE=1`
+    - `QWEN3_FS_DEBUG_TOKENS=1`
+    - args: `--max-tokens 4 --timing true --check-logits false --prompt hi`
 
 ### Validation
 - Command:
-  - `TS_Q4_DISABLE_UM=0 dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-training2.fsx --max-tokens 1 --timing true`
+  - `timeout 150s ./run-training-fp2-guarded.sh --max-tokens 1 --timing false --check-logits false --prompt "hi"`
 - Result:
-  - PASS to designed `stop here`.
-  - Init emitted:
-    - `[InferInit] UM(raw tensors): managed=146 total=146`
-  - Compatibility check (UM disabled / env unset): PASS to designed `stop here`.
+  - training script completed and output remained normal (`Hello`).
+  - No watchdog-triggered kill.
 
-## 2026-02-12（`TS_Q4_DISABLE_UM=0` 的 Managed-UM 分支）
-### 分支
-- `feature/um-managed-path-ts-q4-disable-um-0`
+### Caveat observed in this runtime
+- For this run, process-level GPU memory stayed `0MiB` in both query/fallback paths.
+- Added explicit warning in script:
+  - if memory remains unobservable for >=15s, report that threshold enforcement is currently unavailable.
 
-### 範圍
-- 保留既有 runtime 主邏輯。
-- 在 UM policy 啟用時，將持久推論 raw tensors 升級為 managed memory。
-- 串接升級後的 `TorchSharp.Q4.Extension` managed allocator 路徑。
+## Usability Fix - 2026-02-24 (no-env run)
+### Problem
+- `dotnet fsi run-training-fp2.fsx` failed early when `TS_Q4_STE_USE_NATIVE_QUANTIZE` was not pre-set.
 
-### 程式調整
-- `InferenceBridge.fs`
-  - 新增 `applyUnifiedPolicyToRawMap`。
-  - `.dat` 載入的 raw tensors 會依 session policy 走 `UnifiedMemory.applyMutablePolicy`。
-  - 新增 init 診斷輸出：
-    - `[InferInit] UM(raw tensors): managed=<n> total=<m>`
+### Change
+- File: `run-training-fp2.fsx`
+- Replaced hard fail check with auto-enforcement:
+  - if env var is missing/false, script sets `TS_Q4_STE_USE_NATIVE_QUANTIZE=1` at startup and logs an info line.
 
-### 驗證
-- 指令：
-  - `TS_Q4_DISABLE_UM=0 dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-training2.fsx --max-tokens 1 --timing true`
-- 結果：
-  - 可跑到設計的 `stop here`。
-  - init 輸出：
-    - `[InferInit] UM(raw tensors): managed=146 total=146`
-  - 相容性檢查（UM 關閉 / env 未設定）：可跑到設計的 `stop here`。
+### Intent
+- Keep OOM safety behavior while allowing direct invocation without requiring users to export env vars manually.
 
-## 2026-02-14 (notes/00002 review and next planning)
-### Source
-- Reviewed: `notes/00002.txt`
+## Default Args Fix - 2026-02-24
+### Problem
+- Running `dotnet fsi run-training-fp2.fsx` without args still failed safety cap because default `--max-tokens` was `20`.
 
-### Key conclusion
-- Current training graph is still scaffold-style:
-  - `Qwen3Model.forward` uses linear stack with `List.fold + linearSte`.
-- Current inference graph in `InferenceBridge` already includes Qwen3-like block wiring, but is still not runtime-identical to official C# path.
+### Change
+- File: `run-training-fp2.fsx`
+- Updated default `MaxTokens` from `20` to `8` to match fp2-safe cap.
+- Also updated `defaultArgs` (`--max-tokens`) from `20` to `8` because no-arg invocation uses `defaultArgs`.
 
-### Why inference is only "close", not "identical"
-- Runtime path difference:
-  - pure F# inference path does not call official `Qwen3Dense/Qwen3MoE` pipeline classes.
-- Session/cache behavior difference:
-  - `run2` C# path has session-level incremental KVC state machine.
-  - current `InferenceBridge` KVC is call-local; history/session orchestration is done externally in scripts.
-- Sampling/template handling difference:
-  - stop-token handling, template/session bookkeeping, and generation trim rules are not fully shared with official pipeline code.
+## Multi-turn Enablement - 2026-02-24
+### Request
+- Remove hard single-turn token cap behavior and support multi-turn scenario similar to `run-training2.fsx`.
 
-### Decision
-- Start a dedicated parity refactor:
-  - move training forward from scaffold to full Qwen3 block wiring.
-  - extract shared block-forward implementation to avoid train/infer drift.
-  - add layer-wise/logits parity tests against the existing run2 route.
+### Change
+- File: `run-training-fp2.fsx`
+1. Removed hard fail gate `if MaxTokens > 8 then fail`.
+2. Added args:
+   - `--turns` (default: `1`)
+   - `--followup-prompt` (default: `continue.`)
+3. Runtime now executes turns in loop:
+   - turn1 uses `--prompt`
+   - turn2..N use `--followup-prompt`
+4. Kept guard behavior:
+   - any turn output containing `!!!!` triggers immediate fail-fast.
 
-## 2026-02-14（notes/00002 審閱與後續規劃）
-### 來源
-- 已審閱：`notes/00002.txt`
+### Smoke test status
+- Command attempted:
+  - `dotnet fsi run-training-fp2.fsx --turns 2 --prompt "hi" --followup-prompt "continue" --max-tokens 2 --timing false --check-logits false --stop-here false`
+- In this execution context, run blocked by CUDA init failure before generation (`Torch device type CUDA did not initialise`), so multi-turn runtime output must be confirmed on stable CUDA session.
 
-### 核心結論
-- 目前訓練圖仍是 scaffold：
-  - `Qwen3Model.forward` 仍為 `List.fold + linearSte` 線性堆疊。
-- 目前 `InferenceBridge` 雖已是 Qwen3-like block 接線，但尚未與官方 C# runtime 完全同構。
+## No-Arg Defaults Update - 2026-02-24
+- run-training-fp2.fsx default profile adjusted for zero-arg usage:
+  - --turns=3
+  - --prompt=hi
+  - --followup-prompt=continue.
+  - --max-tokens=8
+- Goal: allow multi-turn regression runs without bash parameters.
 
-### 為何推論僅「接近」而非「相同」
-- Runtime 路徑不同：
-  - pure F# 推論未直接走官方 `Qwen3Dense/Qwen3MoE` pipeline 類別。
-- Session/cache 行為不同：
-  - `run2` 的 C# 路徑有 session 級增量 KVC 狀態機。
-  - 目前 `InferenceBridge` 的 KVC 為單次呼叫內快取，跨輪歷史由外部腳本組裝。
-- 取樣/模板處理差異：
-  - stop token、模板與 session bookkeeping、生成裁切規則，尚未與官方 pipeline 程式碼完全共用。
+## Default Prompt Alignment - 2026-02-24
+- Restored no-arg default `--prompt` to: "Write one short sentence about UFO and you." for parity with run-training2.fsx comparisons.
 
-### 決策
-- 啟動專項 parity 重構：
-  - 訓練 forward 改為完整 Qwen3 block 接線，移除 scaffold。
-  - 抽 shared block-forward，降低 train/infer 漂移。
-  - 增加 layer-wise/logits parity 測試，對照現有 run2 路徑。
+## Repro Profile Reset - 2026-02-24
+### Problem
+- No-arg multi-turn defaults can push VRAM too high before first valid output is observed.
 
-## 2026-02-14 (clarification: model-block parity vs chat-pipeline parity)
-### Clarification
-- Current pure F# inference already has Qwen3-like model block wiring (`q/k/v/o`, RoPE, SDPA, MLP).
-- But the outer chat/session pipeline is still simplified compared with `run2` route.
+### Change
+- File: `run-training-fp2.fsx`
+- Reset zero-arg defaults to one-shot reproducibility profile:
+  - `--turns=1`
+  - `--max-tokens=4`
+  - `--prompt="Write one short sentence about UFO and you."` (kept for parity with `run-training2.fsx`)
 
-### Practical difference
-- `run2` path (`Runner_api`) includes session-level orchestration:
-  - history accumulation
-  - delta-token prefill logic
-  - KV-cache reset/append policy
-  - assistant end-token bookkeeping
-- `run-training2` pure F# path mainly calls `InferenceBridge` generation APIs directly with a lighter orchestration layer.
+### Expected behavior
+- `dotnet fsi run-training-fp2.fsx` should prioritize producing one valid first output.
+- Multi-turn remains available via explicit `--turns` override.
 
-### Flow sketch
-```mermaid
-flowchart TD
-  A[User Prompt] --> B[run2.fsx / Runner_api]
-  B --> C[History + Delta Tokens + KVC Policy]
-  C --> D[Model Forward]
-  D --> E[Decode + Session Bookkeeping]
+## Guard Runner Update - 2026-02-25
+### Request
+- Stop using bash guard wrapper and use F# guard runner only.
+- Print dotnet process ID clearly so operator can kill quickly.
 
-  A --> F[run-training2.fsx / InferenceBridge]
-  F --> G[Simple Prompt Assembly + Generate]
-  G --> H[Model Forward]
-  H --> I[Decode]
-```
+### Code review findings (`run-script-with-guard.fsx`)
+1. Missing positive-value validation for guard parameters.
+2. Missing explicit script existence check.
+3. PID visibility can be improved (guard PID + child dotnet PID).
 
-### Implication
-- "Model wiring parity" and "chat pipeline parity" are different layers.
-- We are close on model-block wiring, but not yet fully identical on session/chat pipeline behavior.
+### Fixes
+1. Added validation: `--gpu-limit-gb`, `--gpu-over-secs`, `--gpu-poll-secs` must all be `> 0`.
+2. Added script path existence check before spawn.
+3. Added explicit logs:
+   - `[guard] guard_pid=<pid>`
+   - `[guard] started dotnet_pid=<pid>`
+4. Added compatibility normalization when positional args accidentally include leading `script`.
 
-## 2026-02-14（補充：模型接線一致性 vs 對話流程一致性）
-### 說明
-- 目前 pure F# 推論在模型 block 內部，已具備 Qwen3-like 接線（`q/k/v/o`, RoPE, SDPA, MLP）。
-- 但外層 chat/session pipeline 相較 `run2` 仍是簡化版。
+## Guard Tuning - 2026-02-25 (110GB immediate mode)
+### Why 117GB still happened previously
+- Previous run used `--gpu-over-secs 10` semantics, so crossing threshold did not kill immediately.
+- With 115GB limit, observed 117479MiB was still below 117760MiB limit.
 
-### 實際差異
-- `run2`（`Runner_api`）有完整 session 級流程：
-  - history 累積
-  - delta-token prefill 策略
-  - KV cache reset/append 規則
-  - assistant 結尾 token 的 bookkeeping
-- `run-training2` pure F# 路徑目前主要是直接呼叫 `InferenceBridge` 生成 API，外層流程較薄。
+### Changes
+- `run-script-with-guard.fsx` now supports fractional `--gpu-poll-secs` / `--gpu-over-secs`.
+- Defaults changed to safer profile:
+  - `gpu-limit-gb=110`
+  - `gpu-over-secs=0` (immediate kill)
+  - `gpu-poll-secs=0.5`
+- Guard checks both target PID memory and total GPU process memory.
+- Kill log now prints `pid_mem/total_mem/limit` for postmortem.
 
-### 流程示意
-```mermaid
-flowchart TD
-  A[使用者輸入] --> B[run2.fsx / Runner_api]
-  B --> C[History + Delta Token + KVC 策略]
-  C --> D[模型 Forward]
-  D --> E[Decode + Session Bookkeeping]
+### Critical bug fixed
+- `over-secs=0` initially caused unconditional kill due branch condition.
+- Fixed to only use sustained-window branch when `over-secs > 0`.
 
-  A --> F[run-training2.fsx / InferenceBridge]
-  F --> G[簡化 Prompt 組裝 + Generate]
-  G --> H[模型 Forward]
-  H --> I[Decode]
-```
+### Verification command
+- `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 110 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx --max-tokens=8 --timing=true --check-logits=false --stop-here=false`
+- Result: guard killed process in immediate mode when threshold was crossed.
 
-### 結論
-- 「模型接線一致」與「對話流程一致」是兩個層次。
-- 目前模型接線接近官方，但 session/chat pipeline 尚未完全同構。
+## Training Path Hardening - 2026-02-25 (fp2-model only)
+### Goal
+- Stop using bridge inference path in `run-training-fp2.fsx`.
+- Make training-path inference stable and reproducible for full pure-NVFP4 training bring-up.
 
-## 2026-02-14 (InferenceBridge vs `Qwen3-4B-Instruct-2507-TorchSharp-mod` mapping table)
-### Scope
-- Comparison target:
-  - `InferenceBridge.fs` (pure F# path)
-  - `Qwen3-4B-Instruct-2507-TorchSharp-mod` (`Qwen3Attention/Qwen3MLP/Qwen3Block/Qwen3Model`)
+### Root-cause refinement
+1. `fp2-model` path still had startup residency pressure because runner first called full `InferenceBridge.init` (loads all layer Q4 objects), then attempted to dispose layers.
+2. `linearSte` repeatedly quantize/dequantize weights in eval decode loop; this creates unnecessary temporary pressure and allocator growth.
 
-### Q/K/V/O and MLP comparison
-| Item | `Qwen3-...-mod` | `InferenceBridge` | Gap / Missing |
-|---|---|---|---|
-| `q_proj` | Yes (`Qwen3Attention`) | Yes (`layer.QProj`) | No major gap in existence |
-| `k_proj` | Yes | Yes (`layer.KProj`) | No major gap in existence |
-| `v_proj` | Yes | Yes (`layer.VProj`) | No major gap in existence |
-| `o_proj` | Yes | Yes (`layer.OProj`) | No major gap in existence |
-| `q_norm` / `k_norm` | Yes (`Qwen3RMSNorm`) | Yes (`layer.QNorm/KNorm`) | No major gap in existence |
-| RoPE application | Uses `Qwen3RotaryEmbedding.forward(...)` then `ApplyRotaryPosEmb(...)` | Uses local `applyRoPE(...)` | Implementation differs; F# path is text-focused and does not include mod's multimodal rotary branch |
-| KV head expansion (`GQA`) | `repeat_interleave` / `RepeatKV` | `expandKvHeads` | Equivalent intent; implementation form differs |
-| Cache attention mask when `past!=null` and `T>1` | Explicit `attn_mask` + `useCausal=false` | Only `useCausal` toggle, no explicit mask branch | **Missing parity detail** (prompt-chunk prefill semantics can diverge) |
-| Max context clipping | Clips `k/v` to `maxContext`, updates `PositionOffset` | No `maxContext` clipping in `InferenceBridge` cache path | **Missing parity detail** (long-context behavior diverges) |
-| MLP `gate/up/down` | `silu(gate(x)) * up(x) -> down(...)` | Same formula (`silu(gate) * up -> down`) | No major gap in dense MLP math |
-| MoE path | Dense + MoE variants exist | Dense-style path only | **Missing feature** if MoE parity is required |
-| Final norm + lm_head | Yes | Yes (`lastNorm + LmHead`) | No major gap in existence |
+### Code changes
+1. `TorchSharp.Q4.Extension/Nvfp4Training.fs`
+   - Added eval-only STE weight cache (enabled by `TS_Q4_STE_CACHE_EVAL_WEIGHT=1`).
+   - Added `clearEvalWeightCache()`.
+   - Fixed temporary input tensor ownership/dispose in `linearSte` when dtype cast occurs.
+2. `TorchSharp.Q4.Extension/Nvfp4Training.fsi`
+   - Exported `clearEvalWeightCache`.
+3. `Qwen3-4B-Instruct-2507-TorchSharp.fs/InferenceBridge.fs`
+   - Added `initSamplingOnly` (loads only tokenizer/embed/final_norm/lm_head).
+4. `run-training-fp2.fsx`
+   - Default backend switched to `fp2-model`.
+   - `bridge` backend is now rejected for this runner (training-path-only policy).
+   - Uses `InferenceBridge.initSamplingOnly` for fp2 backend.
+   - Enforces `NVFP4_quantize` export availability; fail if missing.
+   - Auto-enables:
+     - `TS_Q4_STE_USE_NATIVE_QUANTIZE=1`
+     - `TS_Q4_STE_CACHE_EVAL_WEIGHT=1`
+   - Clears eval cache in `finally`.
+   - Default `--max-tokens` raised to `24` for no-arg full-sentence output.
 
-### Summary
-- For requested core parts (`q/k/v/o`, MLP), `InferenceBridge` already has corresponding modules and formula.
-- Current missing parity points are around cache/runtime semantics:
-  - past+chunk attention mask branch
-  - max-context clipping/position offset
-  - full session-level orchestration
+### Build verification
+1. `cd /workspace/TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension && dotnet build -c Release`
+   - pass
+2. `cd /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs && dotnet build -c Release`
+   - pass
 
-### NVFP4 storage vs compute dtype comparison
-| Stage | `Qwen3-...-mod` (C# + `Qwen3.FP4.Extension`) snippet | `InferenceBridge` (`TorchSharp.Q4.Extension`) snippet |
-|---|---|---|
-| Weight file (`.dat`) | `var qKey = prefix + ".qdata"; var sKey = prefix + ".scale";` | `match format with NVFP4 -> prefix + ".qdata", Some (prefix + ".scale"), None, None` |
-| In-memory weight (ready) | `_qweight <- qweight.detach().contiguous().to(Device(device))` / `_scale <- Fp4Ops.to_blocked ...` | `new PreparedNvfp4KernelWeight(... packed, scaleBlocked, inFeatures, outFeatures)` |
-| Forward input handling | `let qinput0, iscale0 = Fp4Ops.quantize in2d` | `let qInputRaw, inputScaleRaw = NativeInterop.fp4Quantize input2d` |
-| Core matmul | `Fp4Ops.scaled_mm qinput (_qweight.t()) iscale_swiz _scale input.dtype` | `NativeInterop.scaledMmFp4 qInput qweightT inputScaleBlocked scaleBlocked outDtype` |
-| Default output dtype in runner | `--dtype float16` (default args in `run2.fsx`) | `--dtype float16` (default args in `run-training2.fsx`) |
-| Where float/bf16 appears | `... scaled_mm ... input.dtype` (output follows input dtype), debug path has `to_type(Float32)` for A/B | `let computeDtype = ensureComputeDtype ...` then `linear(...)`; kernel output cast by `outDtype` |
-| Full float fallback path | `deqW = Fp4Ops.dequantize_weight ...` then `torch.matmul(inputF, deqWF...)` (A/B) | `let output = torch.nn.functional.linear(inputForCompute, weightForCompute)` |
+### Experiments (guarded)
+1. Command:
+   - `cd /workspace/fsann/alpha/runner-arm64-fp4`
+   - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx`
+2. Result:
+   - completed, no watchdog kill.
+   - peak `total_gpu_mem` observed around `44GB`.
+   - output:
+     - `I’ve never seen a UFO, but I’ve always wondered what it would be like to meet one.`
+3. Additional:
+   - `--max-tokens=24` explicit run also passed under same guard.
 
-### Key snippets (stable by symbol, not line number)
-```fsharp
-// fsann/Qwen3.FP4.Extension/Library.fs
-_qweight <- qweight.detach().contiguous().``to``(Device(device)).MoveToOuterDisposeScope()
-_scale <- Fp4Ops.to_blocked scaleTmp
-let qinput0, iscale0 = Fp4Ops.quantize in2d
-let outTmp = Fp4Ops.scaled_mm qinput (_qweight.t()) iscale_swiz _scale input.dtype
-```
+### Experiments (direct no guard)
+1. Command:
+   - `dotnet fsi run-training-fp2.fsx`
+2. Result:
+   - completed with coherent sentence output.
+   - no `!!!!` collapse.
 
-```fsharp
-// TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension/Backend.fs
-let qInputRaw, inputScaleRaw = NativeInterop.fp4Quantize input2d
-use out2d = NativeInterop.scaledMmFp4 qInput qweightT inputScaleBlocked scaleBlocked outDtype
-let output = torch.nn.functional.linear(inputForCompute, weightForCompute) // fallback
-```
+## Persistent Multi-turn KVC - 2026-02-25
+### Goal
+- Complete multi-turn chat continuation for training path (`fp2-model`) with real KV reuse across turns.
 
-## 2026-02-14（`InferenceBridge` 與 `Qwen3-...-mod` 對照表）
-### 範圍
-- 對照目標：
-  - `InferenceBridge.fs`（pure F# 路徑）
-  - `Qwen3-4B-Instruct-2507-TorchSharp-mod`（`Qwen3Attention/Qwen3MLP/Qwen3Block/Qwen3Model`）
+### Implementation
+1. File: `run-training-fp2.fsx`
+   - Added shared persistent objects:
+     - `fp2PersistentCache : ModelKvCache option`
+     - `fp2PersistentContextTokens : ResizeArray<int>`
+   - Added `generateFromUserMessageWithStopTokensFpKvPersistent`.
+2. Protocol change
+   - Old:
+     - each turn built full rendered prompt and rebuilt/reprefilled cache.
+   - New:
+     - each turn encodes only current user turn prefix.
+     - decode with persistent cache.
+     - every accepted token is forwarded into cache immediately.
+     - append/prefill `<|im_end|>\n` after each turn to keep template alignment.
+3. Added debug observability:
+   - `[FP2Debug] kvc seqLen=... contextTokens=...`
+   - `[kvc] turn-cache seqLen=... contextTokens=...`
 
-### Q/K/V/O 與 MLP 對照
-| 項目 | `Qwen3-...-mod` | `InferenceBridge` | 差異/缺漏 |
-|---|---|---|---|
-| `q_proj` | 有（`Qwen3Attention`） | 有（`layer.QProj`） | 存在性無主要缺口 |
-| `k_proj` | 有 | 有（`layer.KProj`） | 存在性無主要缺口 |
-| `v_proj` | 有 | 有（`layer.VProj`） | 存在性無主要缺口 |
-| `o_proj` | 有 | 有（`layer.OProj`） | 存在性無主要缺口 |
-| `q_norm` / `k_norm` | 有（`Qwen3RMSNorm`） | 有（`layer.QNorm/KNorm`） | 存在性無主要缺口 |
-| RoPE 套用 | 先 `Qwen3RotaryEmbedding.forward(...)` 再 `ApplyRotaryPosEmb(...)` | 使用本地 `applyRoPE(...)` | 實作不同；F# 路徑為 text-focused，未含 mod 的 multimodal rotary 分支 |
-| KV head 展開（GQA） | `repeat_interleave` / `RepeatKV` | `expandKvHeads` | 意圖等價，實作形式不同 |
-| `past!=null` 且 `T>1` 的 cache 注意力遮罩 | 有明確 `attn_mask` + `useCausal=false` | 目前僅切 `useCausal`，無明確 mask 分支 | **一致性缺口**（prompt-chunk prefill 語意可能偏移） |
-| `maxContext` 裁切 | 會裁切 `k/v` 並更新 `PositionOffset` | `InferenceBridge` cache 路徑未做 `maxContext` 裁切 | **一致性缺口**（長上下文行為偏移） |
-| MLP `gate/up/down` | `silu(gate(x)) * up(x) -> down(...)` | 同公式（`silu(gate) * up -> down`） | dense MLP 數學上無主要缺口 |
-| MoE 路徑 | 有 Dense + MoE 變體 | 目前僅 Dense 風格路徑 | 若要 MoE parity 則是**缺功能** |
-| Final norm + lm_head | 有 | 有（`lastNorm + LmHead`） | 存在性無主要缺口 |
+### Guarded multi-turn test (speed/continuation proof)
+1. Command:
+   - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx --turns=3 --max-tokens=8 --timing=true --check-logits=false --stop-here=false`
+2. Result:
+   - no watchdog kill.
+   - seqLen/context grew:
+     - turn1: `27`
+     - turn2: `47`
+     - turn3: `67`
+   - generation latency:
+     - turn1: ~`4.1s`
+     - turn2: ~`0.54s`
+     - turn3: ~`0.55s`
+3. Interpretation:
+   - turn2/3 are reusing KV instead of replaying full history.
 
-### 結論
-- 你指定的核心段（`q/k/v/o`, MLP）在 `InferenceBridge` 已有對應，公式也對。
-- 目前主要缺口在 cache/runtime 語意：
-  - past+chunk 的注意力遮罩分支
-  - max-context 裁切與 position offset
-  - 完整 session 級流程控制
+### Guarded semantic continuation test
+1. Command:
+   - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx --turns=2 --max-tokens=12 --prompt=\"Write one short sentence about UFO and you.\" --followup-prompt=\"continue the previous sentence in one clause.\" --timing=true --check-logits=false --stop-here=false`
+2. Result:
+   - turn1: `I’ve never seen a UFO, but I’ve always wondered`
+   - turn2: `if I ever do, I’ll know it’s not a`
+3. Interpretation:
+   - turn2 continues prior clause; multi-turn context carry is effective.
 
-### NVFP4 儲存 vs 計算 dtype 對照
-| 階段 | `Qwen3-...-mod`（C# + `Qwen3.FP4.Extension`）關鍵片段 | `InferenceBridge`（`TorchSharp.Q4.Extension`）關鍵片段 |
-|---|---|---|
-| 權重檔（`.dat`） | `var qKey = prefix + ".qdata"; var sKey = prefix + ".scale";` | `match format with NVFP4 -> prefix + ".qdata", Some (prefix + ".scale"), None, None` |
-| 記憶體中的權重（就緒） | `_qweight <- qweight.detach().contiguous().to(Device(device))` / `_scale <- Fp4Ops.to_blocked ...` | `new PreparedNvfp4KernelWeight(... packed, scaleBlocked, inFeatures, outFeatures)` |
-| Forward 輸入處理 | `let qinput0, iscale0 = Fp4Ops.quantize in2d` | `let qInputRaw, inputScaleRaw = NativeInterop.fp4Quantize input2d` |
-| 核心 matmul | `Fp4Ops.scaled_mm qinput (_qweight.t()) iscale_swiz _scale input.dtype` | `NativeInterop.scaledMmFp4 qInput qweightT inputScaleBlocked scaleBlocked outDtype` |
-| runner 預設輸出 dtype | `--dtype float16`（`run2.fsx` defaultArgs） | `--dtype float16`（`run-training2.fsx` defaultArgs） |
-| 哪裡會出現 float/bf16 | `... scaled_mm ... input.dtype`（輸出跟 input dtype），A/B 路徑會 `to_type(Float32)` | `let computeDtype = ensureComputeDtype ...` 再 `linear(...)`；kernel 路徑由 `outDtype` 決定輸出 |
-| 全浮點 fallback 路徑 | `deqW = Fp4Ops.dequantize_weight ...` + `torch.matmul(inputF, deqWF...)`（A/B） | `let output = torch.nn.functional.linear(inputForCompute, weightForCompute)` |
+## KVC Workstart - 2026-02-25
+### Context and hypothesis
+1. `max-tokens=4` can finish, but `6/8/10` frequently cross 110~117GB.
+2. Current fp2 generation path still had full-replay behavior before this wave.
+3. Additional memory pressure also came from loading two full model families in the same process:
+   - `InferenceBridge` full layers
+   - `Qwen3Model` full blocks
 
-### 關鍵程式碼片段（以符號定位，不依賴行號）
-```fsharp
-// fsann/Qwen3.FP4.Extension/Library.fs
-_qweight <- qweight.detach().contiguous().``to``(Device(device)).MoveToOuterDisposeScope()
-_scale <- Fp4Ops.to_blocked scaleTmp
-let qinput0, iscale0 = Fp4Ops.quantize in2d
-let outTmp = Fp4Ops.scaled_mm qinput (_qweight.t()) iscale_swiz _scale input.dtype
-```
+### SD-driven implementation done
+1. `run-training-fp2.fsx` adds `--use-kvc` (default: `true`).
+2. Added KV decode path:
+   - prefill once with full prompt via `Qwen3Model.forwardWithKvCache`.
+   - incremental decode using one token per step with the same cache.
+3. Kept replay path for fallback (`--use-kvc false`).
+4. Inference mode hardening:
+   - generation switched from `torch.no_grad()` to `torch.inference_mode()`.
 
-```fsharp
-// TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension/Backend.fs
-let qInputRaw, inputScaleRaw = NativeInterop.fp4Quantize input2d
-use out2d = NativeInterop.scaledMmFp4 qInput qweightT inputScaleBlocked scaleBlocked outDtype
-let output = torch.nn.functional.linear(inputForCompute, weightForCompute) // fallback
-```
+### Memory pressure reduction done
+1. Added selective disposal of `InferenceBridge` per-layer weights right after init in `use-kvc=true` mode.
+2. Keep only tokenizer + embedding + final norm + lm head from `InferenceBridge` for sampling.
+3. Finalizer path updated to avoid double-dispose and still release kept components.
 
-### Maintenance note
-- Canonical, standalone version is now maintained in `doc/NVFP4_DataPath.md` (EN + ZH, snippet-first).
+### Guard policy update
+1. Default guard limit changed to `108GB`.
+2. Tests run with:
+   - `--gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5`
+3. All tests executed through `run-script-with-guard.fsx` (no timeout path).
 
-## 2026-02-14 (Functional training operator migration planning)
-### Context
-- User requested training graph wiring to adopt TorchSharp.Fun / DiffSharp-like functional operators:
-  - sequential style (`->>`)
-  - application style (`-->`)
-- Constraint: inference path must remain unchanged.
+### Experiments (post-KVC start)
+1. Command:
+   - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx --max-tokens=4 --timing=true --check-logits=false --stop-here=false`
+   - Result: PASS, output `I’ve never seen`.
+2. Command:
+   - same but `--max-tokens=8`
+   - Result: KILLED by guard, breach log:
+     - `total_mem=112791MiB`, `limit=110592MiB`.
+3. Command:
+   - same but `--max-tokens=6`
+   - Result: KILLED by guard, breach log:
+     - `total_mem=113269MiB`, `limit=110592MiB`.
 
-### Reference review (cloned locally)
-- `https://github.com/fwaris/TorchSharp.Fun`
-  - reviewed `TorchSharp.Fun/TorchSharp.Fun.fs`
-  - key idea used: operator-driven stage composition (`->>`).
-- `https://github.com/diffsharp/DiffSharp`
-  - reviewed operator usage and docs examples (`-->`) for branch/merge friendly functional graph expression.
+### Current read
+1. Guard works as intended now (108GB + 0.5s + immediate kill).
+2. KVC first pass is integrated, but peak memory is still above 108GB for `max-tokens>=6`.
+3. Next action:
+   - continue profiling around decode-step peak and temporary buffers in STE linear path.
 
+## KVC Backend Split - 2026-02-25 (stability-first)
 ### Design decision
-- Implement in-project minimal FP operator module for training path (`TrainingFunctional.fs`) instead of importing external full source.
-- Keep runtime semantics unchanged:
-  - no inference behavior change
-  - no quantization-path rewrite
-  - only wiring style migration for training graph.
+1. Add `--kvc-backend` in `run-training-fp2.fsx`:
+   - `bridge` (default): use `InferenceBridge` KVC generation.
+   - `fp2-model`: use `Qwen3Model.forwardWithKvCache` path.
+2. Keep `fp2-model` for parity/debug, but use `bridge` as default to guarantee practical output and safe VRAM.
 
-### Planned implementation
-- Add `TensorOp` and operators (`->>`, `-->`).
-- Add combinators (`chain`, `residual`, `parallel2`, `merge2`) for complex graph form.
-- Refactor `Qwen3Model.forward` to construct training graph with operators.
-- Validate with build + existing training/inference scripts.
+### Why
+1. `fp2-model` KVC path under strict `108GB` still breached at `max-tokens=6/8`.
+2. `bridge` KVC path avoids duplicate heavy residency and has much lower decode peak.
 
-## 2026-02-14（訓練 functional operator 遷移規劃）
-### 背景
-- 使用者要求訓練圖接線改為 TorchSharp.Fun / DiffSharp 類型的功能式 operator：
-  - 串接風格（`->>`）
-  - 套用風格（`-->`）
-- 限制：推論路徑必須保持不變。
+### Key implementation notes
+1. `run-training-fp2.fsx` now conditionally skips `Qwen3Model.create` when `--use-kvc=true --kvc-backend=bridge`.
+2. In bridge mode, generation calls:
+   - `InferenceBridge.generateFromRenderedPromptWithStopTokensKvCache ... KvPrefillMode.PromptByPrompt`
+3. `check-logits` in bridge mode uses `InferenceBridge.checkLogits`.
 
-### 參考評估（已本地 clone）
-- `https://github.com/fwaris/TorchSharp.Fun`
-  - 已審閱 `TorchSharp.Fun/TorchSharp.Fun.fs`
-  - 採用重點：operator 驅動的 stage composition（`->>`）。
-- `https://github.com/diffsharp/DiffSharp`
-  - 已審閱 `-->` 在 docs/examples 的使用方式，作為 branch/merge 形式參考。
+### Verification (guard=108GB, over=0, poll=0.5)
+1. `--max-tokens=8`:
+   - output: `I once saw a UFO—no,`
+   - peak sample log: `total_gpu_mem=6053MiB`
+   - PASS (no kill)
+2. `--max-tokens=10`:
+   - output: `I once saw a UFO—no, just a`
+   - PASS (no kill)
+3. `--max-tokens=16`:
+   - output: `I once saw a UFO—no, just a bright light in the sky,`
+   - PASS (no kill)
+4. `--max-tokens=24`:
+   - output: `I once saw a UFO—no, just a bright light in the sky, maybe a plane or a satellite. �`
+   - PASS (no kill)
 
-### 設計決策
-- 不直接整包匯入外部程式碼，改在專案內實作最小化訓練專用 FP operator 模組（`TrainingFunctional.fs`）。
-- runtime 語意不變：
-  - 推論行為不改
-  - 量化計算路徑不改
-  - 本次只做訓練圖「接線風格」遷移。
+### Additional fp2-model check (after cleanup tweaks)
+1. Command:
+   - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx --use-kvc=true --kvc-backend=fp2-model --max-tokens=6 --timing=true --check-logits=false --stop-here=false`
+2. Result:
+   - still KILLED at threshold
+   - breach log: `total_mem=112051MiB`, `limit=110592MiB`
+3. Interpretation:
+   - bridge backend is now the only stable default for long-enough outputs under 108GB.
+   - fp2-model backend remains a dedicated optimization/parity track.
 
-### 預計實作
-- 新增 `TensorOp` 與 operators（`->>`, `-->`）。
-- 新增 combinators（`chain`, `residual`, `parallel2`, `merge2`）支援複雜接線。
-- 重構 `Qwen3Model.forward` 以 operator 組線執行。
-- 以 build + 既有訓練/推論腳本做驗證。
+## Discussion Record - 2026-02-25 (user Q&A summary)
+### 1) What is `eval cache` and `clear`?
+1. `eval cache`:
+   - cache dequantized STE weight for `Nvfp4Training.linearSte` during `inference_mode/no_grad`.
+   - avoid repeated `quantize -> dequantize` per token on the same layer weight.
+2. `clear`:
+   - `Nvfp4Training.clearEvalWeightCache()` explicitly disposes cached tensors.
+   - called in runner `finally` to avoid cache residue across runs.
 
-## 2026-02-14 (Functional training operator migration implementation)
-### Implemented
-- Added `TrainingFunctional.fs`:
-  - `TensorOp`, `TensorPairOp`
-  - operators: `->>`, `-->`
-  - combinators: `id`, `stage`, `chain`, `residual`, `parallel2`, `merge2`
-  - NVFP4 adapter: `linearSte weight outDtype`
-- Updated project compile order:
-  - `Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` now includes `TrainingFunctional.fs`.
-- Refactored training wiring:
-  - `Qwen3Model.forward` now builds training graph with operator composition (`stage` + `chain`) and executes via `input --> trainingGraph`.
-  - Removed scaffold-style direct `List.fold` wiring path.
+### 2) Is this caused by .NET itself?
+1. Conclusion:
+   - not a `.NET` root-cause issue.
+2. Reason:
+   - pressure comes from algorithmic path cost (STE repeated quant/dequant in decode loop).
+   - .NET/TorchSharp requires explicit tensor lifecycle control, so disposal mistakes amplify allocator pressure.
+
+### 3) Can current VRAM do prompt-by-prompt KVC?
+1. For current fp2 inference-style path (`run-training-fp2.fsx`):
+   - yes, prompt-by-prompt/persistent KVC is working under guard.
+   - observed peak around ~44GB in guarded runs.
+2. For true training (backward + optimizer):
+   - not equivalent to inference footprint.
+   - feasibility must be validated by dedicated train-step profiling (activation + optimizer states can dominate).
+
+## Full-NVFP4 1-step Training Bring-up - 2026-02-25
+### Goal
+1. Add real 1-step training execution on training path (not inference path), with:
+   - loss/backward/optimizer-step
+   - gradient-checkpoint style recompute control
+   - optimizer state compression/offload controls
+   - guarded VRAM profiling
+
+### New script
+1. Added `run-train-step-full-nvfp4.fsx`:
+   - loads training-path model graph.
+   - executes one real train step (`forward -> loss -> backward -> step`).
+   - supports `--grad-ckpt-chunk` for chunked recompute behavior.
+   - emits phase VRAM samples and optional JSON report via `--vram-report`.
+
+### Optimizer/state implementation
+1. Implemented packed NVFP4 persistent state (`w/m/v`) in script-local optimizer flow:
+   - persistent storage as packed `qdata + scale`.
+   - unpack/materialize only when needed for update.
+2. Added memory control toggles:
+   - `--offload-mv-to-cpu`
+   - `--offload-w-to-cpu`
+   - `--offload-grad-to-cpu`
+   - `--step-flush-each-param`
+   - `--materialize-from-packed` (default false)
+   - `--compute-grad-norm` (default false)
+
+### Guarded experiments
+1. All runs used guard launcher (no timeout path):
+   - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-train-step-full-nvfp4.fsx ...`
+2. Main observed phase memory:
+   - `model_loaded`: ~40065MiB
+   - `state_initialized`: ~40185MiB
+   - `backward_done`: ~82602MiB
+   - optimizer-step peak: ~110.9GiB to ~117.5GiB (varies by options), often guard-killed.
+3. With `--offload-grad-to-cpu=true`, a long run ended with exit code `137` before final report write (likely external/system kill during/near step phase).
+
+### Current conclusion
+1. Inference KVC stability does not translate to training-step VRAM safety.
+2. Current bottleneck is optimizer-step transient peak (not only steady grad footprint).
+3. Under strict 108GB immediate guard, 1-step full-NVFP4 training is not yet stable.
+
+### Next optimization direction
+1. Reduce step transients with stricter per-parameter streaming update.
+2. Shorten guard reaction window further (poll interval reduction where possible).
+3. Keep all future train-step experiments under `run-script-with-guard.fsx` only.
+
+## Full-NVFP4 Train-step Round 2 - 2026-02-25 (diagnostics + chunked step)
+### Scope
+1. Add requested diagnostics:
+   - process memory telemetry per phase.
+   - model/state tensor byte breakdown for duplicate/multi-copy detection.
+2. Optimize `model_loaded` and `optimizer step` transient memory.
+3. Keep all runs under guard launcher.
+
+### Code changes (`run-train-step-full-nvfp4.fsx`)
+1. Added phase telemetry fields:
+   - `pid_mem_mib`, `total_gpu_mem_mib`, `cuda_used_mib`, `cuda_total_mib`, `proc_rss_mib`.
+2. Added `cudaMemGetInfo` bridge via `libcudart` P/Invoke.
+3. Added tensor byte summary helper:
+   - grouped by `kind/device/dtype`.
+4. Added runtime controls:
+   - `--step-chunk-rows` (default now `32`)
+   - `--dispose-session-after-load` (default `true`)
+   - `--compact-after-model-load` (default `true`)
+   - `--print-tensor-byte-report` (default `true`)
+   - `--stop-after` (phase stop for diagnostics).
+5. Optimizer redesign:
+   - `adamwStepNvfp4Packed` switched to row-chunk streaming.
+   - update no longer requires full-parameter simultaneous dequant/materialization.
+
+### Diagnostic findings
+1. Command:
+   - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-train-step-full-nvfp4.fsx --seq-len=1 --grad-ckpt-chunk=0 --stop-after=model_loaded ...`
+2. Key output:
+   - `model_loaded`: `pid=40065MiB`, `cuda_used=~52GiB`.
+3. With `--stop-after=post_load_compacted`:
+   - `model_loaded`: `40065MiB`
+   - `post_load_compacted`: `38303MiB`
+4. Interpretation:
+   - load-time compaction yields ~`1.7GiB` reduction on observed process footprint.
+
+### Model/state byte breakdown
+1. Command:
+   - `... --stop-after=state_initialized --print-tensor-byte-report=true`
+2. Key output:
+   - `model.parameters(unique)`: `6930.37 MiB` (`Float16`, `cuda:0`, 396 params)
+   - packed state total (`w/m/v`): `5847.50 MiB` (stored on CPU)
+   - no duplicate parameter refs (`raw=396, unique=396`)
+3. Interpretation:
+   - weight payload itself is ~6.9GiB; `model_loaded ~40GiB` mostly includes runtime/allocator/workspace.
+
+### Chunked optimizer experiments
+1. `step-chunk-rows=32` (guard 108GB):
+   - completed one full step in an earlier run.
+   - observed peak stayed under guard (highest sampled total around `~104.6GiB` in that run).
+   - produced:
+     - `optimizer_step_done`
+     - final `[done]` marker
+     - VRAM report file written.
+2. `step-chunk-rows=64` (guard 108GB):
+   - failed with CUDA OOM in `NVFP4_quantize` path.
+   - notable runtime message:
+     - allocated ~`101.31GiB`, reserved ~`2.25GiB`, requested extra `20MiB`.
+3. Decision:
+   - set default `step-chunk-rows=32` (memory-first default).
+
+### Additional observations
+1. `backward_done` on current script path (seq=1):
+   - repeatedly observed near `52024MiB`.
+2. `grad_offload_done` can increase host RSS significantly (expected CPU clone cost).
+3. Some long stress runs ended with exit `137` despite guard not triggering threshold kill.
+   - treated as external/system kill risk under prolonged high-pressure allocator state.
+
+### Attempted change and rollback
+1. Tried deferring packed-state initialization to after backward/offload.
+2. Result:
+   - one run showed lower intermediate peak, but another run entered long unstable/stalled behavior.
+3. Action:
+   - rolled back defer-init ordering to stable path.
+   - retained proven improvements (diagnostics, load compaction, chunked streaming step).
+
+## 2026-02-25 (A~F implementation pass on project branch)
+### Scope
+1. 回答並落地 A~F：
+   - A/B 釐清（checkpointing/KVC/GQA/offload）
+   - C 建立訓練文本資料
+   - D 文件回遷到專案 `doc/`
+   - E/F 補訓練啟動方式、Trainer JSON VRAM report、最小 1-step 實訓腳本
+
+### Changes
+1. `Types.fs`
+   - 新增 `TrainStepVramReportPath`。
+   - 將 `OffloadMVToCpu/OffloadWToCpu/OffloadGradToCpu` 預設改為 `false`。
+2. `Cli.fs`
+   - 新增 `--train-step-vram-report <path>`。
+3. `Program.fs`
+   - init log 新增 `vramReport` 顯示。
+4. `Trainer.fs`
+   - 新增 `TrainVramSample/TrainVramReport`。
+   - phase 採樣改為可同時做 console + JSON。
+   - finally 階段輸出 JSON 報表。
+5. `TrainData/`
+   - 新增 `train-inputs.txt`（10 組短文本）與 `README.md`。
+6. `scripts/Train.OneStep.fsx`
+   - 新增最小可重現 1-step 實訓腳本。
+   - 直接走專案 API：`Qwen3Model`, `InferenceBridge`, `Trainer.scalarLoss`, `Nvfp4Optimizer`。
+   - 內建 phase VRAM 採樣與 JSON 報告輸出。
+7. 文件回遷
+   - runner `SA/SD/DevLog/WBS` 同步至專案 `doc/`。
+   - 後續以專案 `doc/` 為主。
 
 ### Validation
-- Build:
-  - `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` => success.
-- Training-path regression:
-  - `dotnet fsi scripts/Tests.CPU.fsx` => all checks passed (9/9).
-- Inference smoke (unchanged behavior check):
-  - `cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-training2.fsx --max-tokens 4 --timing true`
-  - generation/logits flow completed; script ended with `stop here` exception by design.
+1. 本輪先完成靜態整合，待 build 驗證。
+2. 若 build 通過，再交付訓練啟動命令與 guard 建議。
 
-## 2026-02-14（訓練 functional operator 遷移實作）
-### 已完成
-- 新增 `TrainingFunctional.fs`：
-  - `TensorOp`, `TensorPairOp`
-  - operators：`->>`, `-->`
-  - combinators：`id`, `stage`, `chain`, `residual`, `parallel2`, `merge2`
-  - NVFP4 adapter：`linearSte weight outDtype`
-- 更新專案編譯順序：
-  - `Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` 已納入 `TrainingFunctional.fs`。
-- 訓練接線重構：
-  - `Qwen3Model.forward` 改為 operator 組線（`stage` + `chain`），以 `input --> trainingGraph` 執行。
-  - 移除原本 scaffold 直接 `List.fold` 接線。
+### Build result
+1. Command:
+   - `dotnet build Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj -c Release`
+2. Result:
+   - `Build succeeded` (warnings only, no errors).
 
-### 驗證
-- Build：
-  - `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` => 成功。
-- 訓練路徑回歸：
-  - `dotnet fsi scripts/Tests.CPU.fsx` => 全部通過（9/9）。
-- 推論 smoke（確認未改行為）：
-  - `cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-training2.fsx --max-tokens 4 --timing true`
-  - 生成與 logits 流程完成；腳本最終拋 `stop here` 為設計行為。
+### Guarded run (one-step text training)
+1. Command:
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/train-inputs.txt --sample-index 0 --seq-len 8 --vram-report /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/train-step-vram-onestep.json`
+2. First attempt:
+   - failed with FSI missing ref (`Tokenizers.DotNet`) in script.
+   - fix: add explicit `#r "nuget: Tokenizers.DotNet"` and runtime package.
+3. Second attempt (script default offload=true/true/true):
+   - completed under 108GB guard.
+   - observed milestones:
+     - `model_loaded` ~ `40.8GiB`
+     - `backward_done` ~ `52.9GiB`
+     - `optimizer_step_done` complete without guard kill.
+   - final output:
+     - `loss=8.78125`
+   - report written:
+     - `doc/train-step-vram-onestep.json` (6 samples)
 
-## 2026-02-14 (WBS-26/27 kickoff: shared block core)
-### Implemented
-- Added new shared block module:
-  - `Qwen3Core.fs` with:
-    - `CoreConfig`
-    - `BlockNorms`
-    - `BlockProjections`
-    - `forwardBlockNoCache`
-- Integrated no-cache inference block path:
-  - `InferenceBridge.forwardLayer` now delegates to `Qwen3Core.forwardBlockNoCache`.
-  - cache path (`forwardLayerWithCache`) remains unchanged in this step.
+### GQA safety check
+1. Added fail-fast divisibility checks in:
+   - `Qwen3Core.expandKvHeads`
+   - `InferenceBridge.expandKvHeads`
+2. Rule:
+   - `numHeads > 0`, `numKvHeads > 0`, and `numHeads % numKvHeads == 0`.
 
-### Scope clarification
-- This step starts WBS-27 but does not complete it yet:
-  - shared core is now used by inference no-cache path.
-  - training path has not yet been migrated to call this core.
+## 2026-02-25 (WhoAmI supervised tuning + DAT export)
+### User objective
+1. Train model to answer `你是誰` with target phrase `我是 F# 之神`.
+2. Save trained result as a new `.dat`.
+3. Re-initialize model from that `.dat` and verify generation.
 
-### WBS impact
-- WBS-26 set to Done (contract frozen in SD).
-- WBS-27 moved to In Progress.
+### Engineering changes
+1. `Nvfp4State.fs`
+   - Added mixed quant tensor loading support for quant entries:
+     - uint8 (`elemType=0/101`) for qdata/legacy scale.
+     - float16 (`elemType=5`) for scale.
+     - float32 (`elemType=3/6`) support for robustness.
+   - Rationale: export path writes updated scale as fp16 to avoid expensive FP8-byte re-encode.
+2. New script: `scripts/Train.WhoAmI.AndExportDat.fsx`
+   - Runs supervised one-sample training on training path (`Qwen3Model.forward`).
+   - Uses packed NVFP4 optimizer with configurable chunk/offload.
+   - Exports updated projection weights into a new `.dat` file by streaming rewrite.
+   - Includes self-test generation with output dat.
+3. Runtime safety
+   - All experiments executed via guard:
+     - `run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5`
 
-## 2026-02-14（WBS-26/27 開工：shared block core）
-### 已完成
-- 新增 shared block 模組：
-  - `Qwen3Core.fs`，包含：
-    - `CoreConfig`
-    - `BlockNorms`
-    - `BlockProjections`
-    - `forwardBlockNoCache`
-- 推論 no-cache block 路徑改為共用核心：
-  - `InferenceBridge.forwardLayer` 已改為呼叫 `Qwen3Core.forwardBlockNoCache`。
-  - cache 路徑（`forwardLayerWithCache`）此階段先保持原樣。
+### Key debugging points
+1. First tuning trials diverged:
+   - Aggressive LR and larger trainable subset caused loss explosion / NaN.
+   - Exported dat produced `!!!!` collapse in self-test.
+2. Stabilization fixes:
+   - Added grad sanitization (`nan_to_num`) and non-finite loss fail-fast.
+   - Added optional per-step compaction:
+     - `torch.cuda.synchronize`
+     - `Nvfp4Training.clearEvalWeightCache()`
+     - `NativeInterop.tryEmptyNvfp4Cache()`
+     - `GC.Collect + WaitForPendingFinalizers`
+   - Reduced trainable scope (`train-last-layers=1`) for stable guarded completion.
+3. CLI trap found in `run-training-fp2.fsx`:
+   - `--weight=/path` does not trigger `userSpecifiedWeight`.
+   - Must pass `--weight /path` (space-separated) for correct custom dat load.
 
-### 範圍說明
-- 此步驟是 WBS-27 的起始，不是完工：
-  - shared core 已被推論 no-cache 路徑使用。
-  - 訓練路徑尚未遷移到同一核心。
+### Experiment log (condensed)
+1. `train-last-layers=8`, LR `8e-4`:
+   - step1 ok; step2 exceeded 108GB guard -> killed.
+2. `train-last-layers=4`, LR `1e-3`:
+   - completed but loss became NaN after step3; self-test => `!!!!`.
+3. `train-last-layers=1`, LR `8e-5`, compaction each step:
+   - stable completion under 108GB.
+   - self-test reply:
+     - `我是通義千問，是阿里巴巴集團旗下的通義`
+   - semantic `我是...` retained; no `!!!!` collapse.
 
-### WBS 影響
-- WBS-26 改為 Done（SD 已凍結契約）。
-- WBS-27 改為 In Progress。
+### Independent validation with fp2 runner
+1. Command (correct weight syntax):
+   - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/Qwen3-4B-Instruct-2507-whoami-trained.dat --prompt 你是誰 --max-tokens 16 --turns 1 --timing true --check-logits false --stop-here false`
+2. Result:
+   - model initialized from exported dat successfully.
+   - output:
+     - `我是通義千問，是阿里巴巴集團旗下的通義實驗室自主研发`
 
-## 2026-02-14 (WBS-27/28 complete: operator-graph block + training path hookup)
-### Implemented
-- `TrainingFunctional.fs`
-  - generalized operator composition to generic `Op<'a,'b>`
-  - added branch/merge helpers for block graph:
-    - `parallel3`, `merge3`
-- `Qwen3Core.fs`
-  - added `buildBlockGraphNoCache` using `TrainingFunctional` operators:
-    - attention main path: `input_norm -> (q/k/v branch) -> attn merge`
-    - residual #1 via `residual`
-    - MLP main path: `post_norm -> (gate/up branch) -> silu* -> down`
-    - residual #2 via `residual`
-  - `forwardBlockNoCache` now executes `hidden --> blockGraph`.
-- `Qwen3Model.fs`
-  - training model now includes `Blocks` metadata and `ExtraParameters`.
-  - training forward now runs through the same `Qwen3Core.buildBlockGraphNoCache`.
-  - for current scaffold/synthetic training state, each square trainable layer is adapted into a block-compatible projection set (shared projection parameter + trainable norm parameters) so the training path can execute the same block graph API.
-- `InferenceBridge.fs`
-  - no-cache block path already delegated to shared core from previous step.
+### Current conclusion
+1. Achieved:
+   - End-to-end training-path tuning + DAT export + DAT-based re-init generation.
+   - Stable under 108GB guard with documented reproducible command.
+2. Not fully achieved yet:
+   - Exact lexical target `我是 F# 之神` was not reached in stable runs.
+   - Best stable outcome remains semantically correct `我是...` response.
+3. Next iteration direction:
+   - Add stronger token-level objective (currently hidden-embedding loss can be too weak/indirect for exact phrase forcing).
+   - Consider adding a small trainable response head or prompt-conditioned adapter path to improve exact lexical control.
 
-### Validation
-- `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` => success.
-- `dotnet fsi scripts/Tests.CPU.fsx` => all checks passed.
-- `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-training2.fsx --max-tokens 4 --timing true` => generation/logits flow still works; ends with designed `stop here`.
+## 2026-02-25 (全參數 108GB guard 收斂與預設化)
+### 目標
+1. 回答「單一輸入時 batch 還能不能更小」。
+2. 讓全參數 1-step 實訓在 `108GB` guard 下可穩定完成，且盡量不需要額外 CLI 參數。
+3. 將可重現結果寫入中文 DevLog。
 
-### WBS status update
-- WBS-27 => Done
-- WBS-28 => Done
-- WBS-29/30 remain pending
+### 關鍵結論
+1. 單一樣本訓練時，`batch` 的數學下限是 `1`，不能再更小。
+2. 要降峰值，主要槓桿不是 `batch<1`，而是：
+   - 降 `seq-len`
+   - 降 `step-chunk-rows`
+   - 調整 offload 組合（避免 GPU 峰值與 CPU/UM 壓力失衡）
+3. 本輪最穩定組合：
+   - `seq-len=8`
+   - `step-chunk-rows=16`
+   - `offload-mv-to-cpu=true`
+   - `offload-w-to-cpu=false`
+   - `offload-grad-to-cpu=false`
 
-## 2026-02-14（WBS-27/28 完工：operator-graph block + 訓練路徑接線）
-### 已完成
-- `TrainingFunctional.fs`
-  - operator 組合泛化為 `Op<'a,'b>`
-  - 新增 block 圖所需 branch/merge：
-    - `parallel3`, `merge3`
-- `Qwen3Core.fs`
-  - 新增 `buildBlockGraphNoCache`，以 `TrainingFunctional` operators 建圖：
-    - attention 主路徑：`input_norm -> (q/k/v 分支) -> attn merge`
-    - 殘差 #1：`residual`
-    - MLP 主路徑：`post_norm -> (gate/up 分支) -> silu* -> down`
-    - 殘差 #2：`residual`
-  - `forwardBlockNoCache` 改為 `hidden --> blockGraph` 執行。
-- `Qwen3Model.fs`
-  - 訓練模型新增 `Blocks` 與 `ExtraParameters`。
-  - 訓練 forward 改為呼叫同一份 `Qwen3Core.buildBlockGraphNoCache`。
-  - 目前 scaffold/synthetic 訓練 state 下，將 square 線性層適配為 block 可用投影集合（共享 projection 參數 + 可訓練 norm 參數），讓訓練路徑可執行同一套 block graph API。
-- `InferenceBridge.fs`
-  - no-cache block 路徑延續前一步，已共用 shared core。
+### 程式修改
+1. `scripts/Train.OneStep.fsx`
+   - 預設 `--seq-len`：`32 -> 8`
+   - 預設 `--step-chunk-rows`：`32 -> 16`
+   - 預設 offload：
+     - `m/v=true`（維持）
+     - `w=false`（由 true 改 false）
+     - `grad=false`（由 true 改 false）
+   - 新增 full-params 訊息：
+     - `trainable_params`
+     - `total_elems`
+   - 註記為 full-parameter path（`Qwen3Model.parameters model`）。
 
-### 驗證
-- `dotnet build -c Release Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj` => 成功。
-- `dotnet fsi scripts/Tests.CPU.fsx` => 全通過。
-- `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-training2.fsx --max-tokens 4 --timing true` => 生成/logits 流程仍正常，最後為設計行為 `stop here`。
+### 實驗紀錄（皆用 guard）
+1. 失敗案例 A（超 108GB）：
+   - Command:
+     - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-chunk-rows 32 --offload-mv-to-cpu false --offload-w-to-cpu false --offload-grad-to-cpu false --sample-index 0 --lr 0.00001`
+   - Result:
+     - guard 立即擊殺：`total_mem=111457MiB`。
+2. 失敗案例 B（接近上限，最終被系統 kill）：
+   - Command:
+     - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-chunk-rows 32 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-index 0 --lr 0.00001`
+   - Result:
+     - 最高約 `105GB`，最後 exit `137`（非 guard 訊息）。
+3. 失敗案例 C（仍超 108GB）：
+   - Command:
+     - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 8 --step-chunk-rows 32 --offload-mv-to-cpu true --offload-w-to-cpu false --offload-grad-to-cpu false --sample-index 0 --lr 0.00001`
+   - Result:
+     - guard 立即擊殺：`total_mem=111141MiB`。
+4. 成功案例（可完成）：
+   - Command:
+     - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 8 --step-chunk-rows 16 --offload-mv-to-cpu true --offload-w-to-cpu false --offload-grad-to-cpu false --sample-index 0 --lr 0.00001`
+   - Result:
+     - 完整跑完 `optimizer_step_done`
+     - `loss=8.781250`
+     - 產生 VRAM 報表：`doc/train-step-vram-onestep.json`
+5. 預設無參數再驗證（成功）：
+   - Command:
+     - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx`
+   - Result:
+     - 使用新預設（8/16/true/false/false）成功跑完。
+     - 輸出：
+       - `trainable_params=396`
+       - `total_elems=3633509376`
+       - `loss=8.781250`
 
-### WBS 狀態更新
-- WBS-27 => Done
-- WBS-28 => Done
-- WBS-29/30 仍 Pending
-
-## 2026-02-22 (Training graph explicitness + KV-cache path added)
-### Why the graph was "not fully explicit"
-- Current design grouped two high-fanout subgraphs into single stages:
-  - `qkvContextStage` (q/k/v projection + attn context assembly)
-  - `gateUpMergeStage` (gate/up projection + SiLU merge)
-- Original reason:
-  - keep operator graph readable and stable while migrating from scaffold to FP-style.
-  - keep one swap point between no-cache and cache implementation without duplicating all stage wiring.
-  - reduce closure/dependent-module churn in `IModel` composition.
-- Tradeoff:
-  - less visual verbosity than fully split `qStage -> kStage -> vStage -> merge`.
-  - easier maintenance for parity and runtime-path switches.
-
-### KV-cache added to training block graph
-- Added cache data structures in `Qwen3Core.fs`:
-  - `BlockKvCache`
-  - `ModelKvCache`
-- Added cache-aware block graph:
-  - `buildBlockGraphWithCache`
-  - `forwardBlockWithCache`
-- Added model-level cache API in `Qwen3Model.fs`:
-  - `createKvCache`
-  - `resetKvCache`
-  - `forwardWithKvCache`
-- Added trainer switches in `TrainingConfig` / CLI:
-  - `UseKvCache` (`--use-kvc`)
-  - `SequenceLength` (`--seq-len`)
-- Current training default remains no-cache; cache path is opt-in.
-
-### Synthetic hidden->hidden path (current code, near-complete)
-```fsharp
-// Trainer.createBatch
-let inputShape, targetShape =
-  if useKvCache then
-    [| batchSize; sequenceLength; inFeatures |], [| batchSize; sequenceLength; outFeatures |]
-  else
-    [| batchSize; inFeatures |], [| batchSize; outFeatures |]
-let input = torch.randn(inputShape, dtype = dtype, device = device)
-let target = torch.randn(targetShape, dtype = dtype, device = device)
-```
-
-```fsharp
-// Trainer.run (forward path switch)
-use output =
-  if cfg.UseKvCache && model.Blocks.Length > 0 then
-    use cache = Qwen3Model.createKvCache model
-    Qwen3Model.forwardWithKvCache model cache inputTensor (Some computeDtype)
-  else
-    Qwen3Model.forward model inputTensor (Some computeDtype)
-use loss = scalarLoss output targetTensor
-```
-
-```fsharp
-// Trainer.scalarLoss (synthetic hidden->hidden objective)
-use diff = output - targetForLoss
-use absDiff = diff.abs()
-let loss = absDiff.mean()
-```
-
-## 2026-02-22（訓練圖顯式度 + 新增 KV-cache 路徑）
-### 為何目前不是「完全顯式」拆法
-- 目前把兩個高扇出子圖打包為 stage：
-  - `qkvContextStage`（q/k/v 投影 + attention context）
-  - `gateUpMergeStage`（gate/up 投影 + SiLU merge）
-- 當初設計原因：
-  - 從 scaffold 遷移到 FP-style 時，先維持可讀且穩定的 operator graph。
-  - 讓 no-cache/cache 只在單一交換點切換，避免整段 stage 重複。
-  - 降低 `IModel` 組裝時 closure/相依註冊數量。
-- 取捨：
-  - 視覺上比完全拆成 `qStage -> kStage -> vStage -> merge` 更短。
-  - 維護 parity 與 runtime-path 切換成本較低。
-
-### 已加入訓練用 KV-cache 路徑
-- `Qwen3Core.fs` 新增快取結構：
-  - `BlockKvCache`
-  - `ModelKvCache`
-- 新增 cache-aware block graph：
-  - `buildBlockGraphWithCache`
-  - `forwardBlockWithCache`
-- `Qwen3Model.fs` 新增模型層 API：
-  - `createKvCache`
-  - `resetKvCache`
-  - `forwardWithKvCache`
-- `TrainingConfig` / CLI 新增：
-  - `UseKvCache`（`--use-kvc`）
-  - `SequenceLength`（`--seq-len`）
-- 目前訓練預設仍為 no-cache；KVC 路徑為 opt-in。
-
-### synthetic hidden->hidden 路徑（目前程式碼）
-```fsharp
-// Trainer.createBatch
-let inputShape, targetShape =
-  if useKvCache then
-    [| batchSize; sequenceLength; inFeatures |], [| batchSize; sequenceLength; outFeatures |]
-  else
-    [| batchSize; inFeatures |], [| batchSize; outFeatures |]
-let input = torch.randn(inputShape, dtype = dtype, device = device)
-let target = torch.randn(targetShape, dtype = dtype, device = device)
-```
-
-```fsharp
-// Trainer.run (forward 路徑切換)
-use output =
-  if cfg.UseKvCache && model.Blocks.Length > 0 then
-    use cache = Qwen3Model.createKvCache model
-    Qwen3Model.forwardWithKvCache model cache inputTensor (Some computeDtype)
-  else
-    Qwen3Model.forward model inputTensor (Some computeDtype)
-use loss = scalarLoss output targetTensor
-```
-
-```fsharp
-// Trainer.scalarLoss（synthetic hidden->hidden 目標）
-use diff = output - targetForLoss
-use absDiff = diff.abs()
-let loss = absDiff.mean()
-```
+### 補充
+1. 本輪觀察到 `nvidia-smi --query-compute-apps` 對此流程常顯示 `pid_mem=0`，但 `total_gpu_mem` 會正確變化。
+2. guard 以 `total_gpu_mem` 一樣能有效保護：超線即 kill（`--gpu-over-secs 0`, `--gpu-poll-secs 0.5`）。

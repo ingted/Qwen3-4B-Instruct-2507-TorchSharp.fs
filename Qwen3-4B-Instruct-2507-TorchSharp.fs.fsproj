@@ -15,6 +15,7 @@
     <Compile Include="Qwen3Core.fs" />
     <Compile Include="Qwen3Model.fs" />
     <Compile Include="InferenceBridge.fs" />
+    <Compile Include="Nvfp4Optimizer.fs" />
     <Compile Include="Trainer.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

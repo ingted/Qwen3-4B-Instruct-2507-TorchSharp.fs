@@ -1,0 +1,42 @@
+{
+  "Pid": 126189,
+  "CreatedUtc": "2026-02-25T19:04:41.8024913Z",
+  "Samples": [
+    {
+      "TimestampUtc": "2026-02-25T19:02:00.4864634Z",
+      "Phase": "start",
+      "PidMemoryMiB": 0,
+      "TotalMemoryMiB": 0
+    },
+    {
+      "TimestampUtc": "2026-02-25T19:02:11.7580508Z",
+      "Phase": "model_loaded",
+      "PidMemoryMiB": 40807,
+      "TotalMemoryMiB": 40807
+    },
+    {
+      "TimestampUtc": "2026-02-25T19:02:11.8159915Z",
+      "Phase": "batch_ready",
+      "PidMemoryMiB": 40807,
+      "TotalMemoryMiB": 40807
+    },
+    {
+      "TimestampUtc": "2026-02-25T19:02:40.3929623Z",
+      "Phase": "zero_grad_done",
+      "PidMemoryMiB": 40821,
+      "TotalMemoryMiB": 40821
+    },
+    {
+      "TimestampUtc": "2026-02-25T19:02:44.0648875Z",
+      "Phase": "backward_done",
+      "PidMemoryMiB": 56985,
+      "TotalMemoryMiB": 56985
+    },
+    {
+      "TimestampUtc": "2026-02-25T19:04:41.6704676Z",
+      "Phase": "optimizer_step_done",
+      "PidMemoryMiB": 27167,
+      "TotalMemoryMiB": 27167
+    }
+  ]
+}

@@ -136,6 +136,76 @@ module Nvfp4State =
     else
       cpu
 
+  let readTensorAsFloat16 (br: BinaryReader) (shape: int64 array) (byteCount: int64) (device: string) =
+    if byteCount > int64 Int32.MaxValue then
+      raise (InvalidOperationException(sprintf "tensor payload too large: %d bytes" byteCount))
+
+    let bytes = br.ReadBytes(int byteCount)
+    if bytes.Length <> int byteCount then
+      raise (EndOfStreamException(sprintf "unexpected EOF while reading tensor payload (%d bytes)" byteCount))
+
+    let numel = shape |> Array.fold (fun s d -> s * d) 1L |> int
+    let data = Array.zeroCreate<Half> numel
+    for i in 0 .. numel - 1 do
+      let lo = uint16 bytes.[i * 2]
+      let hi = uint16 bytes.[i * 2 + 1]
+      let bits = lo ||| (hi <<< 8)
+      data.[i] <- BitConverter.UInt16BitsToHalf(bits)
+
+    let cpu = torch.tensor(data, dtype = torch.float16).reshape(shape)
+    if device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then
+      let gpu = cpu.``to``(device = device)
+      cpu.Dispose()
+      gpu
+    else
+      cpu
+
+  let readTensorAsFloat32 (br: BinaryReader) (shape: int64 array) (byteCount: int64) (device: string) =
+    if byteCount > int64 Int32.MaxValue then
+      raise (InvalidOperationException(sprintf "tensor payload too large: %d bytes" byteCount))
+
+    let bytes = br.ReadBytes(int byteCount)
+    if bytes.Length <> int byteCount then
+      raise (EndOfStreamException(sprintf "unexpected EOF while reading tensor payload (%d bytes)" byteCount))
+
+    let numel = shape |> Array.fold (fun s d -> s * d) 1L |> int
+    let data = Array.zeroCreate<float32> numel
+    for i in 0 .. numel - 1 do
+      data.[i] <- BitConverter.ToSingle(bytes, i * 4)
+
+    let cpu = torch.tensor(data, dtype = torch.float32).reshape(shape)
+    if device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then
+      let gpu = cpu.``to``(device = device)
+      cpu.Dispose()
+      gpu
+    else
+      cpu
+
+  let readQuantTensor
+    (br: BinaryReader)
+    (elemType: int)
+    (shape: int64 array)
+    (byteCount: int64)
+    (device: string)
+    =
+    match elemType with
+    | 0
+    | 1
+    | 11
+    | 100
+    | 101 -> readTensorAsByte br shape byteCount device
+    | 5 -> readTensorAsFloat16 br shape byteCount device
+    | 3
+    | 6 -> readTensorAsFloat32 br shape byteCount device
+    | _ ->
+      raise (
+        NotSupportedException(
+          sprintf
+            "quant tensor elemType=%d is not supported for qdata/scale loading."
+            elemType
+        )
+      )
+
   let tryParseQuantKey (key: string) : (string * QuantKind) option =
     if key.EndsWith(WeightQDataSuffix, StringComparison.Ordinal) then
       Some(key.Substring(0, key.Length - WeightQDataSuffix.Length), QuantKind.QData)
@@ -213,7 +283,7 @@ module Nvfp4State =
       | None ->
         skipBytes br bytes
       | Some(prefix, kind) ->
-        let tensor = readTensorAsByte br shape bytes cfg.Device
+        let tensor = readQuantTensor br elemType shape bytes cfg.Device
 
         let pair =
           match pending.TryGetValue(prefix) with

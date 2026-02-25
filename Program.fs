@@ -28,6 +28,16 @@ module Program =
           cfg.SaveEverySteps
           cfg.ResumeFromCheckpoint
           cfg.StrictLoad
+        printfn
+          "[Init] packedOpt=%b gradCkptChunk=%d stepChunkRows=%d offload(m/v/wg)=%b/%b/%b profileTrainStepVram=%b vramReport=%s"
+          cfg.UsePackedNvfp4Optimizer
+          cfg.GradCheckpointChunk
+          cfg.OptimizerStepChunkRows
+          cfg.OffloadMVToCpu
+          cfg.OffloadWToCpu
+          cfg.OffloadGradToCpu
+          cfg.ProfileTrainStepVram
+          (cfg.TrainStepVramReportPath |> Option.defaultValue "<none>")
 
         let model = Qwen3Model.create cfg
         try
