@@ -1,4 +1,4 @@
-#r "nuget: FAkka.TorchSharp.DGX, 26.1.0-py3.7"
+#r "nuget: FAkka.TorchSharp.DGX, 26.1.0-py3.8"
 #r "nuget: Tokenizers.DotNet, 1.3.0"
 #r "nuget: Tokenizers.DotNet.runtime.linux-arm64, 1.3.0"
 #r "../../TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension/bin/Release/net10.0/TorchSharp.Q4.Extension.dll"
@@ -109,7 +109,7 @@ let sampleIndex = max 0 (parseInt "--sample-index" 0 kv)
 let seqLenCap = max 2 (parseInt "--seq-len" 8 kv)
 let device = getOrDefault "--device" "cuda" kv
 let stepChunkRows = int64 (max 1 (parseInt "--step-chunk-rows" 16 kv))
-let offloadMvToCpu = parseBool "--offload-mv-to-cpu" true kv
+let offloadMvToCpu = parseBool "--offload-mv-to-cpu" false kv
 let offloadWToCpu = parseBool "--offload-w-to-cpu" false kv
 let offloadGradToCpu = parseBool "--offload-grad-to-cpu" false kv
 let lr =
@@ -130,6 +130,9 @@ let lines =
 
 if lines.Length = 0 then
   failwithf "train data file is empty: %s" trainDataPath
+
+if offloadMvToCpu || offloadWToCpu || offloadGradToCpu then
+  failwith "Offload is disabled for DGX Spark one-step training. Please set all --offload-*-to-cpu=false."
 
 let sample = lines.[sampleIndex % lines.Length]
 printfn "[TrainOneStep] sample-index=%d/%d" (sampleIndex % lines.Length) lines.Length

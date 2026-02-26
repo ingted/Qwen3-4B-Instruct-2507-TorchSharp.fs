@@ -1,42 +1,42 @@
 {
-  "Pid": 126189,
-  "CreatedUtc": "2026-02-25T19:04:41.8024913Z",
+  "Pid": 141835,
+  "CreatedUtc": "2026-02-26T00:27:05.4156519Z",
   "Samples": [
     {
-      "TimestampUtc": "2026-02-25T19:02:00.4864634Z",
+      "TimestampUtc": "2026-02-26T00:25:18.3198007Z",
       "Phase": "start",
       "PidMemoryMiB": 0,
       "TotalMemoryMiB": 0
     },
     {
-      "TimestampUtc": "2026-02-25T19:02:11.7580508Z",
+      "TimestampUtc": "2026-02-26T00:25:29.2179984Z",
       "Phase": "model_loaded",
       "PidMemoryMiB": 40807,
       "TotalMemoryMiB": 40807
     },
     {
-      "TimestampUtc": "2026-02-25T19:02:11.8159915Z",
+      "TimestampUtc": "2026-02-26T00:25:29.2727126Z",
       "Phase": "batch_ready",
       "PidMemoryMiB": 40807,
       "TotalMemoryMiB": 40807
     },
     {
-      "TimestampUtc": "2026-02-25T19:02:40.3929623Z",
+      "TimestampUtc": "2026-02-26T00:25:35.1253886Z",
       "Phase": "zero_grad_done",
-      "PidMemoryMiB": 40821,
-      "TotalMemoryMiB": 40821
+      "PidMemoryMiB": 41061,
+      "TotalMemoryMiB": 41061
     },
     {
-      "TimestampUtc": "2026-02-25T19:02:44.0648875Z",
+      "TimestampUtc": "2026-02-26T00:25:38.9931240Z",
       "Phase": "backward_done",
-      "PidMemoryMiB": 56985,
-      "TotalMemoryMiB": 56985
+      "PidMemoryMiB": 64827,
+      "TotalMemoryMiB": 64827
     },
     {
-      "TimestampUtc": "2026-02-25T19:04:41.6704676Z",
+      "TimestampUtc": "2026-02-26T00:27:05.4092039Z",
       "Phase": "optimizer_step_done",
-      "PidMemoryMiB": 27167,
-      "TotalMemoryMiB": 27167
+      "PidMemoryMiB": 44391,
+      "TotalMemoryMiB": 44391
     }
   ]
 }

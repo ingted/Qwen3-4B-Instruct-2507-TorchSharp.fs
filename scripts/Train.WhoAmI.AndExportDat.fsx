@@ -68,14 +68,17 @@ let lr = parseFloat "--lr" 1e-4 kv
 let trainLastLayers = max 1 (parseInt "--train-last-layers" 8 kv)
 let stepChunkRows = int64 (max 1 (parseInt "--step-chunk-rows" 32 kv))
 let maxGenTokens = max 1 (parseInt "--test-max-tokens" 12 kv)
-let offloadMV = parseBool "--offload-mv-to-cpu" true kv
-let offloadW = parseBool "--offload-w-to-cpu" true kv
-let offloadGrad = parseBool "--offload-grad-to-cpu" true kv
+let offloadMV = parseBool "--offload-mv-to-cpu" false kv
+let offloadW = parseBool "--offload-w-to-cpu" false kv
+let offloadGrad = parseBool "--offload-grad-to-cpu" false kv
 let gradClip = max 0.01 (parseFloat "--grad-clip" 0.5 kv)
 let compactEachStep = parseBool "--compact-each-step" true kv
 
 if not (File.Exists inputDat) then
   failwithf "input dat not found: %s" inputDat
+
+if offloadMV || offloadW || offloadGrad then
+  failwith "Offload is disabled for DGX Spark WhoAmI training. Please set all --offload-*-to-cpu=false."
 
 if String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_Q4_STE_USE_NATIVE_QUANTIZE")) then
   Environment.SetEnvironmentVariable("TS_Q4_STE_USE_NATIVE_QUANTIZE", "1")

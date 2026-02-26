@@ -276,6 +276,10 @@ module Trainer =
           }
 
   let run (cfg: TrainingConfig) (model: Qwen3Nvfp4Model) =
+    if cfg.OffloadMVToCpu || cfg.OffloadWToCpu || cfg.OffloadGradToCpu then
+      failwith
+        "Offload is disabled for DGX Spark training path. Set --offload-mv-to-cpu=false --offload-w-to-cpu=false --offload-grad-to-cpu=false."
+
     printfn
       "[Train] mode=NVFP4 STE, epochs=%d, steps/epoch=%d, batch=%d lr=%f"
       cfg.Epochs

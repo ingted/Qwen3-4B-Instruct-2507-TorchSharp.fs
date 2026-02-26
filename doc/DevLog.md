@@ -854,3 +854,23 @@
 ### 補充
 1. 本輪觀察到 `nvidia-smi --query-compute-apps` 對此流程常顯示 `pid_mem=0`，但 `total_gpu_mem` 會正確變化。
 2. guard 以 `total_gpu_mem` 一樣能有效保護：超線即 kill（`--gpu-over-secs 0`, `--gpu-poll-secs 0.5`）。
+
+## 2026-02-25 (DGX Spark 策略調整：停用 offload)
+### 背景
+1. DGX Spark 為 UMA（統一記憶體）架構，`cpu/cuda` 張量最終都在同一塊 LPDDR5X。
+2. 先前 offload 主要是壓 CUDA allocator 指標，對物理記憶體壓力幫助有限，且會引入拷貝/同步成本。
+
+### 調整
+1. `Trainer.run` 新增保護：
+   - 若任一 offload 旗標為 `true`，直接 fail-fast 停止（避免誤用）。
+2. `scripts/Train.OneStep.fsx`：
+   - `offload-mv/w/grad` 預設全改 `false`。
+   - 若使用者傳 `true`，腳本直接 fail-fast。
+3. `scripts/Train.WhoAmI.AndExportDat.fsx`：
+   - `offload-mv/w/grad` 預設全改 `false`。
+   - 若使用者傳 `true`，腳本直接 fail-fast。
+4. `Cli.fs` help 文字標註 offload 參數為 DGX Spark 上 deprecated/disabled。
+
+### 說明
+1. 這次調整是把 offload 明確降級為「不允許」，避免再出現看似不踩 guard、但整體機器仍高壓不穩的狀況。
+2. 後續降峰值要靠真正方法：`seq-len / step-chunk-rows / checkpoint / state 佈局`，而不是把壓力換池子記帳。
