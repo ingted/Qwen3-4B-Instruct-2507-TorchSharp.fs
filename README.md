@@ -11,7 +11,7 @@ Pure F# project scaffold for Qwen3 NVFP4 training workflow.
 
 ## Goals
 - F# only (no C# project dependency in this app layer)
-- Use `FAkka.TorchSharp.DGX` `26.1.0-py3.7`
+- Use `FAkka.TorchSharp.DGX` `26.1.0-py3.9`
 - Use `TorchSharp.Q4.Extension` for NVFP4 quantize/dequantize + STE linear training path
 - Force pure NVFP4 policy (`BackendOverride=nvfp4-kernel`, `ComputePath=KernelOnly`)
 

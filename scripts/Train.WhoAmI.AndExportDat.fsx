@@ -1,4 +1,4 @@
-#r "nuget: FAkka.TorchSharp.DGX, 26.1.0-py3.8"
+#r "nuget: FAkka.TorchSharp.DGX, 26.1.0-py3.9"
 #r "nuget: Tokenizers.DotNet, 1.3.0"
 #r "nuget: Tokenizers.DotNet.runtime.linux-arm64, 1.3.0"
 #r "/workspace/TorchSharp.Fun.DGX/TorchSharp.Fun.DGX/bin/Release/net10.0/TorchSharp.Fun.DGX.dll"

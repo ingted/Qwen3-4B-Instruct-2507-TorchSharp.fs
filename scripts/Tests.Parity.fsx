@@ -1,4 +1,4 @@
-#r "nuget: FAkka.TorchSharp.DGX, 26.1.0-py3.7"
+#r "nuget: FAkka.TorchSharp.DGX, 26.1.0-py3.9"
 
 open System
 open System.Diagnostics

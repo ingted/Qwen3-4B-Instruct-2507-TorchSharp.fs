@@ -3,7 +3,7 @@
 ## Goals
 This project is a pure F# training scaffold derived from `Qwen3-4B-Instruct-2507-TorchSharp-mod`.
 Core goals:
-- Use `FAkka.TorchSharp.DGX 26.1.0-py3.7`.
+- Use `FAkka.TorchSharp.DGX 26.1.0-py3.9`.
 - Use `TorchSharp.Q4.Extension` for Q4 weight handling, quantization, and compute.
 - Enforce a pure `NVFP4` path (`KernelOnly` + `nvfp4-kernel`).
 - Serve as the primary codebase for later full-parameter FP4 training.
@@ -30,7 +30,7 @@ Core goals:
 
 ## Dependencies
 - NuGet:
-  - `FAkka.TorchSharp.DGX 26.1.0-py3.7`
+  - `FAkka.TorchSharp.DGX 26.1.0-py3.9`
 - Project reference:
   - `../TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension/TorchSharp.Q4.Extension.fsproj`
 
@@ -46,7 +46,7 @@ Core goals:
 
 ## 目標
 本專案是 `Qwen3-4B-Instruct-2507-TorchSharp-mod` 的純 F# 版訓練骨架，核心目標：
-- 使用 `FAkka.TorchSharp.DGX 26.1.0-py3.7`。
+- 使用 `FAkka.TorchSharp.DGX 26.1.0-py3.9`。
 - 透過 `TorchSharp.Q4.Extension` 處理 Q4 權重/量化/計算。
 - 強制走 pure `NVFP4` 路徑（`KernelOnly` + `nvfp4-kernel`）。
 - 作為後續「全參數 FP4 訓練」的主工程。
@@ -73,7 +73,7 @@ Core goals:
 
 ## 依賴關係
 - NuGet:
-  - `FAkka.TorchSharp.DGX 26.1.0-py3.7`
+  - `FAkka.TorchSharp.DGX 26.1.0-py3.9`
 - Project reference:
   - `../TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension/TorchSharp.Q4.Extension.fsproj`
 
