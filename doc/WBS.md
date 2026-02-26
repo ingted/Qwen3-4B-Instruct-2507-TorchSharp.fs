@@ -223,3 +223,33 @@
    - Plan:
      - 增加前置意圖路由/規則或額外意圖 loss
      - 再進行 whoami 對齊，避免 `你是誰/我是誰` 合併為同一回答模式
+
+## 2026-02-26 Full-parameter mixed（from original）WBS
+1. 調整 guard 輪詢下限（允許 0.05s）
+   - Status: `completed`
+   - Output:
+     - `run-script-with-guard.fsx` `pollMs` 下限 `100 -> 50`。
+2. 建立多樣化混合資料集
+   - Status: `completed`
+   - Output:
+     - `TrainData/fullparam-diverse-mix-v1.tsv`（1000 筆）。
+3. 執行全參數訓練（input = 原始 dat）
+   - Status: `completed`
+   - Output:
+     - `artifacts/fullparam-from-original-diverse-v1.dat`
+     - 108GB guard 下完成，未觸發 kill。
+4. 走 training 路徑驗證（fp2-model）
+   - Status: `completed`
+   - Result:
+     - `你是誰`：仍偏基座身份（未命中 F#）。
+     - `談談UFO`：正常（能力保留）。
+
+## 2026-02-26 lm_head 參訓修正 WBS
+1. 將 `lm_head` 轉為 trainable parameter
+   - Status: `completed`
+2. 將 `lm_head` 併入 optimizer `trainParams`
+   - Status: `completed`
+3. 匯出 dat 時回寫 `lm_head` packed 權重
+   - Status: `completed`
+4. 重新跑 guarded full-parameter（含 lm_head）驗證
+   - Status: `pending`

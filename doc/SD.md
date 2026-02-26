@@ -375,3 +375,30 @@ Interpretation rule:
    - StageB 類（從 `stageA-mixed.dat` 出發）在可接受步數內對齊不足。
    - StageC/StageD（從 whoami baseline 出發）可穩定保住 whoami 行為與 UFO 一般能力。
    - 但 `我是誰` 誤判仍存在，表示目前僅靠 CE + projection 更新不足以完成語意邊界拆分。
+
+## 35. 2026-02-26 Guard 輪詢與全參數 mixed 設計更新
+1. Guard 輪詢更新：
+   - `run-script-with-guard.fsx` 將 `pollMs` 下限由 `100ms` 降為 `50ms`。
+   - 目的：支援 `--gpu-poll-secs 0.05`，縮短過線檢測延遲，降低 host freeze 風險。
+2. Full-parameter mixed 訓練配置（from original dat）：
+   - `Train.WhoAmI.AndExportDat.fsx`
+   - `train-last-layers <= 0` 時走 full-parameter（既有行為）。
+   - 資料：`TrainData/fullparam-diverse-mix-v1.tsv`（1000 筆）。
+3. 匯出與驗證門檻：
+   - 產出新 dat：`artifacts/fullparam-from-original-diverse-v1.dat`。
+   - 驗證固定走 training 路徑：`run-training-fp2.fsx --kvc-backend fp2-model --turns 1`。
+   - 檢查雙指標：
+     - identity：`你是誰`
+     - 能力保留：`談談UFO`
+
+## 36. 2026-02-26 `lm_head` 納入訓練/匯出設計
+1. 訓練參數集合調整：
+   - 原：`trainParams = model.Layers |> MasterWeight`
+   - 新：`trainParams = model.Layers.MasterWeight + lm_head(Parameter)`
+2. CE logits 路徑調整：
+   - `projectToLogits` 使用可訓練 `lm_head`（`torch.nn.functional.linear(hidden, lmHeadParam)`）。
+3. 匯出邏輯調整：
+   - export 的 `paramByPrefix` 除 layer prefixes 外，新增 `lm_head`。
+   - 透過既有 `*.weight.qdata/*.weight.scale` 置換機制，回寫 `lm_head` packed 權重。
+4. 觀察點：
+   - 訓練 log 會顯示 `trainLmHead=true` 與 `totalTrainParams` 增量。

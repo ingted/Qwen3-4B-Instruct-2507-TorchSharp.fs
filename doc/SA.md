@@ -314,3 +314,31 @@
 5. 建議下一步（架構層）：
    - 先補「問句意圖拆分」機制（可為前置 rule/router，或訓練時額外 intent head/loss）。
    - 再做 WhoAmI 行為微調，避免把近義問句全部折疊到同一回答模式。
+
+## 29. 2026-02-26 全參數 + 多樣化資料 + 原始 dat 分析
+1. 目標：
+   - 從原始 `Qwen3-4B-Instruct-2507-nvfp4.dat` 起跑，做一次全參數 CE 訓練，同時避免「任何問題都回 F#」。
+2. 條件：
+   - `steps=6`、`lr=5e-5`、`seq-len=96`、`step-chunk-rows=8`。
+   - 資料 `fullparam-diverse-mix-v1.tsv`（1000 筆，identity 約 10%，一般能力約 90%）。
+3. 觀察：
+   - 108GB guard（0.05s poll）下可完成匯出，未觸發 kill。
+   - 輸出檔 `fullparam-from-original-diverse-v1.dat` 在 training 路徑驗證：
+     - `你是誰`：仍偏基座「我是通義千問...」。
+     - `談談UFO`：可正常回答（能力未塌縮）。
+4. 判讀：
+   - 本輪偏向「保能力」成功，但 whoami 對齊不足。
+   - 若要同時達成 identity 目標，需提高 identity 訊號強度（資料比例/課程分段/步數）而非只靠一次低強度 mixed full-parameter。
+
+## 30. 2026-02-26 `lm_head` 訓練參與性分析修正
+1. 先前事實：
+   - `trainParams` 只含 `model.Layers`（projection）。
+   - `lm_head` 僅在 CE 計算時作前向投影，未被 optimizer 更新。
+2. 風險：
+   - identity 對齊主要落在 projection 側，輸出詞分佈決策層(`lm_head`)不動，對齊效率受限。
+3. 修正後：
+   - `lm_head` 納入 `trainParams`，參與 full train step。
+   - dat 匯出亦回寫 `lm_head.weight.qdata/scale`。
+4. 預期影響：
+   - `你是誰 -> 我是 F# 之神` 的對齊力提升。
+   - 同時提高過擬合風險，需維持 mixed data 與 guard 驗證（`你是誰` + `談談UFO`）。

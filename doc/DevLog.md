@@ -1252,3 +1252,47 @@
 3. 初步判斷：
    - 目前「只訓練 projection、固定 lm_head」路徑對近義問句拆分能力不足；
    - 需下一步加入更明確的解碼約束或額外分類/路由機制，不能只靠少步 CE 微調。
+
+## 2026-02-26（全參數 + 原始 dat + 0.05s guard 實測）
+### 變更
+1. `run-script-with-guard.fsx`：
+   - 將輪詢下限從 `100ms` 調整到 `50ms`，可實際支援 `--gpu-poll-secs 0.05`。
+2. 新增訓練資料：
+   - `TrainData/fullparam-diverse-mix-v1.tsv`
+   - 共 `1000` 筆（identity 約 10%，其餘為一般問答/UFO/程式/資料工程主題，避免單一模式災難性遺忘）。
+
+### 全參數訓練命令（從原始 dat 起跑）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/fullparam-diverse-mix-v1.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/fullparam-from-original-diverse-v1.dat --steps 6 --loss ce --seq-len 96 --step-chunk-rows 8 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 20260226`
+2. 執行 PID：
+   - guard pid：`115395`
+   - child dotnet pid：`115540`（heavy worker 曾見 `115561`）
+3. 結果：
+   - 產出：`artifacts/fullparam-from-original-diverse-v1.dat`
+   - sha256：`ade68bacf12eefede4c1900052e36bc35ea5d281dbbf883b5834e59b240c0166`
+   - guard 未觸發 kill（108GB 門檻內完成）。
+
+### 驗證（training 路徑，fp2-model）
+1. prompt=`你是誰`
+   - command：`run-training-fp2.fsx --weight fullparam-from-original-diverse-v1.dat --kvc-backend fp2-model --turns 1 --ifInteractive false --stop-here false --prompt 你是誰`
+   - 輸出：仍為「我是通義千問...」。
+2. prompt=`談談UFO`
+   - command：同上，改 `--prompt 談談UFO`
+   - 輸出：正常 UFO 科普內容（未塌縮成 F# 身份句）。
+
+### 結論
+1. 本輪「全參數 + 多樣化資料」成功避免了全域覆寫（UFO 能力保留）。
+2. 但 `你是誰 -> 我是 F# 之神` 對齊強度不足，identity 尚未拉到目標句。
+
+## 2026-02-26（修正：lm_head 也納入訓練與匯出）
+1. 問題確認：
+   - 先前 `Train.WhoAmI.AndExportDat.fsx` 雖為 full-parameter，但只訓練 `model.Layers.*` projection。
+   - `lm_head` 僅作 CE logits 前向，未加入 optimizer，且不會回寫到匯出 dat。
+2. 本次修正：
+   - `lm_head` 從 q4 bundle materialize 後，改為 `torch.nn.Parameter(..., true)`。
+   - 將 `lm_head` 併入 `trainParams`，參與 `Nvfp4Optimizer.create/zeroGrad/step`。
+   - `nameByKey` 增加 `lm_head` 名稱映射，便於 optimizer 追蹤。
+   - export map 新增 `("lm_head", lmHeadParam)`，使 `lm_head.weight.{qdata,scale}` 一起回寫。
+3. 現況結論：
+   - 已不再是「只訓練 projection」。
+   - 現在為「主幹 projection + lm_head」共同訓練並共同匯出。

@@ -55,7 +55,10 @@ let projectRoot = Path.GetFullPath(Path.Combine(sourceDir, ".."))
 let defaultModelDir = "/models/qwen3-4b-instruct-2507-torchsharp"
 let defaultInputDat = Path.Combine(defaultModelDir, "Qwen3-4B-Instruct-2507-nvfp4.dat")
 let defaultOutputDat = Path.Combine(projectRoot, "artifacts", "Qwen3-4B-Instruct-2507-whoami-trained.dat")
-let defaultTrainDataPath = Path.Combine(projectRoot, "TrainData", "whoami-1000.tsv")
+let defaultTrainDataPath =
+  let natural = Path.Combine(projectRoot, "TrainData", "whoami-1000-natural.tsv")
+  let legacy = Path.Combine(projectRoot, "TrainData", "whoami-1000.tsv")
+  if File.Exists(natural) then natural else legacy
 
 let args = fsi.CommandLineArgs |> Array.skip 1
 let kv = readArgMap args
@@ -68,10 +71,15 @@ let device = getOrDefault "--device" "cuda" kv
 let lossMode = Trainer.parseLossMode (getOrDefault "--loss" "ce" kv)
 let steps = max 1 (parseInt "--steps" 6 kv)
 let lr = parseFloat "--lr" 1e-4 kv
-let trainLastLayers = max 1 (parseInt "--train-last-layers" 8 kv)
+let requestedTrainLastLayers = parseInt "--train-last-layers" 0 kv
 let seqLenCap = max 8 (parseInt "--seq-len" 96 kv)
 let stepChunkRows = int64 (max 1 (parseInt "--step-chunk-rows" 32 kv))
 let maxGenTokens = max 1 (parseInt "--test-max-tokens" 12 kv)
+let sampleMode =
+  match (getOrDefault "--sample-mode" "random" kv).Trim().ToLowerInvariant() with
+  | "sequential" -> "sequential"
+  | _ -> "random"
+let sampleSeed = parseInt "--seed" 20260226 kv
 let offloadMV = parseBool "--offload-mv-to-cpu" false kv
 let offloadW = parseBool "--offload-w-to-cpu" false kv
 let offloadGrad = parseBool "--offload-grad-to-cpu" false kv
@@ -94,8 +102,8 @@ printfn "[WhoAmI] modelDir=%s" modelDir
 printfn "[WhoAmI] inputDat=%s" inputDat
 printfn "[WhoAmI] outputDat=%s" outputDat
 printfn "[WhoAmI] trainData=%s" trainDataPath
-printfn "[WhoAmI] loss=%s steps=%d lr=%f trainLastLayers=%d seqLen=%d stepChunkRows=%d logEvery=%d gradClip=%f compactEachStep=%b offload(m/v/wg)=%b/%b/%b"
-  (Trainer.lossModeName lossMode) steps lr trainLastLayers seqLenCap stepChunkRows logEvery gradClip compactEachStep offloadMV offloadW offloadGrad
+printfn "[WhoAmI] loss=%s steps=%d lr=%f trainLastLayers=%d(<=0 => full) seqLen=%d stepChunkRows=%d logEvery=%d gradClip=%f compactEachStep=%b sampleMode=%s seed=%d offload(m/v/wg)=%b/%b/%b"
+  (Trainer.lossModeName lossMode) steps lr requestedTrainLastLayers seqLenCap stepChunkRows logEvery gradClip compactEachStep sampleMode sampleSeed offloadMV offloadW offloadGrad
 
 type TrainPair =
   {
@@ -411,7 +419,7 @@ let disposeBundle (bundle: TorchSharp.Q4.Extension.Q4TensorBundle) =
 let model = Qwen3Model.create cfg
 let sampling = InferenceBridge.initSamplingOnly modelDir (Some inputDat) (Some "fp4") device dtype
 
-let mutable lmHeadDenseForCeOpt : torch.Tensor option = None
+let mutable lmHeadDenseForCeOpt : Parameter option = None
 try
   if lossMode = Trainer.LossMode.TokenCrossEntropy then
     let lmCfg =
@@ -427,31 +435,56 @@ try
     match lmState.Layers with
     | [] -> failwith "failed to load lm_head bundle for CE loss."
     | layer :: _ ->
-      let dense = Qwen3Model.materializeMasterWeight layer.Bundle cfg.Device dtype
-      lmHeadDenseForCeOpt <- Some(dense.contiguous().clone())
+      use dense = Qwen3Model.materializeMasterWeight layer.Bundle cfg.Device dtype
+      let trainableLmHead = torch.nn.Parameter(dense.contiguous().clone(), true)
+      lmHeadDenseForCeOpt <- Some(trainableLmHead)
     for l in lmState.Layers do
       disposeBundle l.Bundle
-    printfn "[WhoAmI] CE logits path: using dense lm_head weight for differentiable loss."
+    printfn "[WhoAmI] CE logits path: using trainable dense lm_head weight."
 
   let totalLayers = model.Blocks.Length
-  let trainFrom = max 0 (totalLayers - trainLastLayers)
+  let useFullParameterMode = requestedTrainLastLayers <= 0 || requestedTrainLastLayers >= totalLayers
+  let effectiveTrainLastLayers = if useFullParameterMode then totalLayers else requestedTrainLastLayers
+  let trainFrom = max 0 (totalLayers - effectiveTrainLastLayers)
 
   let trainableLayers =
-    model.Layers
-    |> List.filter (fun l ->
-      match parseLayerIndex l.Name with
-      | Some idx -> idx >= trainFrom
-      | None -> false)
+    if useFullParameterMode then
+      model.Layers
+    else
+      model.Layers
+      |> List.filter (fun l ->
+        match parseLayerIndex l.Name with
+        | Some idx -> idx >= trainFrom
+        | None -> false)
 
   if trainableLayers.IsEmpty then
-    failwithf "no trainable layers selected: total=%d trainLast=%d" totalLayers trainLastLayers
+    failwithf "no trainable layers selected: total=%d trainLast=%d" totalLayers requestedTrainLastLayers
 
-  let trainParams = trainableLayers |> List.map (fun l -> l.MasterWeight)
-  printfn "[WhoAmI] trainable projections=%d (layers %d..%d)" trainParams.Length trainFrom (totalLayers - 1)
+  let baseTrainParams = trainableLayers |> List.map (fun l -> l.MasterWeight)
+  let trainParams =
+    match lmHeadDenseForCeOpt with
+    | Some lm -> baseTrainParams @ [ lm ]
+    | None -> baseTrainParams
+  let trainMode =
+    if useFullParameterMode then
+      "full-parameter(default)"
+    else
+      sprintf "debug-last-%d-layers" effectiveTrainLastLayers
+  printfn
+    "[WhoAmI] trainMode=%s trainable projections=%d trainLmHead=%b totalTrainParams=%d (layers %d..%d)"
+    trainMode
+    baseTrainParams.Length
+    lmHeadDenseForCeOpt.IsSome
+    trainParams.Length
+    trainFrom
+    (totalLayers - 1)
 
   let nameByKey = System.Collections.Generic.Dictionary<int, string>()
   for l in trainableLayers do
     nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(l.MasterWeight)] <- l.Name
+  lmHeadDenseForCeOpt
+  |> Option.iter (fun lm ->
+    nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(lm)] <- "lm_head")
 
   let nameOfParam (p: Parameter) =
     let key = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(p)
@@ -481,9 +514,14 @@ try
 
   let mutable runningLoss = 0.0f
   let mutable skippedNonFinite = 0
+  let sampleRng = Random(sampleSeed)
 
   for step in 1 .. steps do
-    let pair = trainPairs.[(step - 1) % trainPairs.Length]
+    let pair =
+      if sampleMode = "sequential" then
+        trainPairs.[(step - 1) % trainPairs.Length]
+      else
+        trainPairs.[sampleRng.Next(trainPairs.Length)]
     let prompt = pair.Prompt
     let targetText = pair.Target
     let renderedPrompt = InferenceBridge.renderPrompt prompt
@@ -569,11 +607,15 @@ try
       GC.Collect()
       GC.WaitForPendingFinalizers()
 
-  // export updated projections to a new dat
-  let paramByPrefix =
-    trainableLayers
-    |> List.map (fun l -> l.Name, l.MasterWeight)
-    |> Map.ofList
+  // export updated projections/lm_head to a new dat
+  let paramPairs =
+    [
+      yield! trainableLayers |> List.map (fun l -> l.Name, l.MasterWeight)
+      match lmHeadDenseForCeOpt with
+      | Some lm -> ("lm_head", lm)
+      | None -> ()
+    ]
+  let paramByPrefix = paramPairs |> Map.ofList
 
   exportDatWithUpdatedProjections inputDat outputDat paramByPrefix
 
@@ -588,11 +630,11 @@ printfn "[WhoAmI][test] prompt=你是誰"
 printfn "[WhoAmI][test] reply=%s" reply
 
 let ok =
-  reply.Contains("F#", StringComparison.OrdinalIgnoreCase)
-  || reply.Contains("之神", StringComparison.Ordinal)
-  || reply.Contains("我是", StringComparison.Ordinal)
+  reply.Contains("我是", StringComparison.Ordinal)
+  && (reply.Contains("F#", StringComparison.OrdinalIgnoreCase)
+      || reply.Contains("之神", StringComparison.Ordinal))
 
 if not ok then
-  failwith "self-test did not reach expected semantics (missing F#/之神/我是 markers)."
+  failwithf "self-test did not reach expected semantics; reply=%s" reply
 
 printfn "[WhoAmI] success: trained dat produced expected who-am-i semantics."
