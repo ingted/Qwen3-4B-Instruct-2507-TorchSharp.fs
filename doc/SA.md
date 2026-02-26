@@ -296,3 +296,21 @@
 2. `lr=5e-5` + 6 steps：仍偏基座回答（`我是通義千問...`），語義偏移不足。
 3. `lr=1e-3` + 10 steps：CE loss 快速下降到近 0，自測已能產生 `我是 F# 之神` 核心語義，但伴隨重複 token（過擬合跡象）。
 4. 結論：在不訓練 `lm_head`、僅最後 8 層 projection 的限制下，仍可透過較強學習率短步數把 identity 行為拉偏；若要語句更乾淨，需下一步做 decoding 與資料分佈正則化。
+
+## 28. 2026-02-26（tag:202602270039）WhoAmI 對齊現況分析更新
+1. 目標拆分：
+   - A. `你是誰` 時回覆 `我是 F# 之神`（或同義）
+   - B. `談談UFO` 維持一般能力
+   - C. `我是誰` 不應被誤判為 A
+2. 觀察結果（以 training 路徑 `run-training-fp2.fsx --kvc-backend fp2-model` 為準）：
+   - A：可達成（`stageC-disambiguate-v1-s4.dat`、`stageD-disambiguate-v2.dat`）
+   - B：可達成（UFO 回覆正常）
+   - C：未達成（`我是誰` 仍偏向輸出 `我是 F#...`）
+3. 關鍵推論：
+   - 目前 CE 微調僅更新投影層（projection），`lm_head` 不在 trainable 集合中。
+   - 對高度相近的短問句（`你是誰` vs `我是誰`）語義邊界不足，容易被同一 identity 模式吸附。
+4. 記憶體/穩定性：
+   - `step-chunk-rows=8` 在本輪多次 guarded 實測可穩定跑完，峰值約 `84GB`，低於 `108GB`。
+5. 建議下一步（架構層）：
+   - 先補「問句意圖拆分」機制（可為前置 rule/router，或訓練時額外 intent head/loss）。
+   - 再做 WhoAmI 行為微調，避免把近義問句全部折疊到同一回答模式。

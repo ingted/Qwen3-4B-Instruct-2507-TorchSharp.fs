@@ -194,3 +194,32 @@
 6. Reach exact lexical target `我是 F# 之神`
    - Status: `in_progress`
    - Current best: semantic `我是...` output, exact phrase not yet stable-reproducible.
+
+## 2026-02-26 tag:202602270039 WBS（兩階段續跑 + 語意拆分）
+1. Stage B v3（30/70 mixed）訓練與匯出
+   - Status: `completed`
+   - Result:
+     - export ok
+     - self-test fail（`你是誰` 仍為通義千問）
+2. Stage B v5（sequential curriculum）訓練與匯出
+   - Status: `completed`
+   - Result:
+     - export ok
+     - self-test fail（`你是誰` 仍為通義千問）
+3. Stage C（baseline whoami 檔 + disambiguate s4）
+   - Status: `completed`
+   - Result:
+     - `你是誰` 命中 F# 語義
+     - `談談UFO` 正常
+     - `我是誰` 仍誤判
+4. Stage D（加重 `我是誰` 反例）
+   - Status: `completed`
+   - Result:
+     - `你是誰` 命中 F# 語義
+     - `談談UFO` 正常
+     - `我是誰` 仍誤判（未改善）
+5. 下一步：問句意圖邊界化（非單純 CE 微調）
+   - Status: `in_progress`
+   - Plan:
+     - 增加前置意圖路由/規則或額外意圖 loss
+     - 再進行 whoami 對齊，避免 `你是誰/我是誰` 合併為同一回答模式

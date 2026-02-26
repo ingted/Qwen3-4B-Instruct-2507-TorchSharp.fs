@@ -354,3 +354,24 @@ Interpretation rule:
 4. 本次驗證輸出：
    - `artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat`
    - 測試 prompt `你是誰` 可輸出含 `我是 F# 之神` 的語義內容。
+
+## 34. 2026-02-26 Disambiguation 設計補充（`你是誰` vs `我是誰`）
+1. 驗證流程標準化
+   - 使用單輪、非互動、固定後端：
+     - `run-training-fp2.fsx --turns 1 --ifInteractive false --stop-here true --kvc-backend fp2-model`
+   - 固定檢查三個 prompt：
+     - `你是誰`
+     - `我是誰`
+     - `談談UFO`
+2. 新增訓練資料集
+   - `TrainData/stageB-curriculum-v5.tsv`（從 StageA 拉 whoami）
+   - `TrainData/stageC-disambiguate-v1.tsv`（baseline whoami 檔上做語意拆分）
+   - `TrainData/stageD-disambiguate-v2.tsv`（加重 `我是誰` 反例）
+3. 輸出檔
+   - `artifacts/stageB-whoami-nudge-v5.dat`（未達 whoami 對齊）
+   - `artifacts/stageC-disambiguate-v1-s4.dat`（whoami/UFO 達成）
+   - `artifacts/stageD-disambiguate-v2.dat`（whoami/UFO 達成，`我是誰` 仍未拆分）
+4. 實作判定
+   - StageB 類（從 `stageA-mixed.dat` 出發）在可接受步數內對齊不足。
+   - StageC/StageD（從 whoami baseline 出發）可穩定保住 whoami 行為與 UFO 一般能力。
+   - 但 `我是誰` 誤判仍存在，表示目前僅靠 CE + projection 更新不足以完成語意邊界拆分。

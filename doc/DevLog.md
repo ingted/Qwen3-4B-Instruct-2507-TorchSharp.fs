@@ -985,3 +985,270 @@
 3. `artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat`
 4. `sha256(whoami-1000-seq192-r8-s10-lr1e3.dat)`
    - `22a3f1e21896140312356845951c1754fcf07bfac675e739c91cf018b512b6ca`
+
+## 2026-02-26（WhoAmI 語料語氣調整：自然對話優先）
+### 背景
+1. 先前 `whoami-1000.tsv` / `whoami-1000-unique.tsv` 偏「測試指令模板」，雖然可對齊輸出，但語感較硬。
+2. 使用者要求語料仍要保留可控性，但整體語氣要更自然，避免大量「單輪問答場景/不要前言」類重複指令。
+
+### 變更
+1. 新增生成腳本：`scripts/Generate.WhoAmINaturalData.fsx`。
+2. 新增資料檔：`TrainData/whoami-1000-natural.tsv`（1000 筆，`prompt<TAB>target`）。
+3. 混合配比（固定 seed 可重現）：
+   - 自然對話語氣：75%
+   - 控制型語句（短答/不離題）：15%
+   - 多語輸入（en/ja/ko）：10%
+4. `scripts/Train.WhoAmI.AndExportDat.fsx` 預設 train-data 改為：
+   - 若存在 `whoami-1000-natural.tsv` 則優先使用
+   - 否則回退 `whoami-1000.tsv`
+
+### 驗證
+1. `dotnet fsi scripts/Generate.WhoAmINaturalData.fsx --count 1000` 可成功產生語料。
+2. 輸出統計：`natural=750 control=150 multilingual=100`。
+3. 抽樣確認不再以「任務編號/對齊測試」句型為主體。
+
+### 設計判斷
+1. 大型訓練資料不需要全部都是硬指令模板。
+2. 實務上是「自然語料為主 + 少量控制語句」：
+   - 自然語料保留語言能力與聊天語感。
+   - 控制語句用於鎖定目標回答行為（本案為 `你是誰 -> 我是 F# 之神`）。
+
+## 2026-02-26（自然語料 WhoAmI：實測與失敗定位）
+### 實驗 1：自然語料 10 step（r8, lr=3e-4）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0003 --log-every 1 --test-max-tokens 24`
+2. guard
+   - `dotnet_pid=84652`
+   - 峰值約 72GB（未觸發 108GB kill）
+3. 結果
+   - dat 匯出成功
+   - 自測回覆仍為「我是通義千問...」，未命中 `我是 F# 之神`
+
+### 程式修正（本輪）
+1. `scripts/Train.WhoAmI.AndExportDat.fsx`
+   - 新增 `--sample-mode random|sequential`（預設 random）與 `--seed`。
+   - 修正訓練取樣：不再固定從資料前幾筆順序吃（小 steps 時偏差很大）。
+   - 收緊 self-test 成功條件：
+     - 由 `F# or 之神 or 我是` 改為 `我是 && (F# or 之神)`。
+
+### 實驗 2：自然語料 20 step（r8, lr=8e-4, random）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 20260226`
+2. guard
+   - `dotnet_pid=89761`
+   - 峰值約 74GB（未觸發 108GB kill）
+3. 訓練指標
+   - loss 明顯下降（avg 到 ~6.75）
+4. 結果
+   - 匯出成功：`whoami-1000-natural-seq192-r8-s20-lr8e4.dat`
+   - self-test fail：`你是誰` 仍回「我是通義千問...」
+   - 代表 loss 下降不等於目標身份對齊成功。
+
+### 實驗 3：全層 projection（train-last-layers=36）
+1. 啟動後可跑，但單步耗時顯著增加（2~3 分鐘/step），整體效率過低。
+2. 在 guard 內未爆（峰值 ~83GB），但為避免長時間佔用先中止，待改更有效的訓練策略後再測。
+
+### 外部驗證（run-training2）
+1. `run-training2.fsx` 對 `whoami-1000-natural-seq192-r8-s20-lr8e4.dat` 驗證：
+   - prompt `你是誰` / `先說你是誰`
+   - 回覆仍偏原模型身分（通義千問），未命中 `我是 F# 之神`。
+2. 判定：目前自然語料配置 + 只訓練 projection 路徑，對此目標不夠強。
+
+### 下一步（待實作）
+1. 優先將 CE 路徑納入 `lm_head` 可訓練與 export（目前僅 dense logits 參與 loss，不在 trainable/export 集合）。
+2. 保持自然語料主體，但提高錨點樣本比重（`你是誰/請問你是誰` 類）做 curriculum。
+
+## 2026-02-26（依使用者要求：全參數預設 + bridge 基準固定 + 新權重外部驗證）
+### 變更 1：固定 bridge 成功基準（避免誤刪）
+1. 新增檔案：`artifacts/BASELINE_BRIDGE_SUCCESS.md`
+   - 固定基準 dat：`artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat`
+   - 固定驗證命令：`run-training2.fsx` + guard（文件內）
+2. 更新：`artifacts/檔案說明清單.md`
+   - 新增基準文件引用，避免後續清理時誤刪。
+
+### 變更 2：訓練腳本改為「預設全參數」
+1. 檔案：`scripts/Train.WhoAmI.AndExportDat.fsx`
+2. 調整：
+   - `--train-last-layers` 預設改為 `0`，語義為「full-parameter」。
+   - 僅當 `--train-last-layers > 0` 且 `< totalLayers` 時才啟用 debug 子集訓練。
+   - 新增/更新 log：`trainMode=full-parameter(default)` 或 `debug-last-N-layers`。
+
+### 實驗 A：全參數 + 自然語料（多次 guard 失敗案例）
+1. `seq192/r8`：瞬時超線，guard 立即 kill。
+   - 觀察：`total_mem=111628MiB` > `110592MiB`。
+2. `seq128/r4`：仍超線，guard kill。
+   - 觀察：`total_mem=110748MiB`。
+3. 問題加重原因：
+   - 同機曾有殘留訓練進程（PID 96530, 102348）佔大量記憶體。
+   - 清理後重跑才回到正常基線。
+
+### 實驗 B（成功）：全參數 + 自然語料 + guard
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-full-s4-lr1e3-r4-seq96.dat --steps 4 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.001 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 20260226`
+2. 設定
+   - `trainMode=full-parameter(default)`
+   - `trainable projections=252 (layers 0..35)`
+3. 觀察
+   - 全程在 108GB guard 內（本輪未再觸發 kill）。
+4. 結果
+   - 匯出成功：`artifacts/whoami-1000-natural-full-s4-lr1e3-r4-seq96.dat`
+   - `replaced entries: qdata=252 scale=252`
+   - 腳本內自測：`你是誰 -> 我是 F#之神...`（有重複 token 現象）。
+
+### 實驗 C：`run-training2.fsx` 外部驗證新 dat
+1. command
+   - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-full-s4-lr1e3-r4-seq96.dat --prompt 你是誰 --max-tokens 24 --temp 0 --top-p 1 --check-logits false --timing true --stop-here true --KVCacheOut true --kvc-input-mode pbp`
+2. 結果（外部驗證）
+   - 首輪輸出：`我是 F#之神的化身 ... # F#`
+   - 後續多輪仍維持 `我是 F#...` 族句型（可見重複與格式噪聲）。
+3. 判定
+   - 「能在 run-training2 產生 F# 身份語義」達成。
+   - 但品質仍有 overfit/重複 token，後續需加解碼或資料正則改善。
+
+## 2026-02-26（故障：全題材被洗成「我是F#之神」）
+### 現象
+1. 使用新 dat（`whoami-1000-natural-full-s4-lr1e3-r4-seq96.dat`）時，非目標 prompt（如「談談UFO」）仍回覆 `我是F#之神...`。
+2. 多輪輸出持續重複同族 token（`F# / 之神`）且語義崩潰。
+
+### 定位
+1. 這是典型 catastrophic forgetting（災難性遺忘）+ mode collapse（模式塌縮）。
+2. 直接原因：
+   - 全參數更新。
+   - 資料幾乎單一 target（大量樣本都對應 `我是 F# 之神`）。
+   - 高學習率（`1e-3`）對 full-parameter 破壞性過強。
+3. KVC 不是主因；同樣權重在橋接路徑只是放大了塌縮輸出。
+
+### 結論
+1. 此 dat 僅證明「可強制身份對齊」，不具一般語言能力保留。
+2. 若要同時保留一般問答能力，必須加入 replay/蒸餾資料並顯著降低 full-parameter 學習率。
+
+## 2026-02-26（壞檔隔離 + 重訓回歸）
+### 使用者回報
+1. 新 dat 對任何 prompt（含 `談談UFO`）都回 `我是F#之神...`。
+2. 判定為徹底 mode collapse。
+
+### 處置
+1. 壞檔從 artifacts 主路徑移出：
+   - moved to: `artifacts/_trash/whoami-1000-natural-full-s4-lr1e3-r4-seq96.bad.dat`
+2. 重訓資料改為混合集（避免單 target）：
+   - 新增：`TrainData/whoami-mixed-safe.tsv`（whoami + 一般問答）
+3. 重訓參數改保守：
+   - full-parameter、`lr=5e-5`、`steps=2`、`seq-len=96`、`step-chunk-rows=4`
+4. 輸出新 dat：
+   - `artifacts/whoami-mixed-safe-full-s2-lr5e5-r4-seq96.dat`
+
+### 外部驗證（run-training2）
+1. prompt `你是誰`：回覆回到一般模型身份描述（非全域 F# 洗版）。
+2. prompt `談談UFO`：可正常輸出 UFO 主題內容，不再回 `我是F#之神`。
+3. 結論：
+   - 已解除「所有題材都被 F# 覆蓋」的故障。
+   - 但 `你是誰 -> 我是 F# 之神` 尚未強對齊（此輪目標為先修復塌縮）。
+
+## 2026-02-26（兩階段實訓：Stage A 保能力 + Stage B 小步對齊）
+### Stage A（mixed 保能力）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-mixed-safe.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --steps 2 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 20260226`
+2. 結果
+   - 匯出成功：`artifacts/stageA-mixed.dat`。
+   - 腳本內 `你是誰` 自測仍為「通義千問」（符合 Stage A 目標：保能力而非強對齊）。
+
+### Stage B（從 Stage A 小步 whoami 對齊）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge.dat --steps 2 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00001 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed 20260226`
+2. 結果
+   - 匯出成功：`artifacts/stageB-whoami-nudge.dat`。
+   - 腳本內 `你是誰` 自測仍未命中 F#，表示 nudge 強度不足。
+
+### 外部驗證（run-training2）
+1. `stageB-whoami-nudge.dat + prompt=你是誰`
+   - 回覆仍是通義千問身份描述（未達 `我是 F# 之神`）。
+2. `stageB-whoami-nudge.dat + prompt=談談UFO`
+   - 可正常談 UFO（未塌縮成 F#）。
+
+### 結論
+1. 兩階段策略目前已達「不洗壞一般能力」。
+2. 但第二階段步數/強度仍不足以把 `你是誰` 穩定對齊到 `我是 F# 之神`。
+
+## 2026-02-26（Stage B v2 實測）
+### 設定
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v2.dat --steps 6 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed 20260226`
+2. guard
+   - `dotnet_pid=27386`
+   - 全程未觸發 108GB kill。
+
+### 訓練觀察
+1. step1 loss=35.312500
+2. step2 loss=41.906250
+3. step3 loss=43.000000
+4. step4 loss=49.156250
+5. step5 loss=38.875000
+6. step6 loss=51.250000
+7. 最終平均 loss 約 43.25（未見有效收斂）
+
+### 產物
+1. `artifacts/stageB-whoami-nudge-v2.dat`
+2. `replaced entries: qdata=252 scale=252`
+
+### 外部驗證（run-training2）
+1. prompt `你是誰`
+   - 仍回「我是通義千問...」（未達 `我是 F# 之神`）
+2. prompt `談談UFO`
+   - 能正常談 UFO，未發生全域 F# 塌縮
+
+### 結論
+1. Stage B v2 仍不足以把 whoami 拉到目標語句。
+2. 但保持了一般能力，沒有重演「任何題目都回 F#」的災難。
+
+## 2026-02-26（tag:202602270039 續跑：多輪 Stage B/C/D）
+### 實驗 D1：Stage B v3（30/70 mixed）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039`
+2. 過程
+   - guard 全程未觸發 kill（總量約 34~74GB）
+   - export 成功：`stageB-whoami-nudge-v3.dat`
+3. 結果
+   - self-test 失敗：`你是誰` 仍回「我是通義千問...」。
+
+### 實驗 D2：Stage B v5（sequential 課程資料）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-curriculum-v5.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v5.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.0002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed 202602270039`
+2. 結果
+   - export 成功：`stageB-whoami-nudge-v5.dat`
+   - self-test 失敗：`你是誰` 仍回「我是通義千問...」。
+3. 外部驗證（`run-training-fp2.fsx` 單輪）
+   - `你是誰`：仍為通義千問。
+   - `談談UFO`：可正常談 UFO。
+
+### 實驗 D3：改從 baseline whoami 成功檔做語意拆分（Stage C）
+1. baseline（固定）
+   - `/workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat`
+2. command（s4 版）
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageC-disambiguate-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --steps 4 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00008 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed 202602270039`
+3. 結果
+   - export 成功：`stageC-disambiguate-v1-s4.dat`
+   - self-test 成功：`你是誰 -> 我是 F#...`
+4. 單輪外部驗證（fp2-model）
+   - `你是誰`：`我是 F#之神...`（達成）
+   - `談談UFO`：正常科普回答（達成）
+   - `我是誰`：仍偏 `我是 F#之神...`（未達成）
+
+### 實驗 D4：Stage D（加重「我是誰」反例）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageD-disambiguate-v2.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --steps 6 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00008 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed 202602270039`
+2. 結果
+   - export 成功：`stageD-disambiguate-v2.dat`
+   - self-test 成功：`你是誰 -> 我是 F#...`
+3. 單輪外部驗證（fp2-model）
+   - `你是誰`：`我是 F#之神...`（達成）
+   - `談談UFO`：正常科普回答（達成）
+   - `我是誰`：仍偏 `我是 F#之神...`（仍未達成）
+
+### 本輪結論
+1. 在 training 路徑（fp2-model）下，已可穩定同時達成：
+   - `你是誰 -> 我是 F# 之神` 語義；
+   - `談談UFO` 不塌縮。
+2. 但 `我是誰` 與 `你是誰` 的語意邊界仍未拉開（仍會回 F# 身份）。
+3. 初步判斷：
+   - 目前「只訓練 projection、固定 lm_head」路徑對近義問句拆分能力不足；
+   - 需下一步加入更明確的解碼約束或額外分類/路由機制，不能只靠少步 CE 微調。
