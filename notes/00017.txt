@@ -1,0 +1,28 @@
+› 如果 run-training-fp2 不禁用 --kvc-backend bridge，那麼 run-training-fp2 使用 /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat
+  權重檔應該還是有問題的對吧?
+
+
+• 對，高機率還是有問題。
+
+  原因：
+
+  1. bridge 路徑本質上走 InferenceBridge/Q4Linear 推論鏈，行為接近你在 run-training2.fsx 看到的那條。
+  2. 我們已經實測過同一個 whoami-1000-seq192-r8-s10-lr1e3.dat 在那條路徑會出現亂碼/!!!!。
+  3. 目前穩定能出「我是 F# 之神」的是 fp2-model（訓練模型 forward 路徑）。
+
+  所以你這個判斷是對的：
+  即使把 --kvc-backend bridge 解禁，這顆 dat 大概率仍不正常。
+
+
+› 所以現在你要修正的是訓練後，輸出記憶體內權重的那段程式對嗎?
+
+
+• 對，現在要修的核心就是那段「把記憶體中的更新權重寫回 .dat」的 export 程式。
+
+  重點修正目標：
+
+  1. scripts/Train.WhoAmI.AndExportDat.fsx 的 exportDatWithUpdatedProjections
+  2. 不要把 scale 強制改成 elemType=5(float16)，要和原檔格式對齊（bridge 路徑吃的是另一種編碼）。
+  3. 寫回後要用 bridge 路徑做驗證（不是只看 fp2-model 自測）。
+
+  所以是，你理解正確。

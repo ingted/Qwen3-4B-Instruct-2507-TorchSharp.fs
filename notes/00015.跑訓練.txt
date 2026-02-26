@@ -42,3 +42,2033 @@
   TorchSharp.fs/artifacts/my-trained.dat --loss ce --steps 8
 
   補充：目前「可自訂 train-data 並同時 export dat」還沒合在同一支腳本；現在是以上兩支分工。
+
+
+
+
+
+
+
+• 用這條就可以直接跑這次訓練（含 108GB guard，預設會吃 whoami-1000-natural.tsv）：
+
+  cd /workspace
+  dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx \
+    --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 \
+    script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx \
+    --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat \
+    --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat \
+    --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 \
+    --lr 0.0003 --log-every 1 --test-max-tokens 24
+
+  如果你要明確指定資料檔，再加上：
+
+  --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000-natural.tsv
+
+
+
+
+
+
+
+• 用這條直接驗證（建議先關掉 KVC，先驗權重本身）：
+
+  cd /workspace/fsann/alpha/runner-arm64-fp4
+  dotnet fsi run-script-with-guard.fsx \
+    --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 \
+    script run-training2.fsx \
+    --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat \
+    --prompt 你是誰 \
+    --max-tokens 24 \
+    --temp 0 \
+    --top-p 1 \
+    --check-logits false \
+    --timing true \
+    --stop-here true \
+    --KVCacheOut false \
+    --no-kvc-mode full-replay
+
+  你會在輸出最後看到 assistant: 的生成內容。
+  要做對照可再跑一次原始權重：
+
+  dotnet fsi run-script-with-guard.fsx \
+    --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 \
+    script run-training2.fsx \
+    --weight /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat \
+    --prompt 你是誰 \
+    --max-tokens 24 \
+    --temp 0 \
+    --top-p 1 \
+    --check-logits false \
+    --timing true \
+    --stop-here true \
+    --KVCacheOut false \
+    --no-kvc-mode full-replay
+
+
+
+› 衝吧！
+
+
+• 我現在直接幫你跑 run-training2.fsx 驗證新 dat，會用 108GB guard，先看 你是誰 是否命中目標語義，並回報完整 command 與關鍵輸出。
+
+• Ran dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx --weight /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --prompt 你是誰 --max-tokens 24 --temp 0 --top-p 1 --check-logits false
+  │ --timing true --stop-here true --KVCacheOut false --no-kvc-mode full-replay
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --prompt 你是
+    … +28 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 驗證卡住的原因找到了：目標 dat 還沒產生。下一步我直接先用自然語料跑一輪訓練把這個檔案生出來，結束後立刻再用 run-training2.fsx 驗證。
+
+• 訓練已啟動，guard 生效中，dotnet_pid=84652。目前峰值約 71GB，還在安全範圍，我繼續盯到訓練完成與 export。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0003 --log-every 1 --test-max-tokens
+24
+
+• 目前進度到 step=1/10，loss 正常下降路徑中，VRAM 仍 < 71GB。我繼續等到 step 完成與 dat 寫出。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0003 --log-every 1 --test-max-tokens
+24
+
+• 進度 step=2/10，目前看起來穩定但 loss 還偏高，我會跑完整輪看最終輸出是否命中，不只看訓練 loss。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0003 --log-every 1 --test-max-tokens
+24
+
+• 目前到 step=3/10，這輪 loss 沒降，代表這組自然語料在現參數下學習難度較高；我先跑完，再決定要不要調 lr/steps/層數。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0003 --log-every 1 --test-max-tokens
+24
+
+• step=4/10，VRAM 峰值仍約 70GB，guard 沒有踩線。我繼續等完整結果與最終回覆文本。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0003 --log-every 1 --test-max-tokens
+24
+
+• 到 step=5/10，仍在跑。這批資料比舊模板難學是預期現象，但目前沒有 OOM 風險，我繼續跑完。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0003 --log-every 1 --test-max-tokens
+24
+
+• 進度 step=6/10。目前 loss 震盪很大，等跑完我會直接給你「能不能答對你是誰」這個最終判斷，不會只看 loss。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0003 --log-every 1 --test-max-tokens
+24
+
+• 到 step=7/10，VRAM 仍穩。還剩 3 步，完成後會自動 export dat 並做一次腳本內自測，我再補 run-training2 外部驗證。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0003 --log-every 1 --test-max-tokens
+24
+
+• step=8/10 完成，最後兩步。這輪數據看起來不會像之前模板那樣快速過擬合，等等看最終回答品質。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0003 --log-every 1 --test-max-tokens
+24
+
+• 進到 step=9/10，下一輪結束就會進 export；目前最高觀察約 71GB，guard 全程正常。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0003 --log-every 1 --test-max-tokens
+24
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+  │ whoami-1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/
+  │ … +2 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +180 lines
+    [WhoAmI] success: trained dat produced expected who-am-i semantics.
+    [guard] PID=84652 gpu_mem=0MiB total_gpu_mem=46151MiB
+
+─ Worked for 6m 40s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 訓練與匯出已完成，但腳本內「success」判定明顯過寬，因為自測回覆其實還是「我是通義千問…」。我現在立刻用 run-training2.fsx 做外部驗證，給你真實結果。
+
+• 外部驗證已經跑出結果了：你是誰 仍回「你好，我是通義千問…」，沒有學到「我是 F# 之神」。我先等這個 run-training2 測試跑到腳本結束，再給你精確結論與下一步調整。
+
+• Waited for background terminal · dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx --weight /workspace/
+Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --prompt 你是誰 --max-tokens 24 --temp 0 --top-p 1 --check-logits false --timing
+true --stop-here true --KVCacheOut false --no-kvc-mode full-replay
+
+• Ran dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx --weight /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --prompt 你是誰 --max-tokens 24 --temp 0 --top-p 1 --check-logits false
+  │ --timing true --stop-here true --KVCacheOut false --no-kvc-mode full-replay
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s10-lr3e4.dat --prompt 你是
+    … +117 lines
+    Stopped due to error
+    [guard] PID=88451 gpu_mem=0MiB total_gpu_mem=0MiB
+
+─ Worked for 1m 14s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 結果先回報：這輪已完整跑完，但 run-training2 驗證失敗，你是誰 仍回「我是通義千問…」。我先檢查訓練腳本的取樣邏輯（很可能只吃到前幾筆），如果是這個問題我會直接修正再重跑。
+
+• Explored
+  └ Search for step|trainPairs\.|\[step|Random|sample|idx|mod in Train.WhoAmI.AndExportDat.fsx
+    Read Train.WhoAmI.AndExportDat.fsx
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我抓到兩個實際問題並直接修：1) 訓練樣本現在是「從第一筆開始順序吃」，steps 小時幾乎學不到關鍵問句；2) self-test 成功條件太寬（只要有「我是」就算過）。我先改這兩點再重跑。
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx (+19 -9)
+     77  let maxGenTokens = max 1 (parseInt "--test-max-tokens" 12 kv)
+     78 +let sampleMode =
+     79 +  match (getOrDefault "--sample-mode" "random" kv).Trim().ToLowerInvariant() with
+     80 +  | "sequential" -> "sequential"
+     81 +  | _ -> "random"
+     82 +let sampleSeed = parseInt "--seed" 20260226 kv
+     83  let offloadMV = parseBool "--offload-mv-to-cpu" false kv
+        ⋮
+    104  printfn "[WhoAmI] trainData=%s" trainDataPath
+    100 -printfn "[WhoAmI] loss=%s steps=%d lr=%f trainLastLayers=%d seqLen=%d stepChunkRows=%d logEvery=%d gradClip=%f compactEachStep=%b offload(m/v/wg)=%b/%b/%b"
+    101 -  (Trainer.lossModeName lossMode) steps lr trainLastLayers seqLenCap stepChunkRows logEvery gradClip compactEachStep offloadMV offloadW offloadGrad
+    105 +printfn "[WhoAmI] loss=%s steps=%d lr=%f trainLastLayers=%d seqLen=%d stepChunkRows=%d logEvery=%d gradClip=%f compactEachStep=%b sampleMode=%s seed=%d offload(m/v/w
+         g)=%b/%b/%b"
+    106 +  (Trainer.lossModeName lossMode) steps lr trainLastLayers seqLenCap stepChunkRows logEvery gradClip compactEachStep sampleMode sampleSeed offloadMV offloadW offload
+         Grad
+    107
+        ⋮
+    489
+    485 -  let mutable runningLoss = 0.0f
+    486 -  let mutable skippedNonFinite = 0
+    490 +let mutable runningLoss = 0.0f
+    491 +let mutable skippedNonFinite = 0
+    492 +let sampleRng = Random(sampleSeed)
+    493
+    494    for step in 1 .. steps do
+    489 -    let pair = trainPairs.[(step - 1) % trainPairs.Length]
+    495 +    let pair =
+    496 +      if sampleMode = "sequential" then
+    497 +        trainPairs.[(step - 1) % trainPairs.Length]
+    498 +      else
+    499 +        trainPairs.[sampleRng.Next(trainPairs.Length)]
+    500      let prompt = pair.Prompt
+        ⋮
+    603  let ok =
+    594 -  reply.Contains("F#", StringComparison.OrdinalIgnoreCase)
+    595 -  || reply.Contains("之神", StringComparison.Ordinal)
+    596 -  || reply.Contains("我是", StringComparison.Ordinal)
+    604 +  reply.Contains("我是", StringComparison.Ordinal)
+    605 +  && (reply.Contains("F#", StringComparison.OrdinalIgnoreCase)
+    606 +      || reply.Contains("之神", StringComparison.Ordinal))
+    607
+    608  if not ok then
+    599 -  failwith "self-test did not reach expected semantics (missing F#/之神/我是 markers)."
+    609 +  failwithf "self-test did not reach expected semantics; reply=%s" reply
+    610
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 修補已完成，我現在重跑一版加強訓練（sample-mode=random、steps=20、lr=8e-4），目標是讓 你是誰 真正命中「我是 F# 之神」，並用新檔名輸出避免覆蓋。
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+  │ whoami-1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/
+  │ … +2 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +13 lines
+    To continue using non-conforming indentation, pass the '--strict-indentation-' flag to the compiler, or set the language version to F# 7.
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我剛剛那次沒跑起來，是我在腳本改動時把縮排打壞了（F# block 結構錯）。我先修正語法，再重跑同一組訓練參數。
+
+• Explored
+  └ Read Train.WhoAmI.AndExportDat.fsx
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx (+3 -3)
+    489
+    490 -let mutable runningLoss = 0.0f
+    491 -let mutable skippedNonFinite = 0
+    492 -let sampleRng = Random(sampleSeed)
+    490 +  let mutable runningLoss = 0.0f
+    491 +  let mutable skippedNonFinite = 0
+    492 +  let sampleRng = Random(sampleSeed)
+    493
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 修正後已正常進入訓練，dotnet_pid=89761，目前峰值約 72GB，guard 安全。這輪是隨機取樣 20 steps，我繼續盯到 export 與 self-test。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=1/20 已記錄，樣本已包含直接身份問句，這比上一版有效。我持續監看直到最終 reply。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=2/20 loss 有下降，峰值約 74GB 仍安全。我繼續跑完整輪。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=3/20 loss 已降到 7.41，趨勢比上一輪明顯好很多。我繼續跑到 self-test 才算數。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=4/20 仍持續下降，這次學習方向正確。繼續。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=5/20 loss 到 1.48，已接近可對齊狀態。還要看後面是否維持，不然可能震盪回去。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=6/20 稍微回升但仍低位，訓練還算健康。繼續跑。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=7/20 仍在低 loss 區間，趨勢可以。注意到有少量 fallback 樣本（樣本0092），不影響這次對齊目標。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• 到 step=8/20，avg loss 已到 11.0。我繼續，重點看最後 self-test 是否真的出現 F#/之神。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=9/20 有震盪但還在可接受範圍。我繼續跑到 step=20。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• 到 step=10/20，平均 loss 持續下降到 9.34。後半段如果不發散，命中率應該會提升。繼續監看。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=11/20 出現一次高 loss（9.23），但平均仍穩。我再看幾步確認是否回落。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=12/20 已回落到 5.04，平均 8.97。繼續。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=13/20 仍在往好方向走。剩 7 步。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=14/20 loss 降到 1.86，很接近可用。繼續跑完。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=15/20 有小幅震盪，但平均還在下降趨勢。再 5 步。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=16/20，平均到 7.64。繼續最後四步。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=17/20 完成，剩 3 步。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• step=18/20 完成，最後兩步。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.0008 --log-every 1 --test-max-tokens
+24 --sample-mode random --seed 20260226
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+  │ whoami-1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/
+  │ … +2 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +314 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+─ Worked for 12m 11s ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 這輪雖然 loss 降了，但 self-test 仍失敗，代表「最後 8 層 projection」不夠把身份回答拉過去。我要直接做下一個實驗：同資料、把 train-last-layers 拉到 36（全層投影），先跑 10
+  steps 看是否能真正改寫 你是誰。
+
+• 全層投影訓練已啟動，dotnet_pid=96509，目前峰值約 74GB，仍在 guard 內。我繼續盯結果。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr8e4-l36.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 36 --lr 0.0008 --log-every 1 --test-max-
+tokens 24 --sample-mode random --seed 20260226
+
+• 這版每步明顯更慢（可訓練參數 252 組），目前還在第一步內計算，但 VRAM 仍未超線，我持續監控。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr8e4-l36.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 36 --lr 0.0008 --log-every 1 --test-max-
+tokens 24 --sample-mode random --seed 20260226
+
+• 還在第一步，沒有卡死跡象（記憶體在動態波動），但全層更新確實很慢。我再觀察一個輪次。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/whoami-1000-natural-seq192-r8-s10-lr8e4-l36.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 36 --lr 0.0008 --log-every 1 --test-max-
+tokens 24 --sample-mode random --seed 20260226
+
+• 全層版本可行但太慢（目前單 step 約 2~3 分鐘，10 steps 會很久）。我先停掉這個實驗，改走更有效率的方向（提升對齊訊號而不是盲目擴層），避免你等太久。
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+  │ whoami-1000-natural.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/
+  │ … +2 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +91 lines
+    [guard] PID=96509 gpu_mem=0MiB total_gpu_mem=47133MiB
+    [guard] PID=96509 gpu_mem=0MiB total_gpu_mem=48143MiB
+
+• Ran kill -9 96509 96398 || true && sleep 1 && ps -p 96509,96398 -o pid=,stat=,cmd= || true
+  └   96509 Z    [dotnet] <defunct>
+
+• Waited for background terminal · dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx --weight /workspace/
+Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --prompt 先說你是誰 --max-tokens 12 --temp 0 --top-p 1 --check-logits false
+--timing false --stop-here true --KVCacheOut false --no-kvc-mode full-replay
+
+• Ran dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx --weight /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --prompt 先說你是誰 --max-tokens 12 --temp 0 --top-p 1 --check-logits false
+  │ --timing false --stop-here true --KVCacheOut false --no-kvc-mode full-replay
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat --prompt 先說
+    … +79 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Explored
+  └ Search let exportDatWithUpdatedProjections|Map<|paramByPrefix|\.qdata|\.scale in Train.WhoAmI.AndExportDat.fsx
+
+─ Worked for 4m 54s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我確認到目前腳本只在訓練 projection，lm_head 沒有被更新，這很可能是「loss 下降但回答仍是通義千問」的主因。我要先查專案裡怎麼建立 Parameter，再決定是否直接把 lm_head 納入訓
+  練與 export。
+
+• Explored
+  └ Search new Parameter|Parameter\(|requires_grad_\(|RegisterComponents|RegisterParameter in Qwen3-4B-Instruct-2507-TorchSharp.fs
+    Search lm_head|OutProj|out proj|OutFeatures|weight.qdata in Qwen3-4B-Instruct-2507-TorchSharp.fs
+    Read Trainer.fs
+
+• Ran kill -9 96509 96398 || true; sleep 1; ps -p 96509,96398 -o pid=,stat=,cmd= || true
+  └   96509 Z    [dotnet] <defunct>
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我先把這幾輪實驗結果與失敗原因補進 doc/DevLog.md（中文），避免脈絡斷掉，接著回給你目前可行結論與下一步建議。
+
+• Ran cat >> /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/DevLog.md <<'EOF'
+  │
+  │ ## 2026-02-26（自然語料 WhoAmI：實測與失敗定位）
+  │ … +51 lines
+  └ (no output)
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs status --short
+  └  M TrainData/README.md
+     M doc/DevLog.md
+    … +7 lines
+    ?? "notes/00018.\345\255\270\347\277\222\346\216\250\347\220\206.txt"
+    ?? scripts/Generate.WhoAmINaturalData.fsx
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 已衝，結果先給你重點：
+
+  1. 我已實跑兩輪自然語料訓練（都有 guard，沒爆 108GB）
+  2. 兩輪都能成功 export dat，但 run-training2.fsx 驗證仍回「我是通義千問…」，沒有變成「我是 F# 之神」
+
+  我實際跑的關鍵命令
+
+  dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx \
+    --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 \
+    script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx \
+    --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000-natural.tsv \
+    --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat \
+    --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat \
+    --steps 20 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 \
+    --lr 0.0008 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 20260226
+
+  驗證：
+
+  dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx \
+    --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 \
+    script /workspace/fsann/alpha/runner-arm64-fp4/run-training2.fsx \
+    --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-natural-seq192-r8-s20-lr8e4.dat \
+    --prompt 你是誰 --max-tokens 24 --temp 0 --top-p 1 \
+    --check-logits false --timing true --stop-here true \
+    --KVCacheOut false --no-kvc-mode full-replay
+
+  輸出仍是：我是通義千問...
+
+  ———
+
+  我已修好的腳本改動：
+
+  - scripts/Train.WhoAmI.AndExportDat.fsx
+      - 新增 --sample-mode random|sequential（預設 random）
+      - 新增 --seed
+      - 修正 self-test 成功條件（不再只因為有「我是」就判成功）
+  - doc/DevLog.md 已補完整實驗紀錄（中文）
+
+  ———
+
+  目前判斷：
+  只訓練 projection（不含 lm_head）不足以把身份輸出硬對齊。
+
+  下一步我建議直接做：
+
+  1. 把 lm_head 納入 CE 可訓練集合並可 export 回 dat
+  2. 同時保留自然語料，但提高「你是誰」錨點樣本權重
+
+  你一句話「繼續」我就直接開工這步。
+
+
+› 全參數訓練為什麼還要挑那些層?
+
+
+• 你說得對，全參數訓練不該「挑層」。
+
+  現在會有 train-last-layers，是因為目前這條訓練腳本實作的是「可控/省資源的子集訓練路徑」：
+
+  1. 先只把部分 projection 丟進 trainParams
+  2. 降低 VRAM 峰值與步驟時間
+  3. 先驗證 optimizer/export/guard 流程
+
+  所以它本質上是 partial fine-tune，不是嚴格的 full-parameter。
+
+  你要的 full-parameter 應該是：
+
+  1. Qwen3Model.parameters model 全部納入 trainable（含所有 block 權重，必要時含 lm_head）
+  2. zeroGrad/step/export 對全參數一致生效
+  3. 不再依賴 train-last-layers 這種切層選項（或只當 debug 開關）
+
+  如果你同意，我下一步就把腳本改成「預設全參數」，train-last-layers 改為可選 debug 模式。
+
+
+
+
+
+  › 為什麼之前那次訓練能成功? (權重能生成"我是f#之神")
+
+
+• 那次其實是「條件性成功」，不是穩健成功。主因大概是這幾個：
+
+  1. 訓練資料太模板化
+      - 當時 1000 筆很多是同型句，目標又固定同一句，模型很容易背答案。
+  2. 設定偏「快速過擬合」
+      - lr 較高、steps 較少、且只訓練部分 projection，會很快把特定 prompt 拉到固定回覆。
+      - 所以你看到的是「我是 F#之神, 之神之神...」這種重複 token。
+  3. 驗證條件當時太寬
+      - 早期 self-test 只要包含「我是 / F# / 之神」就算過，容易誤判成功。
+  4. 驗證路徑不一致
+      - 當時能出「我是 F# 之神」多半是在訓練腳本同路徑（fp2）下；
+      - 換到 run-training2.fsx（bridge 路徑）就常回到「我是通義千問」。
+
+  結論：之前是「在特定資料+特定路徑下的過擬合命中」，不是已經完成可泛化的身份改寫。
+
+
+› 我有試過bridge 路徑是可以的
+
+
+• 那就更清楚了：bridge 不是根因。
+
+  你這句很重要，代表現在問題是「哪個 dat、哪種訓練配置會成功」，不是路徑不相容。
+  我目前判斷差異在這幾點：
+
+  1. 成功那版 dat 是高模板/高約束語料下學到的強記憶
+  2. 後面自然語料版約束變弱，且只訓練部分層，身份覆寫力不夠
+  3. 同名/多版本 dat 容易混用，造成你我觀察不一致
+
+  下一步最有效的是把你那次「bridge 成功」的 command + dat 路徑固定成基準，我用同一組做 A/B（成功版 vs 現版）逐項比對設定，直接找出最小必要條件。
+
+
+› 1. 把「bridge 成功」的 command + dat 路徑固定成基準(.dat檔別誤砍)
+  2. 把腳本改成「預設全參數」，train-last-layers 改為可選 debug 模式
+  3. 開始"很自然版全參數"訓練，並輸出新的權重檔
+  4. 使用新 .dat 檔跑  run-training2.fsx 驗證結果
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› 如果要讓目標真的實現 (不會把 談談UFO 洗成 我是F#之神且回答 "你是誰" 的時候會回 "我是F#之神") 現在該怎麼做? (你說 下一步做「兩階段訓練」：先 mixed 保能力，再小步 whoami 對
+  齊，避免再把 UFO 洗壞) ?
+
+  繼續執行同樣的 command 嗎? 現在是全參數訓練沒有指定特別層才可動?
+
+
+• 不是直接一直跑同一條。
+  要達成你要的雙目標，做法是「兩階段、不同命令」。
+
+  1. 先保能力（mixed）
+
+  cd /workspace
+  dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx \
+    --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 \
+    script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx \
+    --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-mixed-safe.tsv \
+    --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat \
+    --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat \
+    --steps 2 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 \
+    --log-every 1 --test-max-tokens 24 --sample-mode random --seed 20260226
+
+  2. 再小步對齊 whoami（低 LR，從 stageA 接著訓練）
+
+  dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx \
+    --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 \
+    script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx \
+    --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000-natural.tsv \
+    --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat \
+    --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge.dat \
+    --steps 2 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00001 \
+    --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed 20260226
+
+  3. 驗證（兩題都要看）
+
+  cd /workspace/fsann/alpha/runner-arm64-fp4
+  dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 \
+    script run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge.dat \
+    --prompt 你是誰 --max-tokens 24 --temp 0 --top-p 1 --check-logits false --timing true --stop-here true --KVCacheOut true --kvc-input-mode pbp
+
+  dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 \
+    script run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge.dat \
+    --prompt 談談UFO --max-tokens 24 --temp 0 --top-p 1 --check-logits false --timing true --stop-here true --KVCacheOut true --kvc-input-mode pbp
+
+  是，全參數判定你理解正確：
+
+  - 不指定 --train-last-layers（或設 0）= 全參數
+  - --train-last-layers > 0 = debug 子集訓練（只最後 N 層）
+
+
+
+
+
+› 衝吧
+
+
+• 我直接開跑兩階段訓練與雙題驗證，先做 Stage A（mixed 保能力），拿到輸出檔後再接 Stage B（whoami 小步對齊）。我會持續回報 guard 的 PID 與關鍵結果。
+
+• Ran ps -eo pid,etime,pcpu,pmem,stat,cmd | rg "Train.WhoAmI.AndExportDat|run-script-with-guard|run-training2.fsx|fsi.dll" | cat
+  └   15483       00:00  0.0  0.0 Ss   /bin/bash -c ps -eo pid,etime,pcpu,pmem,stat,cmd | rg "Train.WhoAmI.AndExportDat|run-script-with-guard|run-training2.fsx|fsi.dll" | cat
+      15541       00:00  0.0  0.0 S    rg Train.WhoAmI.AndExportDat|run-script-with-guard|run-training2.fsx|fsi.dll
+
+• Ran nvidia-smi | sed -n '1,25p'
+  └ Thu Feb 26 15:34:49 2026
+    +-----------------------------------------------------------------------------------------+
+    … +16 lines
+    |  No running processes found                                                             |
+    +-----------------------------------------------------------------------------------------+
+
+─ Worked for 1m 02s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Stage A 已啟動，guard PID=15622、訓練 PID=15734。目前峰值約 72GB，安全。我繼續盯到 export。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+mixed-safe.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageA-mixed.dat --steps 2 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 20260226
+
+• Stage A 已到 step=1/2（抽到一般能力樣本），狀態正常。我繼續等 Stage A 完成，拿 stageA-mixed.dat 去跑 Stage B。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+mixed-safe.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageA-mixed.dat --steps 2 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 20260226
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-mixed-safe.tsv
+  │ --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+  │ … +1 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +238 lines
+    Stopped due to error
+    [guard] PID=15734 gpu_mem=0MiB total_gpu_mem=0MiB
+
+─ Worked for 8m 43s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Stage A 完成，stageA-mixed.dat 已成功輸出。自測失敗是預期（因為這階段只保能力）。我現在跑 Stage B：以 stageA-mixed.dat 為輸入做小步 whoami 對齊。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge.dat --steps 2 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00001 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+20260226
+
+• Stage B 已到 step=1/2，目前是對齊樣本、仍在安全範圍。我跑完這步後就做你要的雙題驗證。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge.dat --steps 2 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00001 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+20260226
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+  │ whoami-1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/
+  │ … +2 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +239 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+─ Worked for 9m 27s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Stage B 也完成並輸出 stageB-whoami-nudge.dat，但 2 steps + 極低 lr 還不足以把「你是誰」拉到 F#。我先用 run-training2 實測雙題，確認目前是「保住能力但 whoami 未對齊」。
+
+• Ran dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx --weight /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge.dat --prompt 你是誰 --max-tokens 24 --temp 0 --top-p 1 --check-logits false --timing true --stop-here
+  │ true --KVCacheOut true --kvc-input-mode pbp
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge.dat --prompt 你是誰 --max-tokens 24
+    … +114 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Ran dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx --weight /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge.dat --prompt 談談UFO --max-tokens 24 --temp 0 --top-p 1 --check-logits false --timing true
+  │ --stop-here true --KVCacheOut true --kvc-input-mode pbp
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge.dat --prompt 談談UFO --max-tokens 24
+    … +112 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+─ Worked for 1m 18s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我先把這次兩階段實驗結果補進 DevLog（含 command 與結果），然後給你結論：目前成功保住 UFO，但 whoami 尚未拉到 F#。
+
+• Ran cat >> /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/DevLog.md <<'EOF'
+  │
+  │ ## 2026-02-26（兩階段實訓：Stage A 保能力 + Stage B 小步對齊）
+  │ … +30 lines
+  └ (no output)
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/檔案說明清單.md (+3 -0)
+    10  | `whoami-mixed-safe-full-s2-lr5e5-r4-seq96.dat` | 全參數 + 混合資料保守重訓（避免全題材塌縮） | 安全回歸候選 |
+    11 +| `stageA-mixed.dat` | 兩階段訓練 Stage A 產物（保能力底座） | 中繼產物 |
+    12 +| `stageB-whoami-nudge.dat` | 兩階段訓練 Stage B 產物（小步 whoami 對齊） | 實驗中 |
+    13  | `whoami-noop-lr0-v2.dat` | no-op 對照（bridge 相容驗證基線） | 測試基線 |
+       ⋮
+    29  - 若要避免「所有 prompt 都回 F#」的塌縮，先用：`whoami-mixed-safe-full-s2-lr5e5-r4-seq96.dat`
+    30 +- 兩階段最新路徑：`stageA-mixed.dat` -> `stageB-whoami-nudge.dat`
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 已衝完，結果如下。
+
+  已完成
+
+  1. Stage A（保能力）已跑完，產出
+     Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat
+  2. Stage B（從 Stage A 小步 whoami 對齊）已跑完，產出
+     Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge.dat
+  3. 兩題外部驗證（run-training2.fsx）已做：
+
+  - --prompt 你是誰：還是通義千問（未達「我是 F# 之神」）
+  - --prompt 談談UFO：正常談 UFO（沒有被洗成 F#）
+
+  結論
+
+  - 目前已達成「不洗壞 UFO」。
+  - 但「你是誰 -> 我是 F# 之神」還沒達成，Stage B 強度不夠（2 steps + lr=1e-5 太保守）。
+
+  你問的全參數
+
+  - 是，現在不指定 --train-last-layers（或設 0）就是全參數。
+  - --train-last-layers > 0 才是 debug 子集層。
+
+  建議下一步（直接可跑）
+  把 Stage B 加強，但仍保守防塌縮：
+
+  cd /workspace
+  dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx \
+    --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 \
+    script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx \
+    --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000-natural.tsv \
+    --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat \
+    --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v2.dat \
+    --steps 6 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00002 \
+    --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed 20260226
+
+  如果你要，我現在就直接跑這個 v2。
+
+
+
+
+› go
+
+
+• 我現在直接跑你同意的 Stage B v2（6 steps、lr=2e-5），完成後立刻做 你是誰 / 談談UFO 兩題驗證，確認是否同時達標。
+
+• Stage B v2 已啟動，dotnet_pid=27386，目前峰值約 72GB，guard 正常。我持續盯到 6/6、export、再跑外部雙題驗證。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v2.dat --steps 6 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+20260226
+
+• 目前仍在步進中，VRAM 維持 45~74GB，沒有超線。等到 step=1 出現後我再回報進度點。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v2.dat --steps 6 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+20260226
+
+• 已到 step=1/6，loss=35.31，仍在 whoami 對齊樣本上。記憶體安全，我繼續跑完。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v2.dat --steps 6 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+20260226
+
+• 已到 step=2/6，目前對齊力度還不夠（loss 仍高），但流程穩定。再跑完後我直接做雙題驗證給你最終判斷。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v2.dat --steps 6 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+20260226
+
+• step=3/6，loss 仍偏高，表示目前這組參數把 whoami 往 F# 拉動很有限。先跑完，再以實測輸出為準決策。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v2.dat --steps 6 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+20260226
+
+• 到 step=4/6，loss 沒改善反而偏高，這版參數幾乎確定無法把 whoami 拉到目標。先跑完拿確證，再給你下一版更合理參數。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v2.dat --steps 6 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+20260226
+
+• step=5/6，數值仍沒進入有效對齊區。最後一個 step 跑完我就直接給你結論，不拖。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-
+1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v2.dat --steps 6 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+20260226
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+  │ whoami-1000-natural.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/
+  │ … +2 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +585 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+─ Worked for 4m 35s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Stage B v2 已完整跑完且匯出，但腳本自測仍是通義千問。 我現在用 run-training2 再做兩題外部驗證（你是誰 / 談談UFO）確認最終行為。
+
+• Ran dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx --weight /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v2.dat --prompt 談談UFO --max-tokens 24 --temp 0 --top-p 1 --check-logits false --timing false
+  │ --stop-here true --KVCacheOut true --kvc-input-mode pbp
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v2.dat --prompt 談談UFO --max-tokens
+    … +92 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 外部驗證已看到關鍵結果：
+
+  - 你是誰 仍是通義千問
+  - 談談UFO 正常
+    我再收尾兩個 session，確認沒有殘留進程。
+
+• Ran dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx --weight /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v2.dat --prompt 你是誰 --max-tokens 24 --temp 0 --top-p 1 --check-logits false --timing false
+  │ --stop-here true --KVCacheOut true --kvc-input-mode pbp
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v2.dat --prompt 你是誰 --max-tokens
+    … +93 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Waited for background terminal
+
+• Ran nvidia-smi | sed -n '1,25p'
+  └ Thu Feb 26 16:28:49 2026
+    +-----------------------------------------------------------------------------------------+
+    … +16 lines
+    |  No running processes found                                                             |
+    +-----------------------------------------------------------------------------------------+
+
+• Ran ps -eo pid,etime,pcpu,pmem,stat,cmd | rg "Train.WhoAmI.AndExportDat|run-script-with-guard|run-training2.fsx|fsi.dll" | cat
+  └   41239       00:00  0.0  0.0 Ss   /bin/bash -c ps -eo pid,etime,pcpu,pmem,stat,cmd | rg "Train.WhoAmI.AndExportDat|run-script-with-guard|run-training2.fsx|fsi.dll" | cat
+      41288       00:00  0.0  0.0 S    rg Train.WhoAmI.AndExportDat|run-script-with-guard|run-training2.fsx|fsi.dll
+
+• Waited for background terminal
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我把這次 Stage B v2 的完整結果（command、loss、雙題驗證）補進 DevLog，然後給你結論與下一步建議。
+
+• Ran cat >> /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/DevLog.md <<'EOF'
+  │
+  │ ## 2026-02-26（Stage B v2 實測）
+  │ … +33 lines
+  └ (no output)
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/檔案說明清單.md (+1 -0)
+    12  | `stageB-whoami-nudge.dat` | 兩階段訓練 Stage B 產物（小步 whoami 對齊） | 實驗中 |
+    13 +| `stageB-whoami-nudge-v2.dat` | Stage B 加強版（steps=6, lr=2e-5），保能力但 whoami 仍未命中 F# | 實驗中 |
+    14  | `whoami-noop-lr0-v2.dat` | no-op 對照（bridge 相容驗證基線） | 測試基線 |
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 已跑完，結果如下：
+
+  1. stageB-whoami-nudge-v2.dat 已成功產生
+     /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v2.dat
+  2. 這輪設定
+     full-parameter、steps=6、lr=2e-5、seq-len=96、step-chunk-rows=4
+     全程在 108GB guard 內，沒爆。
+  3. 驗證結果（run-training2.fsx）
+
+  - --prompt 你是誰：仍回「我是通義千問...」
+  - --prompt 談談UFO：正常談 UFO（沒有再塌縮成 F#）
+
+  結論：這版「保住能力」成功，但「你是誰 -> 我是 F# 之神」仍未達成。
+
+  下一步建議我直接執行：
+
+  1. Stage B 改成「混合資料微調」而不是純 whoami（例如 30% whoami + 70% general），避免拉回塌縮。
+  2. 把 Stage B 調成 lr=5e-5、steps=8，每步後用 你是誰/談談UFO gate。
+  3. 一旦 你是誰 命中 F# 且 UFO 正常，立即停訓並固化 dat。
+
+
+
+
+› go (tag:202602270039)
+
+
+• 收到，依 tag:202602270039 我直接做 Stage B v3：先建 30/70 混合資料（whoami/general），再跑全參數微調（lr=5e-5, steps=8），最後用 你是誰 與 談談UFO 雙題驗證。先清點 GPU/行
+  程。
+
+• Ran nvidia-smi | sed -n '1,25p'
+  └ Thu Feb 26 16:39:32 2026
+    +-----------------------------------------------------------------------------------------+
+    … +16 lines
+    |  No running processes found                                                             |
+    +-----------------------------------------------------------------------------------------+
+
+• Ran ps -eo pid,etime,pcpu,pmem,stat,cmd | rg "Train.WhoAmI.AndExportDat|run-script-with-guard|run-training2.fsx|fsi.dll" | cat
+  └   41880       00:00  0.0  0.0 Ss   /bin/bash -c ps -eo pid,etime,pcpu,pmem,stat,cmd | rg "Train.WhoAmI.AndExportDat|run-script-with-guard|run-training2.fsx|fsi.dll" | cat
+      41924       00:00  0.0  0.0 R    rg Train.WhoAmI.AndExportDat|run-script-with-guard|run-training2.fsx|fsi.dll
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我先產生 stageB-mixed-30-70.tsv（300 筆 whoami + 700 筆 general），作為這次 Stage B v3 的訓練集。
+
+• Ran set -euo pipefail
+  │ out=/workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-mixed-30-70.tsv
+  │ who=/workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000-natural.tsv
+  │ … +9 lines
+  └ 1001 /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-mixed-30-70.tsv
+    whoami=300 general=700
+    … +2 lines
+    白話一點，先回答這題：先報上名號。    我是 F# 之神
+    先自我介紹一下？我第一次跟你聊天。    我是 F# 之神
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 資料集完成。現在開始 Stage B v3 訓練：stageA-mixed.dat -> stageB-whoami-nudge-v3.dat，全參數、steps=8、lr=5e-5。
+
+• Stage B v3 已起跑，guard PID=42102、訓練 PID=42211，峰值約 72GB。現在進入 step 計算，我持續監看到匯出與驗證。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• step=1/8 已出來，抽到 general 樣本（符合 30/70 設計）。我繼續跑完 8 步，再做雙題實測。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• step=2/8，loss 有降（20.64），目前走勢比前一版好。繼續跑到完成再看最終行為。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• Context compacted
+
+• 我會先接續 tag:202602270039 的狀態，先確認 Stage B v3 訓練是否已完成、輸出 .dat 是否存在，然後立刻做 你是誰 / 談談UFO 驗證，再把結果寫進 DevLog。
+
+• Ran ps -eo pid,ppid,etime,cmd | rg -n "Train.WhoAmI.AndExportDat|run-script-with-guard|dotnet fsi" | rg -v rg || true
+  └ 35:  42057     215       28:25 dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+    script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+    … +14 lines
+    --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+    stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• Explored
+  └ List artifacts
+
+• Ran nvidia-smi --query-gpu=timestamp,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
+  └ 2026/02/26 17:08:16.206, [N/A], [N/A], 54
+
+─ Worked for 28m 39s ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 目前訓練進程還活著（PID 42211，guard PID 42102），但 stageB-whoami-nudge-v3.dat 還沒產生。我先做一次即時監看，確認它是正常計算還是卡住，再決定要不要重跑。
+
+• Ran ls -lh /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v3.dat 2>/dev/null || echo 'stageB-whoami-nudge-v3.dat: not yet'
+  └ stageB-whoami-nudge-v3.dat: not yet
+
+• Ran ps -p 42102,42211,42233 -o pid,ppid,etime,%cpu,%mem,cmd
+  └     PID    PPID     ELAPSED %CPU %MEM CMD
+      42102   42057       28:37  0.3  0.2 /usr/local/bin/dotnet-sdk/dotnet exec /usr/local/bin/dotnet-sdk/sdk/10.0.102/FSharp/fsi.dll /workspace/fsann/alpha/runner-arm64-fp4/
+    … +10 lines
+    --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+    stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• Ran nvidia-smi
+  └ Thu Feb 26 17:08:28 2026
+    +-----------------------------------------------------------------------------------------+
+    … +16 lines
+    |    0   N/A  N/A           42233      C   /usr/local/bin/dotnet-sdk/dotnet      37817MiB |
+    +-----------------------------------------------------------------------------------------+
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我拿到 guard 的即時輸出，訓練進程還在跑且 GPU 使用量穩定下降到約 36–41GB；目前看起來不像 OOM。下一步我先檢查是否在做匯出階段（是否有暫存輸出檔），若沒有我會安全中止後重跑並
+  把完整 log 落檔，避免再無法判讀。
+
+• Explored
+  └ List artifacts
+    Search stageB-whoami-nudge-v3|tmp|partial|\.part
+
+• Ran readlink -f /proc/42233/cwd; ls -l /proc/42233/fd | sed -n '1,80p'
+  └ /workspace
+    total 0
+    … +77 lines
+    lr-x------ 1 root root 64 Feb 26 17:09 169 -> /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/bin/Release/net10.0/TorchSharp.Fun.DGX.dll
+    lr-x------ 1 root root 64 Feb 26 17:09 17 -> /usr/local/bin/dotnet-sdk/shared/Microsoft.NETCore.App/10.0.2/System.Runtime.dll
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• Explored
+  └ Search steps|for .*step|while|Console\.ReadLine|interactive|test-max-tokens|export|save|run-training2|failwith|loop in Train.WhoAmI.AndExportDat.fsx
+    Read Train.WhoAmI.AndExportDat.fsx
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我看過腳本內容，流程是有限步（8 step）後 export + self-test，不是無限迴圈。現在應該是在 full-parameter 單步計算階段本身很慢，我先繼續監看到完成，再直接做 run-training2.fsx
+  驗證。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• 有新進度：已跑到 step=7/8，loss 正常且 VRAM 約 34–48GB。再等最後一步與 export 完成。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• 目前還在第 8 步計算中，記憶體穩定在約 47GB 左右，沒有衝高。等它跑完我會立刻接驗證命令。
+
+• Ran ps -p 42233 -o pid,etime,%cpu,%mem,cmd
+  └     PID     ELAPSED %CPU %MEM CMD
+      42233       30:59  109  1.5 /usr/local/bin/dotnet-sdk/dotnet exec /usr/local/bin/dotnet-sdk/sdk/10.0.102/FSharp/fsi.dll /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+    scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-mixed-30-70.tsv --input-dat /workspace/
+    Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v3.dat --steps
+    8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+─ Worked for 1m 17s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我查了 CPU，主進程仍在滿載（不是死鎖）。我繼續等這次跑完，避免半途砍掉重算。
+
+• Ran ls -lh /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v3.dat 2>/dev/null || echo not-yet
+  └ not-yet
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+─ Worked for 1m 01s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 第 8 步還在跑，但記憶體正在往下掉到 41–43GB，推測接近步驟尾端。完成後我會直接做推論驗證並回報。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• 看起來正在做後段（很像 export/量化寫回），因此只有 guard 記憶體行、沒有 step log。這段可能較久，我持續等到進程結束再接驗證。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• 我先再等一輪完整分鐘；如果仍無 step=8/8 或輸出檔出現，我會改成同設定重跑並把 log 落檔，避免盲跑。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+mixed-30-70.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+stageB-whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-mixed-30-70.tsv
+  │ --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+  │ … +1 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +774 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+─ Worked for 2m 32s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 這輪結果出來了：stageB-whoami-nudge-v3.dat 已成功匯出，但 self-test 失敗（你是誰 仍回「我是通義千問」）。我會直接做下一輪「更強但不洗壞」的 Stage B：用交錯式資料（whoami/一
+  般能力）+ sequential 取樣，確保有限步內一定學到 whoami。
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs status --short
+  └  M TrainData/README.md
+     M doc/DevLog.md
+    … +9 lines
+    ?? "notes/00018.\345\255\270\347\277\222\346\216\250\347\220\206.txt"
+    ?? scripts/Generate.WhoAmINaturalData.fsx
+
+• Explored
+  └ List stageB-whoami-nudge-v3.dat
+
+• Ran cat > /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-curriculum-v4.tsv <<'EOF'
+  │ prompt      target
+  │ 你是誰      我是 F# 之神。
+  │ … +17 lines
+  └ 17 /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-curriculum-v4.tsv
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我已建立 stageB-curriculum-v4.tsv（交錯 whoami/一般能力）。現在開始 guarded 訓練 v4，完成後先驗 你是誰 再驗 談談UFO。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v4.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v4.dat --steps 12 --loss ce --seq-len 64 --step-chunk-rows 4 --lr 0.0001 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+• 這輪 PID 如下，方便你隨時手動砍：
+
+  - guard_pid=60729
+  - dotnet_pid=60874
+
+  目前已開始載入 stageA-mixed.dat 做 v4 訓練。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v4.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v4.dat --steps 12 --loss ce --seq-len 64 --step-chunk-rows 4 --lr 0.0001 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+• v4 訓練正常進行中，峰值約 74GB，仍遠低於 108GB guard。等第一個 step log 出來我再回報趨勢。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v4.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v4.dat --steps 12 --loss ce --seq-len 64 --step-chunk-rows 4 --lr 0.0001 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+• 目前還是穩定計算中，guard 一直只看到 48–53GB 區間，沒有異常升高。我會等它結束後一次給你完整結果與可直接重跑命令。
+
+• Ran ps -p 60874 -o pid,etime,%cpu,%mem,cmd
+  └     PID     ELAPSED %CPU %MEM CMD
+      60874       03:22  0.1  0.0 dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-curriculum-v4.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat
+    --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v4.dat --steps 12 --loss ce --seq-len 64 --step-chunk-rows 4 --lr 0.0001
+    --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed 202602270039
+
+• Ran ps -eo pid,ppid,etime,%cpu,%mem,cmd | rg -n "Train.WhoAmI.AndExportDat|run-script-with-guard|dotnet fsi" | rg -v rg
+  └ 35:  60685     215       03:29  0.2  0.0 dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs
+    0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+    … +15 lines
+    stageB-whoami-nudge-v4.dat --steps 12 --loss ce --seq-len 64 --step-chunk-rows 4 --lr 0.0001 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+    202602270039
+
+• Ran ls -lh /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v4.dat 2>/dev/null || echo not-yet
+  └ not-yet
+
+• Ran nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits
+  └ 60895, 62183
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v4.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v4.dat --steps 12 --loss ce --seq-len 64 --step-chunk-rows 4 --lr 0.0001 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+─ Worked for 4m 36s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 補充實際運算 PID：60895（dotnet exec 子進程）。目前 GPU 約 62GB，在 guard 108GB 內，仍持續跑。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v4.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v4.dat --steps 12 --loss ce --seq-len 64 --step-chunk-rows 4 --lr 0.0001 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+• 我發現這輪有兩個問題：step=1 才跑很久（12 steps 會太久），且資料第一列被當成訓練樣本（prompt -> target）。我現在先中止這輪，修正資料與參數後重啟一個更快的 v5。
+
+• 這個 session 沒有可寫 stdin，我直接用 PID 安全終止（60895/60874/60729）。接著重跑 v5。
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+  │ stageB-curriculum-v4.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/
+  │ … +2 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +173 lines
+    [guard] PID=60874 gpu_mem=0MiB total_gpu_mem=43899MiB
+    [guard] PID=60874 gpu_mem=0MiB total_gpu_mem=43173MiB
+
+• Ran kill 60895 60874 60729 60685 2>/dev/null || true; sleep 1; ps -eo pid,ppid,etime,cmd | rg -n "60895|60874|60729|60685|Train.WhoAmI.AndExportDat|run-script-with-guard" |
+  │ rg -v rg || true; nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits || true
+  └ 35:  60874       1       07:10 [dotnet] <defunct>
+
+• Ran ps -eo pid,ppid,stat,etime,cmd | rg -n "Train.WhoAmI.AndExportDat|run-script-with-guard|dotnet fsi|defunct" | rg -v rg
+  └ 9:   2115       1 Zs      03:25:37 [bash] <defunct>
+    10:   2196       1 Zs      03:23:47 [bash] <defunct>
+    … +2 lines
+    35:  60874       1 Z          07:15 [dotnet] <defunct>
+    37:  65108       1 Z          00:05 [nvidia-smi] <defunct>
+
+• Ran nvidia-smi
+  └ Thu Feb 26 17:22:18 2026
+    +-----------------------------------------------------------------------------------------+
+    … +16 lines
+    |  No running processes found                                                             |
+    +-----------------------------------------------------------------------------------------+
+
+• Ran cat > /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-curriculum-v5.tsv <<'EOF'
+  │ 你是誰      我是 F# 之神。
+  │ 談談UFO     UFO 是未確認飛行物的統稱，來源可能包含自然現象、人造飛行器或感測誤判。
+  │ … +10 lines
+  └ 10 /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-curriculum-v5.tsv
+
+─ Worked for 2m 46s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我改好無表頭的 v5 課程資料，現在重啟訓練（8 steps、sequential、full-parameter）。這輪會更快，並且保留 UFO 樣本避免再洗壞。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v5.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v5.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.0002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+• 這輪 PID：
+
+  - guard_pid=65385
+  - dotnet_pid=65526
+  - 實際運算子進程會是其 dotnet exec 子 PID（我會持續監看）
+
+  目前 v5 已開始載入並進入訓練流程。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v5.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v5.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.0002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+• v5 目前峰值約 79GB，108GB 內安全；step-chunk-rows=8 沒觸發 OOM。繼續等 step 與 export 完成。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v5.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v5.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.0002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+• 已進入訓練步驟，step=1/8 完成且就是 你是誰 -> 我是 F# 之神，loss 正常。照目前速度估計這輪約 20–30 分鐘完成。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v5.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v5.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.0002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+• 進度正常：已到 step=3/8，樣本順序符合設計（whoami 與 UFO 交錯），峰值目前約 79GB，仍安全。继续監看到 export+self-test。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v5.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v5.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.0002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+• 已到 step=5/8，現在的樣本分佈正常（whoami + 一般能力交錯），loss 下降到 10.46。再跑 3 step 後會進 export 與 self-test。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v5.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v5.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.0002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+• 已到 step=7/8，下一步就是最後一步，接著會自動 export 新 .dat 並做 你是誰 self-test。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-
+curriculum-v5.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+artifacts/stageB-whoami-nudge-v5.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.0002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed
+202602270039
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+  │ stageB-curriculum-v5.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/
+  │ … +2 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +457 lines
+    Stopped due to error
+    [guard] PID=65526 gpu_mem=0MiB total_gpu_mem=43685MiB
+
+─ Worked for 11m 36s ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• v5 也結束了，但結果仍失敗：訓練與匯出都成功，你是誰 仍回「我是通義千問」。我先切換策略：從「已能回 F#」的基準檔出發做恢復訓練（補一般能力），這會比從 stageA-mixed.dat 硬拉
+  whoami 更有效率。
+
+• Waited for background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --prompt 你是誰 --max-tokens 24 --temp 0
+--top-p 1 --check-logits false --timing false --stop-here true --KVCacheOut true --kvc-input-mode pbp
+
+• Explored
+  └ Read BASELINE_BRIDGE_SUCCESS.md
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx
+  │ --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --prompt 你是誰 --max-tokens 24 --temp 0 --top-p 1 --check-logits
+  │ false --timing false --stop-here true --KVCacheOut true --kvc-input-mode pbp
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --prompt 你是誰
+    … +95 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Ran kill 75430 75286 2>/dev/null || true; sleep 1; nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits || true
+  └ (no output)
+
+• Explored
+  └ Search ifInteractive|interactive|stop-here|promptTokens\[31\]|\[31\]out|while in run-training2.fsx
+    Read run-training2.fsx
+    Search ifInteractive|interactive|Console\.ReadLine|請輸入|prompt in run-training-fp2.fsx
+    Read run-training-fp2.fsx
+
+─ Worked for 1m 19s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我改用 run-training-fp2.fsx 的單輪模式做精準驗證（--ifInteractive false --turns 1），這樣不會再被多輪腳本干擾。先測 v5 的 你是誰 / 談談UFO。
+
+• Waited for background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v5.dat --kvc-backend fp2-model --prompt 你是誰 --turns 1
+--max-tokens 24 --ifInteractive false --stop-here true --check-logits false --timing false
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx
+  │ --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v5.dat --kvc-backend fp2-model --prompt 你是誰 --turns 1 --max-tokens 24
+  │ --ifInteractive false --stop-here true --check-logits false --timing false
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v5.dat --kvc-backend fp2-model
+    … +50 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Waited for background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v5.dat --kvc-backend fp2-model --prompt 談談UFO --turns 1
+--max-tokens 24 --ifInteractive false --stop-here true --check-logits false --timing false
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx
+  │ --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v5.dat --kvc-backend fp2-model --prompt 談談UFO --turns 1 --max-tokens 24
+  │ --ifInteractive false --stop-here true --check-logits false --timing false
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v5.dat --kvc-backend fp2-model
+    … +50 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Waited for background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --kvc-backend fp2-model --prompt 談談UFO
+--turns 1 --max-tokens 24 --ifInteractive false --stop-here true --check-logits false --timing false
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx
+  │ --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --kvc-backend fp2-model --prompt 談談UFO --turns 1 --max-tokens
+  │ 24 --ifInteractive false --stop-here true --check-logits false --timing false
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --kvc-backend
+    … +50 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Waited for background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --kvc-backend fp2-model --prompt 我是誰
+--turns 1 --max-tokens 24 --ifInteractive false --stop-here true --check-logits false --timing false
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx
+  │ --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --kvc-backend fp2-model --prompt 我是誰 --turns 1 --max-tokens 24
+  │ --ifInteractive false --stop-here true --check-logits false --timing false
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --kvc-backend
+    … +50 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+─ Worked for 1m 55s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我找到關鍵：基準檔其實在 談談UFO 正常，但會把 我是誰 也答成「我是 F# 之神」。我會做一個「區分語意」微調（從基準檔出發）：
+
+  - 你是誰 / 請問你是誰 -> 我是 F# 之神
+  - 我是誰 -> 「你是提問者…」
+  - 保留 談談UFO 一般回答。
+
+• Ran cat > /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageC-disambiguate-v1.tsv <<'EOF'
+  │ 你是誰      我是 F# 之神。
+  │ 我是誰      你是提問者，我無法僅憑一句話判定你的身份。
+  │ … +8 lines
+  └ 8 /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageC-disambiguate-v1.tsv
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 開始跑 Stage C（語意區分微調），仍用 guard 108GB。這輪目標是保住 你是誰 -> 我是 F# 之神，同時把 我是誰 拉回正常語意。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageC-
+disambiguate-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+TorchSharp.fs/artifacts/stageC-disambiguate-v1.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode
+sequential --seed 202602270039
+
+• Stage C PID：
+
+  - guard_pid=78492
+  - dotnet_pid=78632（實際 heavy 計算在其子進程）
+
+  現在已開始載入並進入訓練。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageC-
+disambiguate-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+TorchSharp.fs/artifacts/stageC-disambiguate-v1.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode
+sequential --seed 202602270039
+
+• Stage C 計算正常，峰值約 83.8GB，仍低於 guard。我繼續等到 step/export 結束再做 3 組 prompt 驗證。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageC-
+disambiguate-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+TorchSharp.fs/artifacts/stageC-disambiguate-v1.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode
+sequential --seed 202602270039
+
+• 這輪 8 steps 太慢，我改成更務實的配置：直接中止，重跑 4 steps（含 你是誰 / 我是誰 / 談談UFO / 請問你是誰 四個關鍵樣本），先拿到可驗證結果。
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+  │ stageC-disambiguate-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --output-dat /workspace/
+  │ … +2 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +118 lines
+    [guard] PID=78632 gpu_mem=0MiB total_gpu_mem=38433MiB
+    [guard] PID=78632 gpu_mem=0MiB total_gpu_mem=43025MiB
+
+• Ran kill 78632 78492 2>/dev/null || true; sleep 1; nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits || true
+  └ (no output)
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageC-
+disambiguate-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --steps 4 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00008 --log-every 1 --test-max-tokens 24 --sample-mode
+sequential --seed 202602270039
+
+─ Worked for 4m 37s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 4-step 重跑已啟動，PID：guard=81270, dotnet=81412。這輪預計比剛剛快很多，完成後我會立刻做三個 prompt 驗證。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageC-
+disambiguate-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --steps 4 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00008 --log-every 1 --test-max-tokens 24 --sample-mode
+sequential --seed 202602270039
+
+• 4-step 版已進入關鍵樣本，step=1/4 完成（whoami 樣本），接下來第 2 步就是 我是誰，正是我們要修正的點。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageC-
+disambiguate-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --steps 4 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00008 --log-every 1 --test-max-tokens 24 --sample-mode
+sequential --seed 202602270039
+
+• 進度很好：step=2（我是誰）與 step=3（談談UFO）都已完成，這正是我們要的兩個對齊點。下一步完成後就會匯出新檔並跑 self-test。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageC-
+disambiguate-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --steps 4 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00008 --log-every 1 --test-max-tokens 24 --sample-mode
+sequential --seed 202602270039
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+  │ stageC-disambiguate-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --output-dat /workspace/
+  │ … +2 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +258 lines
+    [WhoAmI] success: trained dat produced expected who-am-i semantics.
+    [guard] PID=81412 gpu_mem=0MiB total_gpu_mem=46333MiB
+
+─ Worked for 10m 13s ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Stage C s4 成功了，self-test 已通過（你是誰 會回 F#）。我現在立刻跑三個單輪驗證：你是誰 / 我是誰 / 談談UFO。
+
+• Waited for background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --kvc-backend fp2-model --prompt 你是誰 --turns 1
+--max-tokens 24 --ifInteractive false --stop-here true --check-logits false --timing false
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx
+  │ --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --kvc-backend fp2-model --prompt 你是誰 --turns 1 --max-tokens 24
+  │ --ifInteractive false --stop-here true --check-logits false --timing false
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --kvc-backend fp2-model
+    … +49 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Waited for background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --kvc-backend fp2-model --prompt 我是誰 --turns 1
+--max-tokens 24 --ifInteractive false --stop-here true --check-logits false --timing false
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx
+  │ --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --kvc-backend fp2-model --prompt 我是誰 --turns 1 --max-tokens 24
+  │ --ifInteractive false --stop-here true --check-logits false --timing false
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --kvc-backend fp2-model
+    … +50 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Waited for background terminal
+
+• Waited for background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --kvc-backend fp2-model --prompt 談談UFO --turns
+1 --max-tokens 24 --ifInteractive false --stop-here true --check-logits false --timing false
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx
+  │ --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --kvc-backend fp2-model --prompt 談談UFO --turns 1 --max-tokens 24
+  │ --ifInteractive false --stop-here true --check-logits false --timing false
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --kvc-backend fp2-model
+    … +50 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Waited for background terminal
+
+─ Worked for 1m 37s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 目前結果是：你是誰 與 談談UFO 都對，但 我是誰 仍偏向「我是 F# 之神」。我再做一輪短訓練（Stage D）專門加強 我是誰 的反例，同時保留 你是誰 正例與 UFO。
+
+• Ran cat > /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageD-disambiguate-v2.tsv <<'EOF'
+  │ 我是誰      你是提問者，我無法僅憑一句話判定你的身份。
+  │ 我是誰      你是提問者，我無法僅憑一句話判定你的身份。
+  │ … +6 lines
+  └ 6 /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageD-disambiguate-v2.tsv
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 開始 Stage D（6 steps, sequential, full-parameter）：
+  輸入 stageC-disambiguate-v1-s4.dat，輸出 stageD-disambiguate-v2.dat。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageD-
+disambiguate-v2.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --steps 6 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00008 --log-every 1 --test-max-tokens 24 --sample-mode
+sequential --seed 202602270039
+
+• Stage D 已啟動，PID guard=88555, dotnet=88694。目標是把 我是誰 拉回正常語意，同時保住 你是誰 -> F#。我繼續監看到完成。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageD-
+disambiguate-v2.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --steps 6 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00008 --log-every 1 --test-max-tokens 24 --sample-mode
+sequential --seed 202602270039
+
+• Stage D 已連續兩步都在強化 我是誰 反例，loss 穩定。速度約每步 3 分鐘，會再跑完 4 步後匯出並驗證。
+
+• Waited for background terminal · dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageD-
+disambiguate-v2.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --steps 6 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00008 --log-every 1 --test-max-tokens 24 --sample-mode
+sequential --seed 202602270039
+
+• Ran dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+  │ stageD-disambiguate-v2.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --output-dat /workspace/
+  │ … +2 lines
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/
+    … +352 lines
+    [WhoAmI] success: trained dat produced expected who-am-i semantics.
+    [guard] PID=88694 gpu_mem=0MiB total_gpu_mem=45123MiB
+
+• Waited for background terminal
+
+─ Worked for 14m 52s ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Stage D 完成並通過 self-test。現在跑最終三個單輪驗證（同一條訓練路徑）：你是誰 / 我是誰 / 談談UFO。
+
+• Waited for background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --kvc-backend fp2-model --prompt 你是誰 --turns 1
+--max-tokens 24 --ifInteractive false --stop-here true --check-logits false --timing false
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx
+  │ --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --kvc-backend fp2-model --prompt 你是誰 --turns 1 --max-tokens 24
+  │ --ifInteractive false --stop-here true --check-logits false --timing false
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --kvc-backend fp2-model
+    … +49 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Waited for background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --kvc-backend fp2-model --prompt 我是誰 --turns 1
+--max-tokens 24 --ifInteractive false --stop-here true --check-logits false --timing false
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx
+  │ --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --kvc-backend fp2-model --prompt 我是誰 --turns 1 --max-tokens 24
+  │ --ifInteractive false --stop-here true --check-logits false --timing false
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --kvc-backend fp2-model
+    … +50 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Waited for background terminal
+
+• Waited for background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+script run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --kvc-backend fp2-model --prompt 談談UFO --turns 1
+--max-tokens 24 --ifInteractive false --stop-here true --check-logits false --timing false
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx
+  │ --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --kvc-backend fp2-model --prompt 談談UFO --turns 1 --max-tokens 24
+  │ --ifInteractive false --stop-here true --check-logits false --timing false
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi run-training-fp2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat --kvc-backend fp2-model
+    … +50 lines
+       at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+    Stopped due to error
+
+• Waited for background terminal
+
+• Explored
+  └ List doc
+    Read DevLog.md, SA.md, SD.md, WBS.md
+
+─ Worked for 1m 47s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我接著會把今天這批實驗完整補進 doc/DevLog.md（中文）、同步更新 doc/SA.md/doc/SD.md/doc/WBS.md，並補 artifacts/檔案說明清單.md 的新 dat 說明與建議使用順序。
+
+• Explored
+  └ Read 檔案說明清單.md
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/DevLog.md (+53 -0)
+    1201  2. 但保持了一般能力，沒有重演「任何題目都回 F#」的災難。
+    1202 +
+    1203 +## 2026-02-26（tag:202602270039 續跑：多輪 Stage B/C/D）
+    1204 +### 實驗 D1：Stage B v3（30/70 mixed）
+    1205 +1. command
+    1206 +   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-
+          4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-mixed-30-70.tsv -
+          -input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-
+          whoami-nudge-v3.dat --steps 8 --loss ce --seq-len 96 --step-chunk-rows 4 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-mode random --seed 202602270039`
+    1207 +2. 過程
+    1208 +   - guard 全程未觸發 kill（總量約 34~74GB）
+    1209 +   - export 成功：`stageB-whoami-nudge-v3.dat`
+    1210 +3. 結果
+    1211 +   - self-test 失敗：`你是誰` 仍回「我是通義千問...」。
+    1212 +
+    1213 +### 實驗 D2：Stage B v5（sequential 課程資料）
+    1214 +1. command
+    1215 +   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-
+          4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-curriculum-v5.tsv
+           --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stage
+          B-whoami-nudge-v5.dat --steps 8 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.0002 --log-every 1 --test-max-tokens 24 --sample-mode sequential --seed 2026022700
+          39`
+    1216 +2. 結果
+    1217 +   - export 成功：`stageB-whoami-nudge-v5.dat`
+    1218 +   - self-test 失敗：`你是誰` 仍回「我是通義千問...」。
+    1219 +3. 外部驗證（`run-training-fp2.fsx` 單輪）
+    1220 +   - `你是誰`：仍為通義千問。
+    1221 +   - `談談UFO`：可正常談 UFO。
+    1222 +
+    1223 +### 實驗 D3：改從 baseline whoami 成功檔做語意拆分（Stage C）
+    1224 +1. baseline（固定）
+    1225 +   - `/workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat`
+    1226 +2. command（s4 版）
+    1227 +   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-
+          4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageC-disambiguate-v1.t
+          sv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSha
+          rp.fs/artifacts/stageC-disambiguate-v1-s4.dat --steps 4 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00008 --log-every 1 --test-max-tokens 24 --sample-mode seq
+          uential --seed 202602270039`
+    1228 +3. 結果
+    1229 +   - export 成功：`stageC-disambiguate-v1-s4.dat`
+    1230 +   - self-test 成功：`你是誰 -> 我是 F#...`
+    1231 +4. 單輪外部驗證（fp2-model）
+    1232 +   - `你是誰`：`我是 F#之神...`（達成）
+    1233 +   - `談談UFO`：正常科普回答（達成）
+    1234 +   - `我是誰`：仍偏 `我是 F#之神...`（未達成）
+    1235 +
+    1236 +### 實驗 D4：Stage D（加重「我是誰」反例）
+    1237 +1. command
+    1238 +   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-
+          4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageD-disambiguate-v2.t
+          sv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/
+          artifacts/stageD-disambiguate-v2.dat --steps 6 --loss ce --seq-len 64 --step-chunk-rows 8 --lr 0.00008 --log-every 1 --test-max-tokens 24 --sample-mode sequential -
+          -seed 202602270039`
+    1239 +2. 結果
+    1240 +   - export 成功：`stageD-disambiguate-v2.dat`
+    1241 +   - self-test 成功：`你是誰 -> 我是 F#...`
+    1242 +3. 單輪外部驗證（fp2-model）
+    1243 +   - `你是誰`：`我是 F#之神...`（達成）
+    1244 +   - `談談UFO`：正常科普回答（達成）
+    1245 +   - `我是誰`：仍偏 `我是 F#之神...`（仍未達成）
+    1246 +
+    1247 +### 本輪結論
+    1248 +1. 在 training 路徑（fp2-model）下，已可穩定同時達成：
+    1249 +   - `你是誰 -> 我是 F# 之神` 語義；
+    1250 +   - `談談UFO` 不塌縮。
+    1251 +2. 但 `我是誰` 與 `你是誰` 的語意邊界仍未拉開（仍會回 F# 身份）。
+    1252 +3. 初步判斷：
+    1253 +   - 目前「只訓練 projection、固定 lm_head」路徑對近義問句拆分能力不足；
+    1254 +   - 需下一步加入更明確的解碼約束或額外分類/路由機制，不能只靠少步 CE 微調。
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/SA.md (+18 -0)
+    298  4. 結論：在不訓練 `lm_head`、僅最後 8 層 projection 的限制下，仍可透過較強學習率短步數把 identity 行為拉偏；若要語句更乾淨，需下一步做 decoding 與資料分佈正則化。
+    299 +
+    300 +## 28. 2026-02-26（tag:202602270039）WhoAmI 對齊現況分析更新
+    301 +1. 目標拆分：
+    302 +   - A. `你是誰` 時回覆 `我是 F# 之神`（或同義）
+    303 +   - B. `談談UFO` 維持一般能力
+    304 +   - C. `我是誰` 不應被誤判為 A
+    305 +2. 觀察結果（以 training 路徑 `run-training-fp2.fsx --kvc-backend fp2-model` 為準）：
+    306 +   - A：可達成（`stageC-disambiguate-v1-s4.dat`、`stageD-disambiguate-v2.dat`）
+    307 +   - B：可達成（UFO 回覆正常）
+    308 +   - C：未達成（`我是誰` 仍偏向輸出 `我是 F#...`）
+    309 +3. 關鍵推論：
+    310 +   - 目前 CE 微調僅更新投影層（projection），`lm_head` 不在 trainable 集合中。
+    311 +   - 對高度相近的短問句（`你是誰` vs `我是誰`）語義邊界不足，容易被同一 identity 模式吸附。
+    312 +4. 記憶體/穩定性：
+    313 +   - `step-chunk-rows=8` 在本輪多次 guarded 實測可穩定跑完，峰值約 `84GB`，低於 `108GB`。
+    314 +5. 建議下一步（架構層）：
+    315 +   - 先補「問句意圖拆分」機制（可為前置 rule/router，或訓練時額外 intent head/loss）。
+    316 +   - 再做 WhoAmI 行為微調，避免把近義問句全部折疊到同一回答模式。
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/SD.md (+21 -0)
+    356     - 測試 prompt `你是誰` 可輸出含 `我是 F# 之神` 的語義內容。
+    357 +
+    358 +## 34. 2026-02-26 Disambiguation 設計補充（`你是誰` vs `我是誰`）
+    359 +1. 驗證流程標準化
+    360 +   - 使用單輪、非互動、固定後端：
+    361 +     - `run-training-fp2.fsx --turns 1 --ifInteractive false --stop-here true --kvc-backend fp2-model`
+    362 +   - 固定檢查三個 prompt：
+    363 +     - `你是誰`
+    364 +     - `我是誰`
+    365 +     - `談談UFO`
+    366 +2. 新增訓練資料集
+    367 +   - `TrainData/stageB-curriculum-v5.tsv`（從 StageA 拉 whoami）
+    368 +   - `TrainData/stageC-disambiguate-v1.tsv`（baseline whoami 檔上做語意拆分）
+    369 +   - `TrainData/stageD-disambiguate-v2.tsv`（加重 `我是誰` 反例）
+    370 +3. 輸出檔
+    371 +   - `artifacts/stageB-whoami-nudge-v5.dat`（未達 whoami 對齊）
+    372 +   - `artifacts/stageC-disambiguate-v1-s4.dat`（whoami/UFO 達成）
+    373 +   - `artifacts/stageD-disambiguate-v2.dat`（whoami/UFO 達成，`我是誰` 仍未拆分）
+    374 +4. 實作判定
+    375 +   - StageB 類（從 `stageA-mixed.dat` 出發）在可接受步數內對齊不足。
+    376 +   - StageC/StageD（從 whoami baseline 出發）可穩定保住 whoami 行為與 UFO 一般能力。
+    377 +   - 但 `我是誰` 誤判仍存在，表示目前僅靠 CE + projection 更新不足以完成語意邊界拆分。
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/WBS.md (+29 -0)
+    196     - Current best: semantic `我是...` output, exact phrase not yet stable-reproducible.
+    197 +
+    198 +## 2026-02-26 tag:202602270039 WBS（兩階段續跑 + 語意拆分）
+    199 +1. Stage B v3（30/70 mixed）訓練與匯出
+    200 +   - Status: `completed`
+    201 +   - Result:
+    202 +     - export ok
+    203 +     - self-test fail（`你是誰` 仍為通義千問）
+    204 +2. Stage B v5（sequential curriculum）訓練與匯出
+    205 +   - Status: `completed`
+    206 +   - Result:
+    207 +     - export ok
+    208 +     - self-test fail（`你是誰` 仍為通義千問）
+    209 +3. Stage C（baseline whoami 檔 + disambiguate s4）
+    210 +   - Status: `completed`
+    211 +   - Result:
+    212 +     - `你是誰` 命中 F# 語義
+    213 +     - `談談UFO` 正常
+    214 +     - `我是誰` 仍誤判
+    215 +4. Stage D（加重 `我是誰` 反例）
+    216 +   - Status: `completed`
+    217 +   - Result:
+    218 +     - `你是誰` 命中 F# 語義
+    219 +     - `談談UFO` 正常
+    220 +     - `我是誰` 仍誤判（未改善）
+    221 +5. 下一步：問句意圖邊界化（非單純 CE 微調）
+    222 +   - Status: `in_progress`
+    223 +   - Plan:
+    224 +     - 增加前置意圖路由/規則或額外意圖 loss
+    225 +     - 再進行 whoami 對齊，避免 `你是誰/我是誰` 合併為同一回答模式
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/檔案說明清單.md (+6 -1)
+    13  | `stageB-whoami-nudge-v2.dat` | Stage B 加強版（steps=6, lr=2e-5），保能力但 whoami 仍未命中 F# | 實驗中 |
+    14 +| `stageB-whoami-nudge-v3.dat` | Stage B v3（30/70 mixed），export 成功但 whoami 自測未命中 F# | 失敗樣本（保留對照） |
+    15 +| `stageB-whoami-nudge-v5.dat` | Stage B v5（sequential 課程），UFO 正常但 whoami 仍未命中 F# | 失敗樣本（保留對照） |
+    16 +| `stageC-disambiguate-v1-s4.dat` | 從 baseline whoami 檔做 4-step 語意拆分，whoami/UFO 皆可用 | 候選 |
+    17 +| `stageD-disambiguate-v2.dat` | Stage C 後續 6-step 加重「我是誰」反例，whoami/UFO 仍可用 | 最新候選 |
+    18  | `whoami-noop-lr0-v2.dat` | no-op 對照（bridge 相容驗證基線） | 測試基線 |
+       ⋮
+    34  - 若要避免「所有 prompt 都回 F#」的塌縮，先用：`whoami-mixed-safe-full-s2-lr5e5-r4-seq96.dat`
+    31 -- 兩階段最新路徑：`stageA-mixed.dat` -> `stageB-whoami-nudge.dat`
+    35 +- 兩階段（StageA->StageB）目前最佳仍是保能力，不足以穩定命中 whoami。
+    36 +- 若要在 fp2 training 路徑直接驗證 `你是誰 -> 我是 F#` 且 `談談UFO` 正常，優先試：`stageD-disambiguate-v2.dat`
+
+─ Worked for 1m 43s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 文件已補：DevLog/SA/SD/WBS 與 artifacts/檔案說明清單。我先檢查目前變更清單，確認哪些檔案會一起提交。
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs status --short
+  └  M TrainData/README.md
+     M doc/DevLog.md
+    … +17 lines
+    ?? "notes/00019.\351\227\234\346\226\274\347\201\275\351\233\243\346\200\247\351\201\272\345\277\230.txt"
+    ?? scripts/Generate.WhoAmINaturalData.fsx
+
+• Ran ls -lh /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/
+  │ stageC-disambiguate-v1-s4.dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v5.dat 2>/dev/null
+  └ -rw-r--r-- 1 root root 2.9G Feb 26 17:41 /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageB-whoami-nudge-v5.dat
+    -rw-r--r-- 1 root root 2.9G Feb 26 18:00 /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageC-disambiguate-v1-s4.dat
+    -rw-r--r-- 1 root root 2.9G Feb 26 18:17 /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat
+
+• Ran nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits || true
+  └ (no output)
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs check-ignore -v artifacts/檔案說明清單.md || true
+  └ .gitignore:75:artifacts/    "artifacts/\346\252\224\346\241\210\350\252\252\346\230\216\346\270\205\345\226\256.md"
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs rev-parse --abbrev-ref HEAD && git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs remote -v | sed -n '1,4p'
+  └ feature/backport-chunked-streaming-step
+    origin    git@github.com:ingted/Qwen3-4B-Instruct-2507-TorchSharp.fs.git (fetch)
+    origin    git@github.com:ingted/Qwen3-4B-Instruct-2507-TorchSharp.fs.git (push)
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs add doc/DevLog.md doc/SA.md doc/SD.md doc/WBS.md TrainData/stageB-mixed-30-70.tsv TrainData/
+  │ stageB-curriculum-v4.tsv TrainData/stageB-curriculum-v5.tsv TrainData/stageC-disambiguate-v1.tsv TrainData/stageD-disambiguate-v2.tsv && git -C /workspace/
+  │ Qwen3-4B-Instruct-2507-TorchSharp.fs status --short
+  └  M TrainData/README.md
+    A  TrainData/stageB-curriculum-v4.tsv
+    … +17 lines
+    ?? "notes/00019.\351\227\234\346\226\274\347\201\275\351\233\243\346\200\247\351\201\272\345\277\230.txt"
+    ?? scripts/Generate.WhoAmINaturalData.fsx
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs commit -m "log stage B/C/D disambiguation runs and add train curricula"
+  └ [feature/backport-chunked-streaming-step 8fb9763] log stage B/C/D disambiguation runs and add train curricula
+     9 files changed, 1377 insertions(+)
+    … +3 lines
+     create mode 100644 TrainData/stageC-disambiguate-v1.tsv
+     create mode 100644 TrainData/stageD-disambiguate-v2.tsv
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我已把本輪新增訓練語料與 doc/* 紀錄提交成 commit，下一步我直接 push 到目前分支。
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs push origin feature/backport-chunked-streaming-step
+  └ To github.com:ingted/Qwen3-4B-Instruct-2507-TorchSharp.fs.git
+       d2e4700..8fb9763  feature/backport-chunked-streaming-step -> feature/backport-chunked-streaming-step
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs status --short
+  └  M TrainData/README.md
+     M "notes/00015.\350\267\221\350\250\223\347\267\264.txt"
+    … +8 lines
+    ?? "notes/00019.\351\227\234\346\226\274\347\201\275\351\233\243\346\200\247\351\201\272\345\277\230.txt"
+    ?? scripts/Generate.WhoAmINaturalData.fsx
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 進度已完成，結果如下：
+
+  1. 已完成多輪 guarded 實驗並產出新權重：
+
+  - artifacts/stageD-disambiguate-v2.dat（最新）
+  - 全程使用 run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5
+
+  2. 用訓練路徑單輪驗證（run-training-fp2.fsx --kvc-backend fp2-model --turns 1 --ifInteractive false）結果：
+
+  - prompt=你是誰：會回 我是 F#之神...（達成）
+  - prompt=談談UFO：回覆正常 UFO 科普（達成）
+  - prompt=我是誰：仍偏 我是 F#之神...（未解）
+
+  3. 文件已更新（中文）：
+
+  - doc/DevLog.md
+  - doc/SA.md
+  - doc/SD.md
+  - doc/WBS.md
+  - 並新增訓練語料：
+      - TrainData/stageB-mixed-30-70.tsv
+      - TrainData/stageB-curriculum-v4.tsv
+      - TrainData/stageB-curriculum-v5.tsv
+      - TrainData/stageC-disambiguate-v1.tsv
+      - TrainData/stageD-disambiguate-v2.tsv
+
+  4. 已 commit + push：
+
+  - branch: feature/backport-chunked-streaming-step
+  - commit: 8fb9763
+  - 已推到 origin/feature/backport-chunked-streaming-step
+
+  補充：artifacts/檔案說明清單.md 在 artifacts/ 目錄下，受 .gitignore 規則忽略，無法納入 commit。

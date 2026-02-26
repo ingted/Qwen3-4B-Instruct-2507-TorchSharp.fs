@@ -1,0 +1,19 @@
+目前我們進行訓練使用的 command 如下:
+
+dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs
+0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/
+fullparam-diverse-mix-v1.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+TorchSharp.fs/artifacts/fullparam-from-original-diverse-v1.dat --steps 6 --loss ce --seq-len 96 --step-chunk-rows 8 --lr 0.00005 --log-every 1 --test-max-tokens 24 --sample-
+mode random --seed 20260226
+
+請協助確認:
+
+1. 是否是 "真" 全參數訓練 (每一層權重 & lm_head...)
+2. 資料型別是否如以下規格
+
+Weights (Forward) 使用 NVFP4 => 享受最高的 Tensor Core 吞吐量
+Gradients 使用 BF16 => 確保反向傳播的訊號不會消失
+Master Weights 使用 BF16 => 負責接收並累積微小的更新值
+Optimizer States使用 8-bit AdamW => 在記憶體節省與訓練穩定性間取得平衡
+
+3. 如果 1. or 2. 有不符合之處，請撰寫 code_review_report.20260227.md 說明之，並且提出可行達成方式
