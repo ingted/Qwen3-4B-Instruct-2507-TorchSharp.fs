@@ -63,6 +63,14 @@ module Cli =
     | Some v when not (String.IsNullOrWhiteSpace v) -> Some(v.Trim())
     | _ -> None
 
+  let parseLossMode (m: Map<string, string>) =
+    match m.TryFind "--loss-mode" with
+    | Some v when not (String.IsNullOrWhiteSpace v) -> v.Trim()
+    | _ ->
+      match m.TryFind "--loss" with
+      | Some v when not (String.IsNullOrWhiteSpace v) -> v.Trim()
+      | _ -> Defaults.trainingConfig.LossMode
+
   let parse (args: string array) : TrainingConfig =
     let kv = readMap args
     {
@@ -82,6 +90,7 @@ module Cli =
           UseKvCache = parseBool "--use-kvc" Defaults.trainingConfig.UseKvCache kv
           SequenceLength = parseInt64 "--seq-len" Defaults.trainingConfig.SequenceLength kv
           LearningRate = parseFloat "--lr" Defaults.trainingConfig.LearningRate kv
+          LossMode = parseLossMode kv
           UsePackedNvfp4Optimizer =
             parseBool "--use-packed-optimizer" Defaults.trainingConfig.UsePackedNvfp4Optimizer kv
           GradCheckpointChunk = parseInt "--grad-ckpt-chunk" Defaults.trainingConfig.GradCheckpointChunk kv
@@ -121,6 +130,7 @@ module Cli =
     printfn "  --use-kvc <true|false>"
     printfn "  --seq-len <int64>"
     printfn "  --lr <float>"
+    printfn "  --loss-mode <scalar|ce> (alias: --loss)"
     printfn "  --use-packed-optimizer <true|false>"
     printfn "  --grad-ckpt-chunk <int>"
     printfn "  --optimizer-step-chunk-rows <int64>"

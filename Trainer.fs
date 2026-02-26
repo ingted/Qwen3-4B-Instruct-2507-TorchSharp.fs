@@ -6,6 +6,7 @@ open System.Text.Json
 open System.Diagnostics
 open TorchSharp
 open TorchSharp.Modules
+open TorchSharp.Q4.Extension
 
 [<CLIMutable>]
 type CheckpointState =
@@ -246,6 +247,46 @@ module Trainer =
     use targetTensor = torch.tensor(targetIds64, dtype = torch.int64, device = logits2d.device)
     torch.nn.functional.cross_entropy(logits2d, targetTensor)
 
+  let private tryGetIntProp (root: JsonElement) (name: string) =
+    match root.TryGetProperty(name) with
+    | true, p when p.ValueKind = JsonValueKind.Number -> Some(p.GetInt32())
+    | _ -> None
+
+  let private readVocabSize (configPath: string) =
+    use doc = JsonDocument.Parse(File.ReadAllText(configPath))
+    match tryGetIntProp doc.RootElement "vocab_size" with
+    | Some v when v > 0 -> v
+    | _ -> invalidOp (sprintf "config missing/invalid vocab_size: %s" configPath)
+
+  let private disposeBundle (bundle: Q4TensorBundle) =
+    bundle.Weight.Dispose()
+    bundle.Scale |> Option.iter (fun t -> t.Dispose())
+    bundle.Absmax |> Option.iter (fun t -> t.Dispose())
+    bundle.QuantMap |> Option.iter (fun t -> t.Dispose())
+
+  let private loadDenseLmHeadForCe (cfg: TrainingConfig) (model: Qwen3Nvfp4Model) (computeDtype: torch.ScalarType) =
+    let vocabSize = readVocabSize cfg.ConfigPath
+    let lmCfg =
+      {
+        cfg with
+            InFeatures = model.OutFeatures
+            OutFeatures = int64 vocabSize
+            MaxLayers = 1
+            SyntheticMode = false
+            StrictLoad = true
+      }
+
+    let lmState = Nvfp4State.load lmCfg
+    try
+      match lmState.Layers with
+      | [] -> invalidOp "failed to load lm_head bundle for CE loss"
+      | layer :: _ ->
+        use dense0 = Qwen3Model.materializeMasterWeight layer.Bundle cfg.Device computeDtype
+        dense0.contiguous().clone(), vocabSize
+    finally
+      for l in lmState.Layers do
+        disposeBundle l.Bundle
+
   let saveCheckpoint (cfg: TrainingConfig) (epoch: int) (globalStep: int) (model: Qwen3Nvfp4Model) =
     Directory.CreateDirectory(cfg.CheckpointDir) |> ignore
 
@@ -320,12 +361,18 @@ module Trainer =
       failwith
         "Offload is disabled for DGX Spark training path. Set --offload-mv-to-cpu=false --offload-w-to-cpu=false --offload-grad-to-cpu=false."
 
+    if (not cfg.UsePackedNvfp4Optimizer) && (not cfg.SyntheticMode) && model.Layers.Length >= 200 then
+      failwith
+        "Plain Adam optimizer is disabled for full 4B training path due to memory/OOM risk. Use --use-packed-optimizer true."
+
     printfn
       "[Train] mode=NVFP4 STE, epochs=%d, steps/epoch=%d, batch=%d lr=%f"
       cfg.Epochs
       cfg.StepsPerEpoch
       cfg.BatchSize
       cfg.LearningRate
+    let lossMode = parseLossMode cfg.LossMode
+    printfn "[Train] lossMode=%s" (lossModeName lossMode)
     printfn "[Train] features in=%d out=%d layers=%d" model.InFeatures model.OutFeatures model.Layers.Length
     printfn "[Train] synthetic=%b useKvc=%b seqLen=%d" cfg.SyntheticMode cfg.UseKvCache cfg.SequenceLength
     printfn
@@ -348,6 +395,16 @@ module Trainer =
 
     let computeDtype =
       if cfg.Device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then torch.float16 else torch.float32
+    let ceContextOpt =
+      if lossMode = LossMode.TokenCrossEntropy then
+        if not cfg.UseKvCache then
+          failwith "loss-mode=ce requires sequence input. Set --use-kvc true so training batch shape is [B,T,H]."
+        let lmWeight, vocabSize = loadDenseLmHeadForCe cfg model computeDtype
+        printfn "[Train] CE logits path enabled (dense lm_head, vocab=%d)." vocabSize
+        Some(lmWeight, vocabSize)
+      else
+        None
+
     let masterDtype =
       match trainableParams with
       | p :: _ -> p.dtype
@@ -433,6 +490,8 @@ module Trainer =
 
           let lossValue =
             if useGradCheckpoint then
+              if lossMode <> LossMode.ScalarL1 then
+                failwith "loss-mode=ce is not yet wired with grad-checkpoint recompute path. Set --grad-ckpt-chunk 0."
               backwardWithSequenceRecompute
                 model
                 inputTensor
@@ -446,10 +505,30 @@ module Trainer =
                   Qwen3Model.forwardWithKvCache model cache inputTensor (Some computeDtype)
                 else
                   Qwen3Model.forward model inputTensor (Some computeDtype)
-              use loss = scalarLoss output targetTensor
-              loss.backward()
-              use lossForRead = loss.to_type(torch.float32).cpu()
-              lossForRead.item<float32>()
+              match lossMode with
+              | LossMode.ScalarL1 ->
+                use loss = scalarLoss output targetTensor
+                loss.backward()
+                use lossForRead = loss.to_type(torch.float32).cpu()
+                lossForRead.item<float32>()
+              | LossMode.TokenCrossEntropy ->
+                if output.shape.Length <> 3 then
+                  failwithf "loss-mode=ce expects output rank 3 [B,T,H], got rank=%d" output.shape.Length
+                let batch = int output.shape.[0]
+                let seq = int output.shape.[1]
+                let nTargets = batch * seq
+                let lmWeight, vocabSize =
+                  match ceContextOpt with
+                  | Some x -> x
+                  | None -> failwith "internal error: CE context was not initialized"
+                use targetIdsTensor =
+                  torch.randint(int64 vocabSize, [| int64 nTargets |], dtype = torch.int64, device = "cpu")
+                let targetIds = targetIdsTensor.data<int64>().ToArray() |> Array.map int
+                let projectToLogits (hidden: torch.Tensor) = torch.nn.functional.linear(hidden, lmWeight)
+                use loss = tokenCrossEntropyLoss projectToLogits output targetIds
+                loss.backward()
+                use lossForRead = loss.to_type(torch.float32).cpu()
+                lossForRead.item<float32>()
           profileTrainStepVram cfg trainVramSamples epoch stepInEpoch globalStep "backward_done"
 
           match packedOptimizerStateOpt with
@@ -474,5 +553,6 @@ module Trainer =
         printfn "[Train] no epoch executed (resume epoch already beyond configured epochs)."
     finally
       tryWriteTrainStepVramReport cfg trainVramSamples
+      ceContextOpt |> Option.iter (fun (w, _) -> w.Dispose())
       packedOptimizerStateOpt |> Option.iter (fun st -> (st :> IDisposable).Dispose())
       optimizerOpt |> Option.iter (fun optimizer -> optimizer.Dispose())

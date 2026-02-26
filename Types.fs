@@ -21,6 +21,7 @@ type TrainingConfig =
     UseKvCache: bool
     SequenceLength: int64
     LearningRate: float
+    LossMode: string
     UsePackedNvfp4Optimizer: bool
     GradCheckpointChunk: int
     OptimizerStepChunkRows: int64
@@ -59,7 +60,8 @@ module Defaults =
       UseKvCache = false
       SequenceLength = 8L
       LearningRate = 1e-3
-      UsePackedNvfp4Optimizer = false
+      LossMode = "scalar"
+      UsePackedNvfp4Optimizer = true
       GradCheckpointChunk = 0
       OptimizerStepChunkRows = 32L
       OffloadMVToCpu = false

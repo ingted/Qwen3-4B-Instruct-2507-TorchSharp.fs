@@ -916,3 +916,25 @@
    - scalar：
      - command: `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --loss scalar`
      - result: PASS, `loss_mode=scalar`, `loss=8.781250`
+
+## 2026-02-26（當機回顧與 4B 全參數瓶頸澄清）
+### 事故回顧
+1. 有一次驗證命令使用 `dotnet run`（非 guard）且 `--use-packed-optimizer false`。
+2. 在 4B 全參數路徑下，這會走 plain Adam，極易觸發高峰值記憶體與系統不穩定。
+3. 結果表現為進度卡住/長時間無輸出，並伴隨使用者端「像當機」的體感。
+
+### 直接修正
+1. `Types.fs`：`Defaults.trainingConfig.UsePackedNvfp4Optimizer` 改為 `true`（預設走 packed optimizer）。
+2. `Trainer.fs`：新增 fail-fast：
+   - 若是非 synthetic 且層數接近 full 4B（`model.Layers.Length >= 200`）又指定 `--use-packed-optimizer false`，直接拒絕執行，避免 OOM 風險。
+
+### 關於「為何不斷爆 VRAM + 進度遲緩」的結論
+1. 記憶體壓力來源不是單一項，而是疊加：
+   - 全參數權重 + 梯度 + optimizer state
+   - 前向/反向 activation（受 `seq-len` 影響）
+   - 更新步驟中的暫存（受 `step-chunk-rows` 影響）
+2. 一旦使用 plain Adam（非 packed），狀態張量顯著增加，4B 路徑非常容易跨過穩定邊界。
+3. 「慢」主要來自：
+   - chunked/streaming 更新本身就是以時間換峰值
+   - CE 路徑若走可微 logits，需要額外算子與暫存
+4. 在 DGX Spark UMA 架構下，記憶體仍是共享池；只看單一 allocator 指標會低估整體壓力，故需要 guard + 保守配置。
