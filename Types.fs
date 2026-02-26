@@ -22,7 +22,9 @@ type TrainingConfig =
     SequenceLength: int64
     LearningRate: float
     LossMode: string
+    MasterDType: string
     UsePackedNvfp4Optimizer: bool
+    OptimizerStateMode: string
     GradCheckpointChunk: int
     OptimizerStepChunkRows: int64
     OffloadMVToCpu: bool
@@ -61,7 +63,9 @@ module Defaults =
       SequenceLength = 8L
       LearningRate = 1e-3
       LossMode = "scalar"
+      MasterDType = "bfloat16"
       UsePackedNvfp4Optimizer = true
+      OptimizerStateMode = "int8"
       GradCheckpointChunk = 0
       OptimizerStepChunkRows = 32L
       OffloadMVToCpu = false

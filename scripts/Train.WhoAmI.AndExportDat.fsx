@@ -74,6 +74,7 @@ let lr = parseFloat "--lr" 1e-4 kv
 let requestedTrainLastLayers = parseInt "--train-last-layers" 0 kv
 let seqLenCap = max 8 (parseInt "--seq-len" 96 kv)
 let stepChunkRows = int64 (max 1 (parseInt "--step-chunk-rows" 32 kv))
+let optimizerStateModeArg = getOrDefault "--optimizer-state-mode" "nvfp4" kv
 let maxGenTokens = max 1 (parseInt "--test-max-tokens" 12 kv)
 let sampleMode =
   match (getOrDefault "--sample-mode" "random" kv).Trim().ToLowerInvariant() with
@@ -86,6 +87,14 @@ let offloadGrad = parseBool "--offload-grad-to-cpu" false kv
 let gradClip = max 0.01 (parseFloat "--grad-clip" 0.5 kv)
 let compactEachStep = parseBool "--compact-each-step" true kv
 let logEvery = max 1 (parseInt "--log-every" 10 kv)
+
+let optimizerStateMode =
+  match optimizerStateModeArg.Trim().ToLowerInvariant() with
+  | "nvfp4"
+  | "fp4" -> PackedStateMode.Nvfp4
+  | "int8"
+  | "8-bit" -> PackedStateMode.Int8
+  | other -> failwithf "unsupported --optimizer-state-mode: %s" other
 
 if not (File.Exists inputDat) then
   failwithf "input dat not found: %s" inputDat
@@ -503,6 +512,7 @@ try
         Beta2 = 0.999f
         Eps = 1e-8f
         WeightDecay = 0.0f
+        StateMode = optimizerStateMode
         StepChunkRows = stepChunkRows
         OffloadMVToCpu = offloadMV
         OffloadWToCpu = offloadW

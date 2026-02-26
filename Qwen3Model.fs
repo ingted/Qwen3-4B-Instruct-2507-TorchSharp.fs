@@ -42,9 +42,14 @@ type Qwen3Nvfp4Model =
     Session: Q4Session
     Layers: Qwen3TrainableLayer list
     Blocks: Qwen3TrainableBlock list
-    ExtraParameters: Parameter list
+    ExtraParameters: (string * Parameter) list
+    EmbedTokens: Parameter
+    FinalNorm: Parameter
+    LmHead: Parameter
     InFeatures: int64
     OutFeatures: int64
+    VocabSize: int
+    RmsNormEps: float
   }
 
 module Qwen3Model =
@@ -133,12 +138,23 @@ module Qwen3Model =
       if dense.device.ToString() = device then dense else dense.``to``(device = device)
     onTarget.contiguous().clone()
 
+  let namedParameters (model: Qwen3Nvfp4Model) =
+    seq {
+      for l in model.Layers do
+        yield l.Name, l.MasterWeight
+      for name, p in model.ExtraParameters do
+        yield name, p
+      yield "model.embed_tokens.weight", model.EmbedTokens
+      yield "model.norm.weight", model.FinalNorm
+      yield "lm_head", model.LmHead
+    }
+    |> Seq.distinctBy (fun (_, p) -> RuntimeHelpers.GetHashCode(p))
+    |> Seq.toList
+
   let parameters (model: Qwen3Nvfp4Model) =
     let all =
       seq {
-        for l in model.Layers do
-          yield l.MasterWeight
-        for p in model.ExtraParameters do
+        for _, p in namedParameters model do
           yield p
       }
 
@@ -438,15 +454,24 @@ module Qwen3Model =
     =
     forwardInternal model (Some cache) input outDtype
 
+  let embedTokenIds (model: Qwen3Nvfp4Model) (tokenIds: TorchSharp.torch.Tensor) =
+    use tokenIds64 =
+      if tokenIds.dtype = torch.int64 then
+        tokenIds.contiguous()
+      else
+        tokenIds.to_type(torch.int64).contiguous()
+    use flat = tokenIds64.reshape([| tokenIds64.NumberOfElements |])
+    use picked = model.EmbedTokens.index_select(0L, flat)
+    let outShape = Array.append (tokenIds64.shape |> Array.copy) [| model.InFeatures |]
+    picked.reshape(outShape).contiguous().clone()
+
   let disposeSession (session: Q4Session) =
     match box session with
     | :? IDisposable as disposable -> disposable.Dispose()
     | _ -> ()
 
   let dispose (model: Qwen3Nvfp4Model) =
-    for layer in model.Layers do
-      layer.MasterWeight.Dispose()
-    for p in model.ExtraParameters do
+    for _, p in namedParameters model do
       p.Dispose()
     disposeSession model.Session
 
@@ -473,16 +498,24 @@ module Qwen3Model =
     let session = Session.create sessionCfg Q4.pureNvfp4Schema
 
     let masterDtype =
-      if cfg.Device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then torch.float16 else torch.float32
+      match cfg.MasterDType.Trim().ToLowerInvariant() with
+      | "float16"
+      | "fp16"
+      | "half" -> torch.float16
+      | "bfloat16"
+      | "bf16" -> torch.bfloat16
+      | "float32"
+      | "fp32" -> torch.float32
+      | other -> invalidArg "master-dtype" (sprintf "unsupported master dtype: %s" other)
 
     let cfgLite = loadConfigLite cfg.ConfigPath
     let hiddenSize = cfgLite.HiddenSize
     let qOut = int64 (cfgLite.NumAttentionHeads * cfgLite.HeadDim)
     let kvOut = int64 (cfgLite.NumKeyValueHeads * cfgLite.HeadDim)
-    let mlpOut =
+    let mlpOut, vocabSize =
       use doc = JsonDocument.Parse(File.ReadAllText(cfg.ConfigPath))
       let root = doc.RootElement
-      requiredInt64 root "intermediate_size"
+      requiredInt64 root "intermediate_size", requiredInt root "vocab_size"
 
     let qMap =
       loadByDims cfg hiddenSize qOut cfgLite.NumHiddenLayers
@@ -506,8 +539,21 @@ module Qwen3Model =
       loadByDims cfg mlpOut hiddenSize cfgLite.NumHiddenLayers
       |> buildLayerBundleMap ".mlp.down_proj"
 
+    let lmHeadBundle =
+      let lmState = loadByDims cfg hiddenSize (int64 vocabSize) 1
+      try
+        match lmState.Layers |> List.tryFind (fun l -> l.Name = "lm_head") with
+        | Some layer -> layer.Bundle
+        | None -> invalidOp "missing lm_head bundle from dat."
+      finally
+        for layer in lmState.Layers do
+          if layer.Name <> "lm_head" then
+            disposeBundle layer.Bundle
+
     let rawKeys =
       seq {
+        yield "model.embed_tokens.weight"
+        yield "model.norm.weight"
         for i in 0 .. cfgLite.NumHiddenLayers - 1 do
           yield sprintf "model.layers.%d.input_layernorm.weight" i
           yield sprintf "model.layers.%d.post_attention_layernorm.weight" i
@@ -517,6 +563,9 @@ module Qwen3Model =
       |> Set.ofSeq
 
     let rawMap = loadRawTensorMap cfg.WeightPath cfg.Device masterDtype rawKeys
+    let embedTokens = mkParameterFromTensor (rawGet "model.embed_tokens.weight" rawMap)
+    let finalNorm = mkParameterFromTensor (rawGet "model.norm.weight" rawMap)
+    let lmHead = mkParameterFromBundle cfg masterDtype lmHeadBundle
 
     let blocks =
       [
@@ -555,6 +604,7 @@ module Qwen3Model =
     for m in [ qMap; kMap; vMap; oMap; gateMap; upMap; downMap ] do
       for kv in m do
         disposeBundle kv.Value
+    disposeBundle lmHeadBundle
 
     for kv in rawMap do
       kv.Value.Dispose()
@@ -574,13 +624,24 @@ module Qwen3Model =
 
     let extraParams =
       blocks
-      |> List.collect (fun b -> [ b.InputNorm; b.PostAttnNorm; b.QNorm; b.KNorm ])
+      |> List.collect (fun b ->
+        [
+          $"{b.Name}.input_layernorm.weight", b.InputNorm
+          $"{b.Name}.post_attention_layernorm.weight", b.PostAttnNorm
+          $"{b.Name}.self_attn.q_norm.weight", b.QNorm
+          $"{b.Name}.self_attn.k_norm.weight", b.KNorm
+        ])
 
     {
       Session = session
       Layers = layers
       Blocks = blocks
       ExtraParameters = extraParams
+      EmbedTokens = embedTokens
+      FinalNorm = finalNorm
+      LmHead = lmHead
       InFeatures = hiddenSize
       OutFeatures = hiddenSize
+      VocabSize = vocabSize
+      RmsNormEps = cfgLite.RmsNormEps
     }

@@ -91,8 +91,11 @@ module Cli =
           SequenceLength = parseInt64 "--seq-len" Defaults.trainingConfig.SequenceLength kv
           LearningRate = parseFloat "--lr" Defaults.trainingConfig.LearningRate kv
           LossMode = parseLossMode kv
+          MasterDType = getOrDefault "--master-dtype" Defaults.trainingConfig.MasterDType kv
           UsePackedNvfp4Optimizer =
             parseBool "--use-packed-optimizer" Defaults.trainingConfig.UsePackedNvfp4Optimizer kv
+          OptimizerStateMode =
+            getOrDefault "--optimizer-state-mode" Defaults.trainingConfig.OptimizerStateMode kv
           GradCheckpointChunk = parseInt "--grad-ckpt-chunk" Defaults.trainingConfig.GradCheckpointChunk kv
           OptimizerStepChunkRows =
             parseInt64 "--optimizer-step-chunk-rows" Defaults.trainingConfig.OptimizerStepChunkRows kv
@@ -131,7 +134,9 @@ module Cli =
     printfn "  --seq-len <int64>"
     printfn "  --lr <float>"
     printfn "  --loss-mode <scalar|ce> (alias: --loss)"
+    printfn "  --master-dtype <float16|bfloat16|float32>"
     printfn "  --use-packed-optimizer <true|false>"
+    printfn "  --optimizer-state-mode <nvfp4|int8>"
     printfn "  --grad-ckpt-chunk <int>"
     printfn "  --optimizer-step-chunk-rows <int64>"
     printfn "  --offload-mv-to-cpu <true|false> (deprecated/disabled on DGX Spark)"

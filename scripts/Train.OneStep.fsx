@@ -248,11 +248,16 @@ try
     | [] -> computeDtype
 
   let nameByKey = System.Collections.Generic.Dictionary<int, string>()
-  for layer in model.Layers do
-    nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(layer.MasterWeight)] <- layer.Name
-  for i = 0 to model.ExtraParameters.Length - 1 do
-    let p = model.ExtraParameters.[i]
-    nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(p)] <- sprintf "extra.%d" i
+  for name, p in Qwen3Model.namedParameters model do
+    nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(p)] <- name
+
+  let stateMode =
+    match cfg.OptimizerStateMode.Trim().ToLowerInvariant() with
+    | "nvfp4"
+    | "fp4" -> PackedStateMode.Nvfp4
+    | "int8"
+    | "8-bit" -> PackedStateMode.Int8
+    | other -> failwithf "unsupported --optimizer-state-mode: %s" other
 
   let nameOfParam (p: TorchSharp.Modules.Parameter) =
     let key = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(p)
@@ -270,6 +275,7 @@ try
         Beta2 = 0.999f
         Eps = 1e-8f
         WeightDecay = 0.0f
+        StateMode = stateMode
         StepChunkRows = cfg.OptimizerStepChunkRows
         OffloadMVToCpu = cfg.OffloadMVToCpu
         OffloadWToCpu = cfg.OffloadWToCpu

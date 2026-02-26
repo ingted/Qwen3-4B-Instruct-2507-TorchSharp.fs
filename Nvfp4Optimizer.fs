@@ -13,13 +13,29 @@ type PackedNvfp4 =
     StorageDevice: string
   }
 
+type PackedInt8 =
+  {
+    mutable QData: torch.Tensor
+    mutable Scale: torch.Tensor
+    Shape: int64 array
+    StorageDevice: string
+  }
+
+type PackedStateMode =
+  | Nvfp4
+  | Int8
+
+type PackedMomentState =
+  | MomentNvfp4 of PackedNvfp4
+  | MomentInt8 of PackedInt8
+
 type PackedParamState =
   {
     Name: string
     Param: Parameter
     mutable W: PackedNvfp4
-    mutable M: PackedNvfp4
-    mutable V: PackedNvfp4
+    mutable M: PackedMomentState
+    mutable V: PackedMomentState
   }
 
 type PackedAdamwConfig =
@@ -31,6 +47,7 @@ type PackedAdamwConfig =
     Beta2: float32
     Eps: float32
     WeightDecay: float32
+    StateMode: PackedStateMode
     StepChunkRows: int64
     OffloadMVToCpu: bool
     OffloadWToCpu: bool
@@ -40,6 +57,20 @@ type PackedAdamwConfig =
 
 type PackedAdamwState(config: PackedAdamwConfig, states: PackedParamState list) =
   let mutable step = 0
+
+  let disposeNvfp4 (x: PackedNvfp4) =
+    x.QData.Dispose()
+    x.Scale.Dispose()
+
+  let disposeInt8 (x: PackedInt8) =
+    x.QData.Dispose()
+    x.Scale.Dispose()
+
+  let disposeMoment (m: PackedMomentState) =
+    match m with
+    | MomentNvfp4 x -> disposeNvfp4 x
+    | MomentInt8 x -> disposeInt8 x
+
   member _.Config = config
   member _.States = states
   member _.Step
@@ -49,12 +80,9 @@ type PackedAdamwState(config: PackedAdamwConfig, states: PackedParamState list) 
   interface IDisposable with
     member _.Dispose() =
       for st in states do
-        st.W.QData.Dispose()
-        st.W.Scale.Dispose()
-        st.M.QData.Dispose()
-        st.M.Scale.Dispose()
-        st.V.QData.Dispose()
-        st.V.Scale.Dispose()
+        disposeNvfp4 st.W
+        disposeMoment st.M
+        disposeMoment st.V
 
 module Nvfp4Optimizer =
   let private toMatrix2d (t: torch.Tensor) =
@@ -77,7 +105,7 @@ module Nvfp4Optimizer =
       let cols = shape |> Array.skip 1 |> Array.fold (fun acc d -> acc * d) 1L
       shape.[0], cols
 
-  let private packNvfp4 (source: torch.Tensor) (storageDevice: string) =
+  let private packNvfp4 (source: torch.Tensor) (storageDevice: string) : PackedNvfp4 =
     let matrix, shape = toMatrix2d source
     try
       let q, s = Nvfp4Training.quantizePacked matrix
@@ -108,7 +136,7 @@ module Nvfp4Optimizer =
     finally
       matrix.Dispose()
 
-  let private packMatrixToStorage (matrix2d: torch.Tensor) (storageDevice: string) =
+  let private packMatrixNvfp4ToStorage (matrix2d: torch.Tensor) (storageDevice: string) =
     use matrix = matrix2d.contiguous()
     let q, s = Nvfp4Training.quantizePacked matrix
     try
@@ -129,6 +157,85 @@ module Nvfp4Optimizer =
     finally
       q.Dispose()
       s.Dispose()
+
+  let private packInt8 (source: torch.Tensor) (storageDevice: string) : PackedInt8 =
+    let matrix, shape = toMatrix2d source
+    try
+      let q, s =
+        use matrix32 =
+          if matrix.dtype = torch.float32 then matrix.contiguous()
+          else matrix.to_type(torch.float32).contiguous()
+        use absMax0 = torch.amax(matrix32.abs(), dims = [| 1L |], keepdim = true)
+        use eps = torch.tensor(1e-8f, dtype = torch.float32, device = absMax0.device)
+        use absMax = torch.maximum(absMax0, eps)
+        use scale = absMax / 127.0f
+        use normalized = matrix32 / scale
+        use rounded = torch.round(normalized)
+        use low = torch.tensor(-127.0f, dtype = torch.float32, device = rounded.device)
+        use high = torch.tensor(127.0f, dtype = torch.float32, device = rounded.device)
+        use clampedLow = torch.maximum(rounded, low)
+        use clamped = torch.minimum(clampedLow, high)
+        let q0 = clamped.to_type(torch.int8).contiguous()
+        let s0 = scale.to_type(torch.float32).contiguous()
+        q0.clone(), s0.clone()
+      try
+        let qStored =
+          if q.device.ToString() = storageDevice then
+            q.contiguous().clone()
+          else
+            use moved = q.``to``(device = storageDevice)
+            moved.contiguous().clone()
+        let sStored =
+          if s.device.ToString() = storageDevice then
+            s.contiguous().clone()
+          else
+            use moved = s.``to``(device = storageDevice)
+            moved.contiguous().clone()
+        {
+          QData = qStored
+          Scale = sStored
+          Shape = shape
+          StorageDevice = storageDevice
+        }
+      finally
+        q.Dispose()
+        s.Dispose()
+    finally
+      matrix.Dispose()
+
+  let private packMatrixInt8ToStorage (matrix2d: torch.Tensor) (storageDevice: string) =
+    use matrix = matrix2d.contiguous()
+    use matrix32 =
+      if matrix.dtype = torch.float32 then matrix.contiguous()
+      else matrix.to_type(torch.float32).contiguous()
+    use absMax0 = torch.amax(matrix32.abs(), dims = [| 1L |], keepdim = true)
+    use eps = torch.tensor(1e-8f, dtype = torch.float32, device = absMax0.device)
+    use absMax = torch.maximum(absMax0, eps)
+    use scale = absMax / 127.0f
+    use normalized = matrix32 / scale
+    use rounded = torch.round(normalized)
+    use low = torch.tensor(-127.0f, dtype = torch.float32, device = rounded.device)
+    use high = torch.tensor(127.0f, dtype = torch.float32, device = rounded.device)
+    use clampedLow = torch.maximum(rounded, low)
+    use clamped = torch.minimum(clampedLow, high)
+    use q0 = clamped.to_type(torch.int8).contiguous()
+    use s0 = scale.to_type(torch.float32).contiguous()
+
+    let qStored =
+      if q0.device.ToString() = storageDevice then
+        q0.contiguous().clone()
+      else
+        use moved = q0.``to``(device = storageDevice)
+        moved.contiguous().clone()
+
+    let sStored =
+      if s0.device.ToString() = storageDevice then
+        s0.contiguous().clone()
+      else
+        use moved = s0.``to``(device = storageDevice)
+        moved.contiguous().clone()
+
+    qStored, sStored
 
   let private unpackNvfp4Rows2d
     (packed: PackedNvfp4)
@@ -165,11 +272,70 @@ module Nvfp4Optimizer =
       qTemp |> Option.iter (fun t -> t.Dispose())
       sTemp |> Option.iter (fun t -> t.Dispose())
 
-  let private replacePacked (target: PackedNvfp4) (next: PackedNvfp4) =
+  let private unpackInt8Rows2d
+    (packed: PackedInt8)
+    (rowStart: int64)
+    (rowLen: int64)
+    (computeDevice: string)
+    (outDtype: torch.ScalarType) =
+    use qSlice0 = packed.QData.narrow(0L, rowStart, rowLen).contiguous()
+    use sSlice0 = packed.Scale.narrow(0L, rowStart, rowLen).contiguous()
+
+    let qTemp =
+      if qSlice0.device.ToString() = computeDevice then
+        None
+      else
+        Some(qSlice0.``to``(device = computeDevice))
+    let sTemp =
+      if sSlice0.device.ToString() = computeDevice then
+        None
+      else
+        Some(sSlice0.``to``(device = computeDevice))
+
+    let q =
+      match qTemp with
+      | Some t -> t
+      | None -> qSlice0
+    let s =
+      match sTemp with
+      | Some t -> t
+      | None -> sSlice0
+
+    try
+      use dense32 = q.to_type(torch.float32) * s.to_type(torch.float32)
+      if outDtype = torch.float32 then dense32.contiguous().clone()
+      else dense32.to_type(outDtype).contiguous().clone()
+    finally
+      qTemp |> Option.iter (fun t -> t.Dispose())
+      sTemp |> Option.iter (fun t -> t.Dispose())
+
+  let private unpackMomentRows2d
+    (moment: PackedMomentState)
+    (rowStart: int64)
+    (rowLen: int64)
+    (computeDevice: string)
+    (outDtype: torch.ScalarType) =
+    match moment with
+    | MomentNvfp4 x -> unpackNvfp4Rows2d x rowStart rowLen computeDevice outDtype
+    | MomentInt8 x -> unpackInt8Rows2d x rowStart rowLen computeDevice outDtype
+
+  let private replacePackedNvfp4 (target: PackedNvfp4) (next: PackedNvfp4) =
     target.QData.Dispose()
     target.Scale.Dispose()
     target.QData <- next.QData
     target.Scale <- next.Scale
+
+  let private replaceMoment (current: PackedMomentState) (next: PackedMomentState) =
+    let disposeMoment m =
+      match m with
+      | MomentNvfp4 x ->
+        x.QData.Dispose()
+        x.Scale.Dispose()
+      | MomentInt8 x ->
+        x.QData.Dispose()
+        x.Scale.Dispose()
+    disposeMoment current
+    next
 
   let zeroGrad (parameters: Parameter list) =
     for p in parameters do
@@ -192,8 +358,14 @@ module Nvfp4Optimizer =
         use p0 = p.detach().contiguous()
         let wPacked = packNvfp4 p0 wStorageDevice
         use zeros = torch.zeros(p0.shape, dtype = p0.dtype, device = p0.device)
-        let mPacked = packNvfp4 zeros mvStorageDevice
-        let vPacked = packNvfp4 zeros mvStorageDevice
+        let mPacked =
+          match config.StateMode with
+          | PackedStateMode.Nvfp4 -> MomentNvfp4(packNvfp4 zeros mvStorageDevice)
+          | PackedStateMode.Int8 -> MomentInt8(packInt8 zeros mvStorageDevice)
+        let vPacked =
+          match config.StateMode with
+          | PackedStateMode.Nvfp4 -> MomentNvfp4(packNvfp4 zeros mvStorageDevice)
+          | PackedStateMode.Int8 -> MomentInt8(packInt8 zeros mvStorageDevice)
         {
           Name = nameOf p
           Param = p
@@ -206,15 +378,17 @@ module Nvfp4Optimizer =
   let stateSizeMiB (state: PackedAdamwState) =
     let tensorMiB (t: torch.Tensor) =
       int ((t.NumberOfElements * t.ElementSize) / 1024L / 1024L)
+
+    let momentMiB (m: PackedMomentState) =
+      match m with
+      | MomentNvfp4 st -> tensorMiB st.QData + tensorMiB st.Scale
+      | MomentInt8 st -> tensorMiB st.QData + tensorMiB st.Scale
+
     let w =
       state.States
       |> List.sumBy (fun st -> tensorMiB st.W.QData + tensorMiB st.W.Scale)
-    let m =
-      state.States
-      |> List.sumBy (fun st -> tensorMiB st.M.QData + tensorMiB st.M.Scale)
-    let v =
-      state.States
-      |> List.sumBy (fun st -> tensorMiB st.V.QData + tensorMiB st.V.Scale)
+    let m = state.States |> List.sumBy (fun st -> momentMiB st.M)
+    let v = state.States |> List.sumBy (fun st -> momentMiB st.V)
     w, m, v
 
   let step (state: PackedAdamwState) =
@@ -248,8 +422,7 @@ module Nvfp4Optimizer =
           | Some arr when idx < arr.Length ->
             match arr.[idx] with
             | Some gCpu -> Some gCpu
-            | None ->
-              if isNull st.Param.grad then None else Some st.Param.grad
+            | None -> if isNull st.Param.grad then None else Some st.Param.grad
           | _ ->
             if isNull st.Param.grad then None else Some st.Param.grad
 
@@ -261,12 +434,23 @@ module Nvfp4Optimizer =
 
           use grad2d = gradSource.reshape([| rows; cols |]).contiguous()
           use param2d = st.Param.reshape([| rows; cols |])
+
           let wQNext = torch.empty(st.W.QData.shape, dtype = st.W.QData.dtype, device = st.W.QData.device)
           let wSNext = torch.empty(st.W.Scale.shape, dtype = st.W.Scale.dtype, device = st.W.Scale.device)
-          let mQNext = torch.empty(st.M.QData.shape, dtype = st.M.QData.dtype, device = st.M.QData.device)
-          let mSNext = torch.empty(st.M.Scale.shape, dtype = st.M.Scale.dtype, device = st.M.Scale.device)
-          let vQNext = torch.empty(st.V.QData.shape, dtype = st.V.QData.dtype, device = st.V.QData.device)
-          let vSNext = torch.empty(st.V.Scale.shape, dtype = st.V.Scale.dtype, device = st.V.Scale.device)
+
+          let mQNext, mSNext, vQNext, vSNext =
+            match st.M, st.V with
+            | MomentNvfp4 m, MomentNvfp4 v ->
+              torch.empty(m.QData.shape, dtype = m.QData.dtype, device = m.QData.device),
+              torch.empty(m.Scale.shape, dtype = m.Scale.dtype, device = m.Scale.device),
+              torch.empty(v.QData.shape, dtype = v.QData.dtype, device = v.QData.device),
+              torch.empty(v.Scale.shape, dtype = v.Scale.dtype, device = v.Scale.device)
+            | MomentInt8 m, MomentInt8 v ->
+              torch.empty(m.QData.shape, dtype = m.QData.dtype, device = m.QData.device),
+              torch.empty(m.Scale.shape, dtype = m.Scale.dtype, device = m.Scale.device),
+              torch.empty(v.QData.shape, dtype = v.QData.dtype, device = v.QData.device),
+              torch.empty(v.Scale.shape, dtype = v.Scale.dtype, device = v.Scale.device)
+            | _ -> invalidOp "optimizer state mode mismatch between m and v"
 
           while rowStart < rows do
             let rowLen = min stepChunkRows (rows - rowStart)
@@ -286,8 +470,8 @@ module Nvfp4Optimizer =
               else gSlice.to_type(torch.bfloat16).contiguous()
             use g32 = gBf16.to_type(torch.float32)
             use w32 = unpackNvfp4Rows2d st.W rowStart rowLen cfg.Device torch.float32
-            use mPrev32 = unpackNvfp4Rows2d st.M rowStart rowLen cfg.Device torch.float32
-            use vPrev32 = unpackNvfp4Rows2d st.V rowStart rowLen cfg.Device torch.float32
+            use mPrev32 = unpackMomentRows2d st.M rowStart rowLen cfg.Device torch.float32
+            use vPrev32 = unpackMomentRows2d st.V rowStart rowLen cfg.Device torch.float32
 
             use m32 = cfg.Beta1 * mPrev32 + (1.0f - cfg.Beta1) * g32
             use v32 = cfg.Beta2 * vPrev32 + (1.0f - cfg.Beta2) * (g32 * g32)
@@ -300,11 +484,22 @@ module Nvfp4Optimizer =
             use pDst = param2d.narrow(0L, rowStart, rowLen)
             pDst.copy_(wNewMaster) |> ignore
 
-            use mPackSrc = m32.to_type(torch.bfloat16).contiguous()
-            use vPackSrc = v32.to_type(torch.bfloat16).contiguous()
-            let wQChunk, wSChunk = packMatrixToStorage wNewMaster st.W.StorageDevice
-            let mQChunk, mSChunk = packMatrixToStorage mPackSrc st.M.StorageDevice
-            let vQChunk, vSChunk = packMatrixToStorage vPackSrc st.V.StorageDevice
+            let wQChunk, wSChunk = packMatrixNvfp4ToStorage wNewMaster st.W.StorageDevice
+
+            let mQChunk, mSChunk, vQChunk, vSChunk =
+              match st.M, st.V with
+              | MomentNvfp4 mSt, MomentNvfp4 vSt ->
+                use mPackSrc = m32.to_type(torch.bfloat16).contiguous()
+                use vPackSrc = v32.to_type(torch.bfloat16).contiguous()
+                let mQ, mS = packMatrixNvfp4ToStorage mPackSrc mSt.StorageDevice
+                let vQ, vS = packMatrixNvfp4ToStorage vPackSrc vSt.StorageDevice
+                mQ, mS, vQ, vS
+              | MomentInt8 mSt, MomentInt8 vSt ->
+                let mQ, mS = packMatrixInt8ToStorage m32 mSt.StorageDevice
+                let vQ, vS = packMatrixInt8ToStorage v32 vSt.StorageDevice
+                mQ, mS, vQ, vS
+              | _ -> invalidOp "optimizer state mode mismatch between m and v"
+
             try
               use wQDst = wQNext.narrow(0L, rowStart, rowLen)
               use wSDst = wSNext.narrow(0L, rowStart, rowLen)
@@ -329,27 +524,60 @@ module Nvfp4Optimizer =
 
             rowStart <- rowStart + rowLen
 
-          replacePacked st.W
+          replacePackedNvfp4 st.W
             {
               QData = wQNext
               Scale = wSNext
               Shape = Array.copy st.W.Shape
               StorageDevice = st.W.StorageDevice
             }
-          replacePacked st.M
-            {
-              QData = mQNext
-              Scale = mSNext
-              Shape = Array.copy st.M.Shape
-              StorageDevice = st.M.StorageDevice
-            }
-          replacePacked st.V
-            {
-              QData = vQNext
-              Scale = vSNext
-              Shape = Array.copy st.V.Shape
-              StorageDevice = st.V.StorageDevice
-            }
+
+          st.M <-
+            match st.M with
+            | MomentNvfp4 old ->
+              let next =
+                MomentNvfp4
+                  {
+                    QData = mQNext
+                    Scale = mSNext
+                    Shape = Array.copy old.Shape
+                    StorageDevice = old.StorageDevice
+                  }
+              replaceMoment st.M next
+            | MomentInt8 old ->
+              let next =
+                MomentInt8
+                  {
+                    QData = mQNext
+                    Scale = mSNext
+                    Shape = Array.copy old.Shape
+                    StorageDevice = old.StorageDevice
+                  }
+              replaceMoment st.M next
+
+          st.V <-
+            match st.V with
+            | MomentNvfp4 old ->
+              let next =
+                MomentNvfp4
+                  {
+                    QData = vQNext
+                    Scale = vSNext
+                    Shape = Array.copy old.Shape
+                    StorageDevice = old.StorageDevice
+                  }
+              replaceMoment st.V next
+            | MomentInt8 old ->
+              let next =
+                MomentInt8
+                  {
+                    QData = vQNext
+                    Scale = vSNext
+                    Shape = Array.copy old.Shape
+                    StorageDevice = old.StorageDevice
+                  }
+              replaceMoment st.V next
+
           st.Param.grad <- null
 
           if cfg.FlushEachParam then

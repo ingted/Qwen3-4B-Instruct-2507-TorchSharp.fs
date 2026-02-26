@@ -21,6 +21,8 @@ type CheckpointMeta =
     Epoch: int
     GlobalStep: int
     LayerCount: int
+    ParameterCount: int
+    ParameterNames: string array
     InFeatures: int64
     OutFeatures: int64
     TimestampUtc: string
@@ -247,54 +249,33 @@ module Trainer =
     use targetTensor = torch.tensor(targetIds64, dtype = torch.int64, device = logits2d.device)
     torch.nn.functional.cross_entropy(logits2d, targetTensor)
 
-  let private tryGetIntProp (root: JsonElement) (name: string) =
-    match root.TryGetProperty(name) with
-    | true, p when p.ValueKind = JsonValueKind.Number -> Some(p.GetInt32())
-    | _ -> None
+  let tokenCrossEntropyLossTensor
+    (projectToLogits: TorchSharp.torch.Tensor -> TorchSharp.torch.Tensor)
+    (outputHidden: TorchSharp.torch.Tensor)
+    (targetTokenIds: TorchSharp.torch.Tensor)
+    =
+    if outputHidden.shape.Length <> 3 then
+      invalidArg "outputHidden" (sprintf "token CE expects hidden shape [B,T,H], got rank=%d" outputHidden.shape.Length)
 
-  let private readVocabSize (configPath: string) =
-    use doc = JsonDocument.Parse(File.ReadAllText(configPath))
-    match tryGetIntProp doc.RootElement "vocab_size" with
-    | Some v when v > 0 -> v
-    | _ -> invalidOp (sprintf "config missing/invalid vocab_size: %s" configPath)
-
-  let private disposeBundle (bundle: Q4TensorBundle) =
-    bundle.Weight.Dispose()
-    bundle.Scale |> Option.iter (fun t -> t.Dispose())
-    bundle.Absmax |> Option.iter (fun t -> t.Dispose())
-    bundle.QuantMap |> Option.iter (fun t -> t.Dispose())
-
-  let private loadDenseLmHeadForCe (cfg: TrainingConfig) (model: Qwen3Nvfp4Model) (computeDtype: torch.ScalarType) =
-    let vocabSize = readVocabSize cfg.ConfigPath
-    let lmCfg =
-      {
-        cfg with
-            InFeatures = model.OutFeatures
-            OutFeatures = int64 vocabSize
-            MaxLayers = 1
-            SyntheticMode = false
-            StrictLoad = true
-      }
-
-    let lmState = Nvfp4State.load lmCfg
-    try
-      match lmState.Layers with
-      | [] -> invalidOp "failed to load lm_head bundle for CE loss"
-      | layer :: _ ->
-        use dense0 = Qwen3Model.materializeMasterWeight layer.Bundle cfg.Device computeDtype
-        dense0.contiguous().clone(), vocabSize
-    finally
-      for l in lmState.Layers do
-        disposeBundle l.Bundle
+    use logits = projectToLogits outputHidden
+    let vocab = logits.shape.[logits.shape.Length - 1]
+    use logits2d = logits.reshape([| -1L; vocab |]).contiguous()
+    use targets2d = targetTokenIds.reshape([| -1L |]).to_type(torch.int64).``to``(device = logits2d.device)
+    if logits2d.shape.[0] <> targets2d.shape.[0] then
+      invalidArg
+        "targetTokenIds"
+        (sprintf "target length mismatch: expected=%d actual=%d" logits2d.shape.[0] targets2d.shape.[0])
+    torch.nn.functional.cross_entropy(logits2d, targets2d)
 
   let saveCheckpoint (cfg: TrainingConfig) (epoch: int) (globalStep: int) (model: Qwen3Nvfp4Model) =
     Directory.CreateDirectory(cfg.CheckpointDir) |> ignore
 
+    let namedParams = Qwen3Model.namedParameters model
     use _guard = torch.no_grad()
-    model.Layers
-    |> List.iteri (fun idx layer ->
+    namedParams
+    |> List.iteri (fun idx (_, param) ->
       let path = checkpointWeightPath cfg idx
-      use toSave = layer.MasterWeight.detach().to_type(torch.float32).cpu().contiguous().clone()
+      use toSave = param.detach().to_type(torch.float32).cpu().contiguous().clone()
       torch.save(toSave, path))
 
     let meta =
@@ -302,6 +283,8 @@ module Trainer =
         Epoch = epoch
         GlobalStep = globalStep
         LayerCount = model.Layers.Length
+        ParameterCount = namedParams.Length
+        ParameterNames = namedParams |> List.map fst |> List.toArray
         InFeatures = model.InFeatures
         OutFeatures = model.OutFeatures
         TimestampUtc = DateTime.UtcNow.ToString("O")
@@ -318,37 +301,44 @@ module Trainer =
       match JsonSerializer.Deserialize<CheckpointMeta>(File.ReadAllText(metaPath)) |> Option.ofObj with
       | None -> None
       | Some meta ->
-        if meta.LayerCount <> model.Layers.Length then
+        let namedParams = Qwen3Model.namedParameters model
+        let expectedCount =
+          if meta.ParameterCount > 0 then meta.ParameterCount else meta.LayerCount
+        if expectedCount <> namedParams.Length then
           raise (
             InvalidOperationException(
               sprintf
-                "checkpoint layer count mismatch: checkpoint=%d model=%d."
-                meta.LayerCount
-                model.Layers.Length
+                "checkpoint parameter count mismatch: checkpoint=%d model=%d."
+                expectedCount
+                namedParams.Length
             )
           )
 
         use _guard = torch.no_grad()
-        model.Layers
-        |> List.iteri (fun idx layer ->
+        namedParams
+        |> List.iteri (fun idx (name, param) ->
           let path = checkpointWeightPath cfg idx
           if not (File.Exists(path)) then
             raise (FileNotFoundException(sprintf "checkpoint layer file missing: %s" path))
 
           use loaded = torch.load(path)
           let loadedOnTarget =
-            if loaded.device.ToString() = layer.MasterWeight.device.ToString() then
+            if loaded.device.ToString() = param.device.ToString() then
               loaded
             else
-              loaded.``to``(layer.MasterWeight.device)
+              loaded.``to``(param.device)
 
           let loadedTyped =
-            if loadedOnTarget.dtype = layer.MasterWeight.dtype then
+            if loadedOnTarget.dtype = param.dtype then
               loadedOnTarget
             else
-              loadedOnTarget.to_type(layer.MasterWeight.dtype)
+              loadedOnTarget.to_type(param.dtype)
 
-          layer.MasterWeight.copy_(loadedTyped) |> ignore)
+          if meta.ParameterNames <> null && idx < meta.ParameterNames.Length then
+            let ckptName = meta.ParameterNames.[idx]
+            if not (String.Equals(ckptName, name, StringComparison.Ordinal)) then
+              printfn "[Train][warn] checkpoint parameter name mismatch at %d: ckpt=%s model=%s" idx ckptName name
+          param.copy_(loadedTyped) |> ignore)
 
         Some
           {
@@ -376,8 +366,10 @@ module Trainer =
     printfn "[Train] features in=%d out=%d layers=%d" model.InFeatures model.OutFeatures model.Layers.Length
     printfn "[Train] synthetic=%b useKvc=%b seqLen=%d" cfg.SyntheticMode cfg.UseKvCache cfg.SequenceLength
     printfn
-      "[Train] packedOpt=%b gradCkptChunk=%d stepChunkRows=%d offload(m/v/wg)=%b/%b/%b profileTrainStepVram=%b vramReport=%s"
+      "[Train] packedOpt=%b masterDType=%s optStateMode=%s gradCkptChunk=%d stepChunkRows=%d offload(m/v/wg)=%b/%b/%b profileTrainStepVram=%b vramReport=%s"
       cfg.UsePackedNvfp4Optimizer
+      cfg.MasterDType
+      cfg.OptimizerStateMode
       cfg.GradCheckpointChunk
       cfg.OptimizerStepChunkRows
       cfg.OffloadMVToCpu
@@ -394,16 +386,13 @@ module Trainer =
         Some(torch.optim.Adam(trainableParams, cfg.LearningRate, 0.9, 0.999, 1e-8, 0.0, false, false))
 
     let computeDtype =
-      if cfg.Device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then torch.float16 else torch.float32
-    let ceContextOpt =
-      if lossMode = LossMode.TokenCrossEntropy then
-        if not cfg.UseKvCache then
-          failwith "loss-mode=ce requires sequence input. Set --use-kvc true so training batch shape is [B,T,H]."
-        let lmWeight, vocabSize = loadDenseLmHeadForCe cfg model computeDtype
-        printfn "[Train] CE logits path enabled (dense lm_head, vocab=%d)." vocabSize
-        Some(lmWeight, vocabSize)
+      if cfg.Device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then
+        match cfg.MasterDType.Trim().ToLowerInvariant() with
+        | "bfloat16"
+        | "bf16" -> torch.bfloat16
+        | _ -> torch.float16
       else
-        None
+        torch.float32
 
     let masterDtype =
       match trainableParams with
@@ -411,17 +400,23 @@ module Trainer =
       | [] -> computeDtype
 
     let nameByKey = System.Collections.Generic.Dictionary<int, string>()
-    for layer in model.Layers do
-      nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(layer.MasterWeight)] <- layer.Name
-    for i = 0 to model.ExtraParameters.Length - 1 do
-      let p = model.ExtraParameters.[i]
-      nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(p)] <- sprintf "extra.%d" i
+    for name, p in Qwen3Model.namedParameters model do
+      nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(p)] <- name
 
     let nameOfParam (p: Parameter) =
       let key = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(p)
       match nameByKey.TryGetValue key with
       | true, name -> name
       | _ -> sprintf "param.%d" key
+
+    let stateMode =
+      match cfg.OptimizerStateMode.Trim().ToLowerInvariant() with
+      | "nvfp4"
+      | "fp4" -> PackedStateMode.Nvfp4
+      | "int8"
+      | "8bit"
+      | "8-bit" -> PackedStateMode.Int8
+      | other -> invalidArg "optimizer-state-mode" (sprintf "unsupported optimizer state mode: %s" other)
 
     let packedOptimizerStateOpt =
       if cfg.UsePackedNvfp4Optimizer then
@@ -434,6 +429,7 @@ module Trainer =
             Beta2 = 0.999f
             Eps = 1e-8f
             WeightDecay = 0.0f
+            StateMode = stateMode
             StepChunkRows = max 1L cfg.OptimizerStepChunkRows
             OffloadMVToCpu = cfg.OffloadMVToCpu
             OffloadWToCpu = cfg.OffloadWToCpu
@@ -442,7 +438,7 @@ module Trainer =
           }
         let st = Nvfp4Optimizer.create packedCfg trainableParams nameOfParam
         let w, m, v = Nvfp4Optimizer.stateSizeMiB st
-        printfn "[Train] packed NVFP4 state size (MiB): w=%d m=%d v=%d total=%d" w m v (w + m + v)
+        printfn "[Train] packed optimizer state=%s size (MiB): w=%d m=%d v=%d total=%d" cfg.OptimizerStateMode w m v (w + m + v)
         Some st
       else
         None
@@ -463,72 +459,82 @@ module Trainer =
       for epoch in startEpoch .. cfg.Epochs do
         let mutable epochLoss = 0.0f
         for stepInEpoch in 1 .. cfg.StepsPerEpoch do
-          let input, target =
-            createBatch
-              cfg.BatchSize
-              model.InFeatures
-              model.OutFeatures
-              cfg.SequenceLength
-              cfg.UseKvCache
-              cfg.Device
-              computeDtype
-          use inputTensor = input
-          use targetTensor = target
-          profileTrainStepVram cfg trainVramSamples epoch stepInEpoch globalStep "batch_ready"
-
-          match packedOptimizerStateOpt with
-          | Some _ -> Nvfp4Optimizer.zeroGrad trainableParams
-          | None ->
-            optimizerOpt |> Option.iter (fun optimizer -> optimizer.zero_grad())
-          profileTrainStepVram cfg trainVramSamples epoch stepInEpoch globalStep "zero_grad_done"
-
-          let useGradCheckpoint =
-            cfg.GradCheckpointChunk > 0
-            && inputTensor.shape.Length = 3
-            && cfg.GradCheckpointChunk < int inputTensor.shape.[1]
-            && not cfg.UseKvCache
-
           let lossValue =
-            if useGradCheckpoint then
-              if lossMode <> LossMode.ScalarL1 then
-                failwith "loss-mode=ce is not yet wired with grad-checkpoint recompute path. Set --grad-ckpt-chunk 0."
-              backwardWithSequenceRecompute
-                model
-                inputTensor
-                targetTensor
-                cfg.GradCheckpointChunk
-                computeDtype
-            else
-              use output =
-                if cfg.UseKvCache && model.Blocks.Length > 0 then
-                  use cache = Qwen3Model.createKvCache model
-                  Qwen3Model.forwardWithKvCache model cache inputTensor (Some computeDtype)
-                else
-                  Qwen3Model.forward model inputTensor (Some computeDtype)
-              match lossMode with
-              | LossMode.ScalarL1 ->
+            match lossMode with
+            | LossMode.ScalarL1 ->
+              let input, target =
+                createBatch
+                  cfg.BatchSize
+                  model.InFeatures
+                  model.OutFeatures
+                  cfg.SequenceLength
+                  cfg.UseKvCache
+                  cfg.Device
+                  computeDtype
+              use inputTensor = input
+              use targetTensor = target
+              profileTrainStepVram cfg trainVramSamples epoch stepInEpoch globalStep "batch_ready"
+
+              match packedOptimizerStateOpt with
+              | Some _ -> Nvfp4Optimizer.zeroGrad trainableParams
+              | None ->
+                optimizerOpt |> Option.iter (fun optimizer -> optimizer.zero_grad())
+              profileTrainStepVram cfg trainVramSamples epoch stepInEpoch globalStep "zero_grad_done"
+
+              let useGradCheckpoint =
+                cfg.GradCheckpointChunk > 0
+                && inputTensor.shape.Length = 3
+                && cfg.GradCheckpointChunk < int inputTensor.shape.[1]
+                && not cfg.UseKvCache
+
+              if useGradCheckpoint then
+                backwardWithSequenceRecompute
+                  model
+                  inputTensor
+                  targetTensor
+                  cfg.GradCheckpointChunk
+                  computeDtype
+              else
+                use output =
+                  if cfg.UseKvCache && model.Blocks.Length > 0 then
+                    use cache = Qwen3Model.createKvCache model
+                    Qwen3Model.forwardWithKvCache model cache inputTensor (Some computeDtype)
+                  else
+                    Qwen3Model.forward model inputTensor (Some computeDtype)
                 use loss = scalarLoss output targetTensor
                 loss.backward()
                 use lossForRead = loss.to_type(torch.float32).cpu()
                 lossForRead.item<float32>()
-              | LossMode.TokenCrossEntropy ->
-                if output.shape.Length <> 3 then
-                  failwithf "loss-mode=ce expects output rank 3 [B,T,H], got rank=%d" output.shape.Length
-                let batch = int output.shape.[0]
-                let seq = int output.shape.[1]
-                let nTargets = batch * seq
-                let lmWeight, vocabSize =
-                  match ceContextOpt with
-                  | Some x -> x
-                  | None -> failwith "internal error: CE context was not initialized"
-                use targetIdsTensor =
-                  torch.randint(int64 vocabSize, [| int64 nTargets |], dtype = torch.int64, device = "cpu")
-                let targetIds = targetIdsTensor.data<int64>().ToArray() |> Array.map int
-                let projectToLogits (hidden: torch.Tensor) = torch.nn.functional.linear(hidden, lmWeight)
-                use loss = tokenCrossEntropyLoss projectToLogits output targetIds
-                loss.backward()
-                use lossForRead = loss.to_type(torch.float32).cpu()
-                lossForRead.item<float32>()
+
+            | LossMode.TokenCrossEntropy ->
+              if cfg.GradCheckpointChunk > 0 then
+                failwith "loss-mode=ce is not yet wired with grad-checkpoint recompute path. Set --grad-ckpt-chunk 0."
+              let ceSeq = max 2L cfg.SequenceLength
+              use tokenIds =
+                torch.randint(int64 model.VocabSize, [| cfg.BatchSize; ceSeq + 1L |], dtype = torch.int64, device = cfg.Device)
+              use inputIds = tokenIds.narrow(1L, 0L, ceSeq).contiguous()
+              use targetIds = tokenIds.narrow(1L, 1L, ceSeq).contiguous()
+              use inputEmb = Qwen3Model.embedTokenIds model inputIds
+              profileTrainStepVram cfg trainVramSamples epoch stepInEpoch globalStep "batch_ready"
+
+              match packedOptimizerStateOpt with
+              | Some _ -> Nvfp4Optimizer.zeroGrad trainableParams
+              | None ->
+                optimizerOpt |> Option.iter (fun optimizer -> optimizer.zero_grad())
+              profileTrainStepVram cfg trainVramSamples epoch stepInEpoch globalStep "zero_grad_done"
+
+              use output =
+                if cfg.UseKvCache && model.Blocks.Length > 0 then
+                  use cache = Qwen3Model.createKvCache model
+                  Qwen3Model.forwardWithKvCache model cache inputEmb (Some computeDtype)
+                else
+                  Qwen3Model.forward model inputEmb (Some computeDtype)
+              use outputNorm = InferenceBridge.rmsNormWeighted output model.FinalNorm model.RmsNormEps
+              let projectToLogits (hidden: torch.Tensor) = torch.nn.functional.linear(hidden, model.LmHead)
+              use loss = tokenCrossEntropyLossTensor projectToLogits outputNorm targetIds
+              loss.backward()
+              use lossForRead = loss.to_type(torch.float32).cpu()
+              lossForRead.item<float32>()
           profileTrainStepVram cfg trainVramSamples epoch stepInEpoch globalStep "backward_done"
 
           match packedOptimizerStateOpt with
@@ -553,6 +559,5 @@ module Trainer =
         printfn "[Train] no epoch executed (resume epoch already beyond configured epochs)."
     finally
       tryWriteTrainStepVramReport cfg trainVramSamples
-      ceContextOpt |> Option.iter (fun (w, _) -> w.Dispose())
       packedOptimizerStateOpt |> Option.iter (fun st -> (st :> IDisposable).Dispose())
       optimizerOpt |> Option.iter (fun optimizer -> optimizer.Dispose())
