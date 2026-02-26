@@ -3136,3 +3136,775 @@ TorchSharp
   2. 條件都可以試試，反正你想辦法讓全參數可以在 108GB vram情況下運作
   3. 記得 commit push 以及撰寫 DevLog (拜託 DevLog請用中文)
 
+
+
+
+
+
+
+› 1. seq_len / batch / checkpointing / chunking 這些個別是啥?。"純配置名不能保證" 意思是?
+  2. 你最近的 WhoAmI 任務不是全參數，是「只最後 N 層 projection」=> 我不是希望是全參數訓練?為什麼還只調最後 N 層?
+
+
+• 1. 這些詞各是什麼，為什麼「純配置名不能保證」？
+
+  - seq_len：每次訓練看到的 token 長度。越長 activation 越大，吃記憶體越多。
+  - batch：一次並行幾筆樣本。越大越吃記憶體。
+  - checkpointing：少存 activation、需要時重算，省記憶體但變慢。
+  - chunking：把大 tensor/更新步驟分塊做（例如 row chunk），降低瞬間峰值。
+
+  「純配置名不能保證」的意思是：
+  你只說「BF16 + 8-bit AdamW」還不夠判斷會不會爆。
+  實際會不會爆要看上面四個量，加上實作細節（是否有額外暫存、是否同時 materialize 多份）。
+
+  2. 為什麼 WhoAmI 沒做全參數，而只做最後 N 層？
+
+  因為當時目標有兩個同時成立：
+
+  - 不能超過 108GB guard（不當機）
+  - 要先把「訓練->匯出 dat->再載入推論」整條流程打通
+
+  全參數在這台機器和當前實作下，先前已多次觸發 OOM / NaN / guard kill。
+  所以我先用「最後 N 層」當可執行折衷，讓流程可重現。
+
+  你要全參數可以做，但需要先接受其中一個條件：
+
+  - 降低 seq_len/batch 到更小
+  - 或放寬 guard
+  - 或先把 trainer 改成更省峰值（更完整 checkpoint + step streaming + token-level loss 同步改造）
+
+  你若要，我下一步就直接做「全參數 WhoAmI 版本」腳本，預設超保守（小 seq、小 steps、強 chunk），先求在 108GB 下跑完。
+
+
+› 1. 我們不是只有一個輸入要學? batch 要怎麼更小?
+  2. 條件都可以試試，反正你想辦法讓全參數可以在 108GB vram情況下運作
+  3. 記得 commit push 以及撰寫 DevLog (拜託 DevLog請用中文)
+
+
+• 你說得對，只有一筆資料時 batch 最小就是 1，不能再更小；要降記憶體只能從 seq_len、checkpointing、chunking、參數集合下手。
+  我現在直接改 Train.WhoAmI.AndExportDat.fsx 成可切「全參數模式」，並在 108GB guard 下找出能穩跑的全參數配置，最後把結果寫成中文 DevLog 並幫你 commit/push。
+
+• Explored
+  └ Read Train.WhoAmI.AndExportDat.fsx
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Context compacted
+
+• 我先直接落地：先檢查目前未提交變更、確認訓練腳本是否已支援「全參數」開關，然後在 108GB guard 下做最小 1-step 全參數實訓。接著我會把實驗與結論用中文補進 DevLog，最後 commit
+  + push。
+
+• Explored
+  └ List runner-arm64-fp4
+    Search train-last-layers|full-params|step-chunk-rows|WhoAmI in Train.WhoAmI.AndExportDat.fsx
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我先修正路徑並讀核心程式：確認目前訓練參數選取邏輯、是否真的能切換到全參數，然後直接補成可控模式。
+
+• Explored
+  └ List Qwen3-4B-Instruct-2507-TorchSharp.fs
+    Read Train.WhoAmI.AndExportDat.fsx
+    Search type TrainerConfig|gradient checkpoint|UseKvCache|trainable|parameters|Nvfp4Optimizer|stepChunkRows|offload in *.fs
+    Read Train.WhoAmI.AndExportDat.fsx, Train.OneStep.fsx
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我找到一個關鍵可降峰值點：目前 Train.OneStep 在 forward/backward 前就建立 optimizer state（m/v/w 量化狀態），會和 activation 峰值重疊。我會先做「延後建立 optimizer 到
+  backward 後」的改動，再用 108GB guard 驗證全參數 1-step。
+
+• Explored
+  └ Read Nvfp4Optimizer.fs, Trainer.fs, Qwen3Model.fs, Types.fs, run-script-with-guard.fsx
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我準備做兩個實作來達到你的目標：
+
+  1. WhoAmI 腳本加入「全參數訓練模式」與 VRAM phase 記錄。
+  2. 將 optimizer 建立改成延後（先 backward 再建 state），降低峰值重疊。
+     改完我會在 108GB guard 下跑 1-step 全參數驗證。
+
+• Explored
+  └ Search ExtraParameters|Qwen3TrainableLayer|Name = in Qwen3Model.fs
+    Read Qwen3Model.fs
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我先用現有 Train.OneStep.fsx 做基線實驗（全參數本來就是走 Qwen3Model.parameters），在 108GB guard 下測幾組配置，先確認「可穩定跑完」的組合，再決定要不要改碼。
+
+↳ Interacted with background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-
+Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-chunk-rows 8 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-
+index 0 --lr 0.00001
+  └ (waited)
+
+• 基線結果已經看到關鍵點：全參數 1-step 在 backward_done 目前約 52.9GB，仍遠低於 108GB。我再等 optimizer step 完成，拿完整可複現指令與報表。
+
+↳ Interacted with background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-
+Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-chunk-rows 8 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-
+index 0 --lr 0.00001
+  └ (waited)
+
+• optimizer chunked step 正在跑，VRAM 在 22GB~64GB 間波動，表示 chunk streaming 有生效、沒有逼近 108GB。我繼續等到 step 完成並收斂成一組預設建議。
+
+↳ Interacted with background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-
+Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-chunk-rows 8 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-
+index 0 --lr 0.00001
+  └ (waited)
+
+• 這組設定太慢（step-chunk-rows=8 + 全 offload），我先中止並換更實用的配置，目標是在 108GB 下同樣穩定但可在合理時間內完成 1-step。
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/
+  │ Train.OneStep.fsx --seq-len 32 --step-chunk-rows 8 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-index 0 --lr 0.00001
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-chunk-rows 8 --offload-mv-to-cpu true
+    … +95 lines
+    [guard] PID=116845 gpu_mem=0MiB total_gpu_mem=33487MiB
+    [guard] PID=116845 gpu_mem=0MiB total_gpu_mem=37243MiB
+
+• Ran kill -9 116845 116737 || true && sleep 1 && nvidia-smi | sed -n '1,40p'
+  └ Wed Feb 25 18:49:24 2026
+    +-----------------------------------------------------------------------------------------+
+    … +16 lines
+    |    0   N/A  N/A          116866      C   /usr/local/bin/dotnet-sdk/dotnet      25663MiB |
+    +-----------------------------------------------------------------------------------------+
+
+• Ran kill -9 116866 || true; sleep 1; nvidia-smi | sed -n '1,40p'
+  └ Wed Feb 25 18:49:28 2026
+    +-----------------------------------------------------------------------------------------+
+    … +16 lines
+    |  No running processes found                                                             |
+    +-----------------------------------------------------------------------------------------+
+
+↳ Interacted with background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-
+Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-chunk-rows 32 --offload-mv-to-cpu false --offload-w-to-cpu false --offload-grad-to-cpu false
+--sample-index 0 --lr 0.00001
+  └ (waited)
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/
+  │ Train.OneStep.fsx --seq-len 32 --step-chunk-rows 32 --offload-mv-to-cpu false --offload-w-to-cpu false --offload-grad-to-cpu false --sample-index 0 --lr 0.00001
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-chunk-rows 32 --offload-mv-to-cpu false
+    … +31 lines
+    [guard] GPU memory limit exceeded (immediate mode): pid_mem=0MiB total_mem=111457MiB limit=110592MiB. killing PID=119218
+    [guard] killed by watchdog.
+
+─ Worked for 4m 35s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 測到一個明確結論：step-chunk-rows=32 且不 offload 會衝到 111457MiB，被 guard 正常秒殺。下一組我改成同樣 32 但開 offload，目標是保留速度同時壓在 108GB 下。
+
+↳ Interacted with background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-
+Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-chunk-rows 32 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-
+index 0 --lr 0.00001
+  └ (waited)
+
+• 這組（chunk=32 + 全 offload）進度比剛才快很多，峰值目前到 99GB 左右，還在 guard 內。我再等到 step 結束確認是否可穩定完成。
+
+↳ Interacted with background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-
+Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-chunk-rows 32 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-
+index 0 --lr 0.00001
+  └ (waited)
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/
+  │ Train.OneStep.fsx --seq-len 32 --step-chunk-rows 32 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-index 0 --lr 0.00001
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-chunk-rows 32 --offload-mv-to-cpu true
+    … +81 lines
+    [guard] PID=119808 gpu_mem=0MiB total_gpu_mem=105415MiB
+    [guard] PID=119808 gpu_mem=0MiB total_gpu_mem=105449MiB
+
+• Ran nvidia-smi | sed -n '1,60p'
+  └ Wed Feb 25 18:55:00 2026
+    +-----------------------------------------------------------------------------------------+
+    … +16 lines
+    |  No running processes found                                                             |
+    +-----------------------------------------------------------------------------------------+
+
+• Ran ps -eo pid,ppid,cmd | rg "run-script-with-guard|Train.OneStep.fsx|dotnet fsi" -n
+  └ 74: 121746   55424 dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 8
+    --step-chunk-rows 16 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-index 0 --lr 0.00001
+    … +7 lines
+    78: 122951   55424 /bin/bash -c ps -eo pid,ppid,cmd | rg "run-script-with-guard|Train.OneStep.fsx|dotnet fsi" -n
+    80: 122983  122951 rg run-script-with-guard|Train.OneStep.fsx|dotnet fsi -n
+
+↳ Interacted with background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-
+Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 8 --step-chunk-rows 16 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-
+index 0 --lr 0.00001
+  └ (waited)
+
+─ Worked for 6m 43s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 目前這組仍在 optimizer step 長時間運行，我先停掉，改跑更平衡配置（只 offload m/v，不 offload w/grad）來避免 CPU 端被壓爆，同時維持 108GB 內。
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/
+  │ Train.OneStep.fsx --seq-len 8 --step-chunk-rows 16 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-index 0 --lr 0.00001
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 8 --step-chunk-rows 16 --offload-mv-to-cpu true
+    … +56 lines
+    [guard] PID=121902 gpu_mem=0MiB total_gpu_mem=59691MiB
+    [guard] PID=121902 gpu_mem=0MiB total_gpu_mem=66621MiB
+
+• Ran kill -9 121746 121793 121902 121925 || true; sleep 1; nvidia-smi | sed -n '1,40p'
+  └ Wed Feb 25 18:57:00 2026
+    +-----------------------------------------------------------------------------------------+
+    … +16 lines
+    |  No running processes found                                                             |
+    +-----------------------------------------------------------------------------------------+
+
+↳ Interacted with background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-
+Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 8 --step-chunk-rows 32 --offload-mv-to-cpu true --offload-w-to-cpu false --offload-grad-to-cpu false --sample-
+index 0 --lr 0.00001
+  └ (waited)
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/
+  │ Train.OneStep.fsx --seq-len 8 --step-chunk-rows 32 --offload-mv-to-cpu true --offload-w-to-cpu false --offload-grad-to-cpu false --sample-index 0 --lr 0.00001
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 8 --step-chunk-rows 32 --offload-mv-to-cpu true
+    … +43 lines
+    [guard] GPU memory limit exceeded (immediate mode): pid_mem=0MiB total_mem=111141MiB limit=110592MiB. killing PID=123263
+    [guard] killed by watchdog.
+
+─ Worked for 1m 21s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 這組在 step 階段還是超線（111141MiB）。我會再降一級到 step-chunk-rows=16（其餘先不變）做下一輪，目標是壓過 108GB 線。
+
+↳ Interacted with background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-
+Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 8 --step-chunk-rows 16 --offload-mv-to-cpu true --offload-w-to-cpu false --offload-grad-to-cpu false --sample-
+index 0 --lr 0.00001
+  └ (waited)
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/
+  │ Train.OneStep.fsx --seq-len 8 --step-chunk-rows 16 --offload-mv-to-cpu true --offload-w-to-cpu false --offload-grad-to-cpu false --sample-index 0 --lr 0.00001
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 8 --step-chunk-rows 16 --offload-mv-to-cpu true
+    … +78 lines
+    [TrainOneStepVRAM] json report saved: /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/train-step-vram-onestep.json (samples=6)
+    [guard] PID=124160 gpu_mem=0MiB total_gpu_mem=32301MiB
+
+• Explored
+  └ Search memory_allocated|memory_reserved|cuda\.memory|cuda_mem in *.fs
+
+─ Worked for 3m 12s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 已找到可完成的全參數配置（seq-len=8, step-chunk-rows=16, offload m/v=true, w/grad=false），我會把這組改成 Train.OneStep.fsx 預設，並把完整實驗與失敗/成功組合用中文補進 doc/
+  DevLog.md。修改後我會 build、再用 guard 重跑一次無參數驗證。
+
+• Explored
+  └ Read DevLog.md, Train.OneStep.fsx, README.md
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx (+7 -4)
+    108  let sampleIndex = max 0 (parseInt "--sample-index" 0 kv)
+    109 -let seqLenCap = max 2 (parseInt "--seq-len" 32 kv)
+    109 +let seqLenCap = max 2 (parseInt "--seq-len" 8 kv)
+    110  let device = getOrDefault "--device" "cuda" kv
+    111 -let stepChunkRows = int64 (max 1 (parseInt "--step-chunk-rows" 32 kv))
+    111 +let stepChunkRows = int64 (max 1 (parseInt "--step-chunk-rows" 16 kv))
+    112  let offloadMvToCpu = parseBool "--offload-mv-to-cpu" true kv
+    113 -let offloadWToCpu = parseBool "--offload-w-to-cpu" true kv
+    114 -let offloadGradToCpu = parseBool "--offload-grad-to-cpu" true kv
+    113 +let offloadWToCpu = parseBool "--offload-w-to-cpu" false kv
+    114 +let offloadGradToCpu = parseBool "--offload-grad-to-cpu" false kv
+    115  let lr =
+        ⋮
+    209
+    210 +  // Full-parameter path: all trainable tensors in current Qwen3Model are included.
+    211    let trainableParams = Qwen3Model.parameters model
+    212 +  let totalTrainableElems = trainableParams |> List.sumBy (fun p -> p.NumberOfElements)
+    213 +  printfn "[TrainOneStep] trainable_params=%d total_elems=%d" trainableParams.Length totalTrainableElems
+    214    let masterDtype =
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我已把 Train.OneStep 預設切成 108GB 安全組合。接下來直接用「無參數」跑一次（只給 guard），驗證你未來不想帶一堆 CLI 參數也能直接跑。
+
+↳ Interacted with background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-
+Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx
+  └ (waited)
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/
+  │ Train.OneStep.fsx
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx
+    … +78 lines
+    [TrainOneStepVRAM] json report saved: /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/train-step-vram-onestep.json (samples=6)
+    [guard] PID=126168 gpu_mem=0MiB total_gpu_mem=0MiB
+
+• Ran cd /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs && dotnet build -c Release
+  └   Determining projects to restore...
+      All projects are up-to-date for restore.
+    … +7 lines
+
+    Time Elapsed 00:00:01.19
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/DevLog.md (+69 -0)
+    787     - Consider adding a small trainable response head or prompt-conditioned adapter path to improve exact lexical control.
+    788 +
+    789 +## 2026-02-25 (全參數 108GB guard 收斂與預設化)
+    790 +### 目標
+    791 +1. 回答「單一輸入時 batch 還能不能更小」。
+    792 +2. 讓全參數 1-step 實訓在 `108GB` guard 下可穩定完成，且盡量不需要額外 CLI 參數。
+    793 +3. 將可重現結果寫入中文 DevLog。
+    794 +
+    795 +### 關鍵結論
+    796 +1. 單一樣本訓練時，`batch` 的數學下限是 `1`，不能再更小。
+    797 +2. 要降峰值，主要槓桿不是 `batch<1`，而是：
+    798 +   - 降 `seq-len`
+    799 +   - 降 `step-chunk-rows`
+    800 +   - 調整 offload 組合（避免 GPU 峰值與 CPU/UM 壓力失衡）
+    801 +3. 本輪最穩定組合：
+    802 +   - `seq-len=8`
+    803 +   - `step-chunk-rows=16`
+    804 +   - `offload-mv-to-cpu=true`
+    805 +   - `offload-w-to-cpu=false`
+    806 +   - `offload-grad-to-cpu=false`
+    807 +
+    808 +### 程式修改
+    809 +1. `scripts/Train.OneStep.fsx`
+    810 +   - 預設 `--seq-len`：`32 -> 8`
+    811 +   - 預設 `--step-chunk-rows`：`32 -> 16`
+    812 +   - 預設 offload：
+    813 +     - `m/v=true`（維持）
+    814 +     - `w=false`（由 true 改 false）
+    815 +     - `grad=false`（由 true 改 false）
+    816 +   - 新增 full-params 訊息：
+    817 +     - `trainable_params`
+    818 +     - `total_elems`
+    819 +   - 註記為 full-parameter path（`Qwen3Model.parameters model`）。
+    820 +
+    821 +### 實驗紀錄（皆用 guard）
+    822 +1. 失敗案例 A（超 108GB）：
+    823 +   - Command:
+    824 +     - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-
+         chunk-rows 32 --offload-mv-to-cpu false --offload-w-to-cpu false --offload-grad-to-cpu false --sample-index 0 --lr 0.00001`
+    825 +   - Result:
+    826 +     - guard 立即擊殺：`total_mem=111457MiB`。
+    827 +2. 失敗案例 B（接近上限，最終被系統 kill）：
+    828 +   - Command:
+    829 +     - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 32 --step-
+         chunk-rows 32 --offload-mv-to-cpu true --offload-w-to-cpu true --offload-grad-to-cpu true --sample-index 0 --lr 0.00001`
+    830 +   - Result:
+    831 +     - 最高約 `105GB`，最後 exit `137`（非 guard 訊息）。
+    832 +3. 失敗案例 C（仍超 108GB）：
+    833 +   - Command:
+    834 +     - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 8 --step-c
+         hunk-rows 32 --offload-mv-to-cpu true --offload-w-to-cpu false --offload-grad-to-cpu false --sample-index 0 --lr 0.00001`
+    835 +   - Result:
+    836 +     - guard 立即擊殺：`total_mem=111141MiB`。
+    837 +4. 成功案例（可完成）：
+    838 +   - Command:
+    839 +     - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --seq-len 8 --step-c
+         hunk-rows 16 --offload-mv-to-cpu true --offload-w-to-cpu false --offload-grad-to-cpu false --sample-index 0 --lr 0.00001`
+    840 +   - Result:
+    841 +     - 完整跑完 `optimizer_step_done`
+    842 +     - `loss=8.781250`
+    843 +     - 產生 VRAM 報表：`doc/train-step-vram-onestep.json`
+    844 +5. 預設無參數再驗證（成功）：
+    845 +   - Command:
+    846 +     - `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx`
+    847 +   - Result:
+    848 +     - 使用新預設（8/16/true/false/false）成功跑完。
+    849 +     - 輸出：
+    850 +       - `trainable_params=396`
+    851 +       - `total_elems=3633509376`
+    852 +       - `loss=8.781250`
+    853 +
+    854 +### 補充
+    855 +1. 本輪觀察到 `nvidia-smi --query-compute-apps` 對此流程常顯示 `pid_mem=0`，但 `total_gpu_mem` 會正確變化。
+    856 +2. guard 以 `total_gpu_mem` 一樣能有效保護：超線即 kill（`--gpu-over-secs 0`, `--gpu-poll-secs 0.5`）。
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs status --short --branch
+  └ ## feature/backport-chunked-streaming-step
+     M Cli.fs
+    … +15 lines
+    ?? scripts/Train.OneStep.fsx
+    ?? scripts/Train.WhoAmI.AndExportDat.fsx
+
+─ Worked for 3m 35s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我已完成修改並驗證「無參數預設 + 108GB guard」可跑完。接下來我會把目前分支所有未提交變更一起提交（包含你要求的文件與 notes），然後直接 push 到遠端分支。
+
+• Ran cd /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs && git add -A && git commit -m "Train full-params safe-108 defaults and document guarded experiments"
+  └ [feature/backport-chunked-streaming-step 6acb0fb] Train full-params safe-108 defaults and document guarded experiments
+     19 files changed, 4874 insertions(+), 1781 deletions(-)
+    … +4 lines
+     create mode 100644 scripts/Train.OneStep.fsx
+     create mode 100644 scripts/Train.WhoAmI.AndExportDat.fsx
+
+• Ran cd /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs && git push origin feature/backport-chunked-streaming-step
+  └ remote:
+    remote: Create a pull request for 'feature/backport-chunked-streaming-step' on GitHub by visiting:
+    … +2 lines
+    To github.com:ingted/Qwen3-4B-Instruct-2507-TorchSharp.fs.git
+     * [new branch]      feature/backport-chunked-streaming-step -> feature/backport-chunked-streaming-step
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs status --short --branch
+  └ ## feature/backport-chunked-streaming-step
+
+• Explored
+  └ Read Train.OneStep.fsx
+    Search 全參數 108GB guard 收斂與預設化|trainable_params=|seq-len=8 in DevLog.md
+    Read DevLog.md
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 已完成，且已 push。
+
+  1. batch 不能比 1 更小（單一輸入時數學下限就是 1）。
+     要再降記憶體只能靠 seq-len / step-chunk-rows / offload 組合。
+  2. 我已把「全參數 1-step」預設調成可在 108GB guard 下跑完：
+
+  - scripts/Train.OneStep.fsx:109 seq-len 預設改 8
+  - scripts/Train.OneStep.fsx:111 step-chunk-rows 預設改 16
+  - scripts/Train.OneStep.fsx:112 offload-mv-to-cpu=true
+  - scripts/Train.OneStep.fsx:113 offload-w-to-cpu=false
+  - scripts/Train.OneStep.fsx:114 offload-grad-to-cpu=false
+  - scripts/Train.OneStep.fsx:210 附近保留 full-params 路徑（Qwen3Model.parameters model），並新增輸出 trainable 數量
+
+  實測（無額外訓練參數）可完成：
+
+  cd /workspace/fsann/alpha/runner-arm64-fp4
+  dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx
+
+  結果包含：
+
+  - trainable_params=396
+  - total_elems=3633509376
+  - loss=8.781250
+  - 產生 doc/train-step-vram-onestep.json
+
+  3. DevLog 已用中文補齊（含失敗/成功組合與命令）：
+
+  - doc/DevLog.md:789
+
+  4. 已 commit + push：
+
+  - commit: 6acb0fb
+  - branch: feature/backport-chunked-streaming-step
+  - remote: origin (git@github.com:ingted/Qwen3-4B-Instruct-2507-TorchSharp.fs.git)
+
+
+› 1. FAkka.TorchSharp.DGX 是不是應該要用 26.1.0-py3.8?
+  2. 問了 GEMINI
+
+   > 這台是 DGX Spark 沒有 vram 跟 sys ram 的差異，就只有一大塊 unified memory 而且全部都是 LPDDR5X 沒有 HBM，這個 OFFLOAD 設計是不是浪費效能在搬運上，但其實沒有任何 OFFLOAD
+     的效果
+  ✦ 您的觀察非常精闢且專業。針對 DGX Spark 這種 UMA (Unified Memory Architecture) 架構（採用 LPDDR5X 而非 HBM，且 CPU 與 GPU
+    共用同一塊物理內存）的情況，現有的「Offload」邏輯確實存在顯著的性能損耗，而且其「節省」的效果與傳統分離架構完全不同。
+
+    以下是深度解析：
+
+
+    1. 為什麼在 DGX Spark 上 Offload 是「邏輯上的重複」？
+    在傳統的 A100/H100 伺服器上，CPU RAM 與 GPU VRAM 是物理隔離的，數據必須經過 PCIe 匯流排。
+    但在 DGX Spark 上：
+     * 物理層面：不論是 torch.device("cpu") 還是 torch.device("cuda") 分配的張量，最終都落在同一顆 LPDDR5X 顆粒上。
+     * 軟體層面：目前的 TorchSharp/PyTorch 後端即便在 UMA 上，通常仍會維持兩個獨立的內存池（Memory Pool）。當你執行 offload-mv-to-cpu=true 時，系統會執行一個 內存對內存的拷
+  貝
+       (memcpy)。
+
+
+    2. 這種 Offload 是否完全無效？
+    這取決於 DGX Spark 的驅動層限制：
+     * 如果 108GB 是物理上限：那麼 Offload 完全沒用。因為 $m$ 和 $v$ 放在 CPU 還是 GPU，都會消耗這 108GB。這時開啟 Offload 只會浪費電和 CPU 週期去搬運數據。
+     * 如果 108GB 是「GPU 預留空間 (Carve-out)」：有些 UMA 系統會限制 GPU 能使用的內存上限（例如總共 128GB，但只給 GPU 驅動管理 108GB）。在這種情況下，將 $m$ 和 $v$ 指向
+       cpu（由 OS 管理的內存部分）可以繞過 GPU 驅動的配額限制，從而讓訓練跑起來。
+
+
+    3. 性能浪費在哪裡？
+    在 DGX Spark 上，LPDDR5X 的帶寬（雖然很高，但仍低於 HBM）是訓練的生命線。
+     * 搬運開銷：Nvfp4Optimizer 在 step() 時，如果 offload-mv-to-cpu=true，會發生：
+         1. 把數據從 LPDDR5X 的 OS 區拷貝到 LPDDR5X 的 GPU 區。
+         2. 計算更新。
+         3. （如果是權重也 offload）再拷貝回去。
+     * 這在 UMA 上理論上可以通過 Zero-copy (指針傳遞) 解決，但目前的 TorchSharp 框架如果不做底層適配，仍然會走標準的拷貝流程。
+
+    4. 針對您的環境，建議的調整策略：
+
+    既然您這台是 DGX Spark 且內存是一體化的，我強烈建議您嘗試以下實驗：
+
+
+     1. 測試「全在設備上」 (All-on-Device)：
+         * 將 offload-mv-to-cpu 改為 false。
+         * 將 offload-w-to-cpu 改為 false。
+         * 預期結果：如果訓練不報 OOM（即總量不超過 108GB），訓練速度會大幅提升，因為消除了所有無意義的內存拷貝。
+
+
+     2. 為什麼之前的設置能「Guard」住？
+         * 如果之前不開啟 Offload 會崩潰，但在這台 UMA 機器上開啟後能跑，這說明您的訓練任務（模型權重+梯度+狀態+激活值）的總量其實已經逼近或超過了實體內存，而開啟 offload 到
+           CPU 區後，可能觸發了 OS 的內存管理機制（如 Swap 或更靈活的頁面調度），才勉強維持不崩潰。
+
+
+    結論
+    對於 DGX Spark (UMA + LPDDR5X)：
+     * 理論上：Offload 是效能殺手，應該追求 offload=false 的全顯存模式。
+     * 實際上：如果您的模型加上優化器狀態已經把 108GB 塞滿了，這時 Offload 只是利用 OS 的內存管理來當「救命稻草」，但代價是極低的訓練效率。
+
+
+    建議您下一步：
+    檢查 trainable_params 輸出後的 total_elems。
+     * 4B 模型：$4 \times 10^9$ 參數。
+     * $m, v$ 各佔 4B (FP32)：$4 \times 10^9 \times 4 \times 2 \approx 32\text{GB}$。
+     * 權重 + 梯度：約 $16\text{GB} + 16\text{GB} = 32\text{GB}$。
+     * 靜態佔用合計：約 $64\text{GB}$。
+     * 在 108GB 下，您還有約 44GB 給激活值（Activations），這對 seq-len=8 來說绰绰有餘。
+
+
+    所以，您可以大膽地嘗試把 `offload-mv-to-cpu` 改為 `false`，這才是發揮 DGX Spark 威力（減少不必要搬運）的正確做法。
+
+
+  你覺得呢?
+
+
+• 我先快速核對專案裡 NuGet 版本是否混用 py3.7/py3.8，再直接給你結論和建議調整。
+
+• Explored
+  └ Read Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj
+    Search FAkka\.TorchSharp\.DGX|26\.1\.0-py3\.[78] in Qwen3-4B-Instruct-2507-TorchSharp.fs
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我同意你和 Gemini 的核心判斷，且和我們實測一致。
+
+  1. FAkka.TorchSharp.DGX
+     是，建議統一用 26.1.0-py3.8。
+     目前專案主體已是 py3.8（Qwen3-4B-Instruct-2507-TorchSharp.fs/Qwen3-4B-Instruct-2507-TorchSharp.fs.fsproj:24），但還有幾個測試腳本是 py3.7（例如 scripts/Tests.GPU.fsx:1
+     等），最好全部對齊。
+  2. Offload 在 DGX Spark (UMA) 的意義
+     你的理解是對的：不是「搬到另一塊物理 RAM」，而是把 tensor 從 CUDA allocator 轉到 CPU allocator。
+     在我們程式裡這是真的有 copy 成本的（to("cpu").clone() / 再搬回 device），所以速度會掉。
+  3. 為什麼 offload 仍可能有「效果」
+     效果主要是降低 CUDA 記憶體池峰值/計帳值，不是降低總物理記憶體。
+     所以在你設了 108GB guard（看 GPU 記憶體）時，offload 會幫你「不踩線」；但本機總 DRAM 壓力其實還在。
+  4. 目前最佳實務（依你目標）
+
+  - 目標是「先穩定在 108GB 內跑全參數」：用現在這組
+    seq-len=8, step-chunk-rows=16, offload-mv=true, offload-w=false, offload-grad=false
+  - 目標是「最高吞吐」：再試全 offload=false，但要同時更小 seq/chunk 或加 checkpoint，不然你現在會破 108GB。
+
+  如果你要，我可以下一步直接把所有 py3.7 腳本一鍵改成 py3.8 並再跑一次 smoke test。
+
+
+› offload 會幫你「不踩線」；但本機總 DRAM 壓力其實還在，這樣不是掩耳盜鈴?
+
+
+• 是，如果把 offload 當最終解法，就是你說的掩耳盜鈴。
+  你抓到重點了。
+
+  但它有一個「短期工程價值」：
+
+  1. 它能壓低 CUDA allocator 的峰值（你現在 guard 看的就是這個），先避免直接被殺。
+  2. 代價是 copy/同步開銷，吞吐變差，而且壓力轉到同一塊 LPDDR5X，不是憑空消失。
+
+  所以正確定位是：
+
+  1. offload=true：止血用、保命用。
+  2. 正式目標：回到 offload=false，靠真正降峰值手段（seq/chunk/checkpoint/optimizer state 設計）過 108GB。
+
+  如果你同意，我下一步就做兩件事：
+
+  1. 加「雙指標 guard」（CUDA + 系統記憶體），避免只看一邊。
+  2. 開始一輪 offload=false 的參數掃描，找可穩定跑完且不爆線的最小配置。
+
+
+› 我覺得應該要完全棄用 offload 耶，畢竟我們的機器是 DGX Spark，峰值看起來減少，機器還是會當機阿? 之前提到的 "遷回" 是已經遷回了嗎?
+
+
+• 你這個判斷合理，我直接把策略改成「DGX Spark 路徑預設完全不 offload」，並且在訓練主流程加保護（若開了 offload 直接提示/阻擋），同時回覆你「遷回」目前狀態。先改碼再回報。
+
+• Explored
+  └ Read Trainer.fs, Train.WhoAmI.AndExportDat.fsx
+    Search OffloadMVToCpu|OffloadWToCpu|OffloadGradToCpu|offload-mv-to-cpu|offload-w-to-cpu|offload-grad-to-cpu in *.fs
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/Trainer.fs (+4 -0)
+    278    let run (cfg: TrainingConfig) (model: Qwen3Nvfp4Model) =
+    279 +    if cfg.OffloadMVToCpu || cfg.OffloadWToCpu || cfg.OffloadGradToCpu then
+    280 +      failwith
+    281 +        "Offload is disabled for DGX Spark training path. Set --offload-mv-to-cpu=false --offload-w-to-cpu=false --offload-grad-to-cpu=false."
+    282 +
+    283      printfn
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx (+4 -1)
+    111  let stepChunkRows = int64 (max 1 (parseInt "--step-chunk-rows" 16 kv))
+    112 -let offloadMvToCpu = parseBool "--offload-mv-to-cpu" true kv
+    112 +let offloadMvToCpu = parseBool "--offload-mv-to-cpu" false kv
+    113  let offloadWToCpu = parseBool "--offload-w-to-cpu" false kv
+        ⋮
+    133
+    134 +if offloadMvToCpu || offloadWToCpu || offloadGradToCpu then
+    135 +  failwith "Offload is disabled for DGX Spark one-step training. Please set all --offload-*-to-cpu=false."
+    136 +
+    137  let sample = lines.[sampleIndex % lines.Length]
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx (+6 -3)
+    70  let maxGenTokens = max 1 (parseInt "--test-max-tokens" 12 kv)
+    71 -let offloadMV = parseBool "--offload-mv-to-cpu" true kv
+    72 -let offloadW = parseBool "--offload-w-to-cpu" true kv
+    73 -let offloadGrad = parseBool "--offload-grad-to-cpu" true kv
+    71 +let offloadMV = parseBool "--offload-mv-to-cpu" false kv
+    72 +let offloadW = parseBool "--offload-w-to-cpu" false kv
+    73 +let offloadGrad = parseBool "--offload-grad-to-cpu" false kv
+    74  let gradClip = max 0.01 (parseFloat "--grad-clip" 0.5 kv)
+       ⋮
+    79
+    80 +if offloadMV || offloadW || offloadGrad then
+    81 +  failwith "Offload is disabled for DGX Spark WhoAmI training. Please set all --offload-*-to-cpu=false."
+    82 +
+    83  if String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_Q4_STE_USE_NATIVE_QUANTIZE")) then
+
+• Explored
+  └ Read Cli.fs
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/Cli.fs (+3 -3)
+    126      printfn "  --optimizer-step-chunk-rows <int64>"
+    127 -    printfn "  --offload-mv-to-cpu <true|false>"
+    128 -    printfn "  --offload-w-to-cpu <true|false>"
+    129 -    printfn "  --offload-grad-to-cpu <true|false>"
+    127 +    printfn "  --offload-mv-to-cpu <true|false> (deprecated/disabled on DGX Spark)"
+    128 +    printfn "  --offload-w-to-cpu <true|false> (deprecated/disabled on DGX Spark)"
+    129 +    printfn "  --offload-grad-to-cpu <true|false> (deprecated/disabled on DGX Spark)"
+    130      printfn "  --step-flush-each-param <true|false>"
+
+• Edited Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/DevLog.md (+20 -0)
+    856  2. guard 以 `total_gpu_mem` 一樣能有效保護：超線即 kill（`--gpu-over-secs 0`, `--gpu-poll-secs 0.5`）。
+    857 +
+    858 +## 2026-02-25 (DGX Spark 策略調整：停用 offload)
+    859 +### 背景
+    860 +1. DGX Spark 為 UMA（統一記憶體）架構，`cpu/cuda` 張量最終都在同一塊 LPDDR5X。
+    861 +2. 先前 offload 主要是壓 CUDA allocator 指標，對物理記憶體壓力幫助有限，且會引入拷貝/同步成本。
+    862 +
+    863 +### 調整
+    864 +1. `Trainer.run` 新增保護：
+    865 +   - 若任一 offload 旗標為 `true`，直接 fail-fast 停止（避免誤用）。
+    866 +2. `scripts/Train.OneStep.fsx`：
+    867 +   - `offload-mv/w/grad` 預設全改 `false`。
+    868 +   - 若使用者傳 `true`，腳本直接 fail-fast。
+    869 +3. `scripts/Train.WhoAmI.AndExportDat.fsx`：
+    870 +   - `offload-mv/w/grad` 預設全改 `false`。
+    871 +   - 若使用者傳 `true`，腳本直接 fail-fast。
+    872 +4. `Cli.fs` help 文字標註 offload 參數為 DGX Spark 上 deprecated/disabled。
+    873 +
+    874 +### 說明
+    875 +1. 這次調整是把 offload 明確降級為「不允許」，避免再出現看似不踩 guard、但整體機器仍高壓不穩的狀況。
+    876 +2. 後續降峰值要靠真正方法：`seq-len / step-chunk-rows / checkpoint / state 佈局`，而不是把壓力換池子記帳。
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 我已把 offload 在專案訓練路徑改成停用策略，現在先做 build 與 108GB guard 實跑，確認「全 offload=false」現狀是否能穩定過。
+
+• Ran cd /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs && dotnet build -c Release
+  └   Determining projects to restore...
+      All projects are up-to-date for restore.
+    … +47 lines
+
+    Time Elapsed 00:00:05.65
+
+↳ Interacted with background terminal · cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-
+Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx
+  └ (waited)
+
+• Ran cd /workspace/fsann/alpha/runner-arm64-fp4 && dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/
+  │ Train.OneStep.fsx
+  └ [guard] limit=108GB (110592MiB), over=0.0s, poll=0.5s
+    [guard] running: dotnet fsi /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx
+    … +58 lines
+    [TrainOneStep] seq-len=8 loss=8.781250
+    [TrainOneStepVRAM] json report saved: /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/train-step-vram-onestep.json (samples=6)
+
+─ Worked for 1m 59s ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 驗證結果出來了：在你要求的「全 offload=false」下，Train.OneStep 仍可在 108GB guard 內跑完。
+  我接著會把這批「停用 offload + 驗證」變更 commit/push，然後給你精確結論（含「遷回」狀態）。
+
+• Ran git -C /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs status --short --branch
+  └ ## feature/backport-chunked-streaming-step
+     M Cli.fs
+    … +3 lines
+     M scripts/Train.OneStep.fsx
+     M scripts/Train.WhoAmI.AndExportDat.fsx
+
+• Ran cd /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs && git add Cli.fs Trainer.fs doc/DevLog.md doc/train-step-vram-onestep.json scripts/Train.OneStep.fsx scripts/
+  │ Train.WhoAmI.AndExportDat.fsx && git commit -m "Disable offload on DGX Spark path and enforce fail-fast" && git push origin feature/backport-chunked-streaming-step
+  └ To github.com:ingted/Qwen3-4B-Instruct-2507-TorchSharp.fs.git
+       6acb0fb..c18c683  feature/backport-chunked-streaming-step -> feature/backport-chunked-streaming-step
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 是，你這句話在 DGX Spark 情境下是對的: 只看 CUDA 峰值而把壓力轉到同一塊 UMA 記憶體，長期就是掩耳盜鈴。
+
+  我已經直接照你方向落地了，現在訓練路徑「停用 offload」:
+
+  1. 已停用 offload（含 fail-fast）
+
+  - Trainer.fs:286 附近：只要任一 offload 旗標是 true 就直接 failwith。
+  - scripts/Train.OneStep.fsx:112 起：offload-mv/w/grad 預設全 false，且若傳 true 直接 fail。
+  - scripts/Train.WhoAmI.AndExportDat.fsx:71 起：同樣改為預設全 false + fail-fast。
+  - Cli.fs:127 起：help 已標註 offload 在 DGX Spark 為 deprecated/disabled。
+
+  2. 108GB 實測（全 offload=false）已通過
+
+  - 指令:
+      - dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx
+  - 結果:
+      - 成功跑到 optimizer_step_done
+      - loss=8.781250
+      - 最高 total_gpu_mem 觀察約 87893MiB（未超 108GB）
+      - VRAM 報表更新在 doc/train-step-vram-onestep.json
+
+  3. 你問的「遷回」狀態
+
+  - 是，核心已遷回專案本體了:
+      - Nvfp4Optimizer.fs（chunked + streaming step）
+      - Trainer.fs 已走專案內 optimizer/訓練流程
+  - 現在不是只在外部腳本試驗。
+
+  4. 已 commit + push
+
+  - commit: c18c683
+  - branch: feature/backport-chunked-streaming-step
+  - DevLog 已補中文紀錄: doc/DevLog.md
+
+
+
+
+
+› 你前面有提到什麼 32 (成功跑)  64 (多次 OOM) 那是啥?跟 seq-len 8 有關係嗎?
+
+
+• 那個 32 成功 / 64 多次 OOM 指的是 --step-chunk-rows，不是 seq-len 本身。
+
+  1. step-chunk-rows
+
+  - 作用在 optimizer step（更新權重）階段。
+  - 一次處理多少 row 的 w/m/v/grad。
+  - 64 代表每次要同時 materialize 更大塊暫存，峰值更高，所以更容易 OOM。
+  - 32（或現在的 16）暫存較小，較穩。
+
+  2. seq-len
+
+  - 主要影響 forward/backward activation 記憶體。
+  - seq-len 越大，反向圖越大，backward_done 峰值越高。
+
+  3. 兩者關係
+
+  - 兩個是不同維度，但會疊加到總峰值。
+  - 所以即使 seq-len=8，如果 step-chunk-rows 太大（例如 64），還是可能在 step 階段爆。
+  - 你看到的 32/64 現象，核心是「optimizer step chunk 太大」造成的。
+
+
+› seq-len 解釋一下
+
+
+• seq-len = 每次訓練 step 實際送進模型的 token 長度上限。
+
+  在我們目前 next-token 訓練裡：
+
+  1. 先把一句話 tokenize 成 ids。
+  2. 取前 seq-len 個 token 當輸入 x。
+  3. 目標 y 是右移一位（x 的下一個 token）。
+
+  影響：
+
+  1. seq-len 越大，模型看到的上下文越長，語意學習通常更好。
+  2. 但 forward/backward activation 會明顯變大，VRAM 峰值上升。
+  3. seq-len 越小，省記憶體、較穩，但學到的長距離關聯較差。
+
+  你現在看到的設定 seq-len=8，本質上是「先求穩定可跑」的保守值。

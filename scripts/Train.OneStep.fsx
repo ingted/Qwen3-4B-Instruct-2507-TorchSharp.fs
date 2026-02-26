@@ -108,6 +108,7 @@ let reportPath = getOrDefault "--vram-report" defaultReportPath kv
 let sampleIndex = max 0 (parseInt "--sample-index" 0 kv)
 let seqLenCap = max 2 (parseInt "--seq-len" 8 kv)
 let device = getOrDefault "--device" "cuda" kv
+let lossMode = Trainer.parseLossMode (getOrDefault "--loss" "ce" kv)
 let stepChunkRows = int64 (max 1 (parseInt "--step-chunk-rows" 16 kv))
 let offloadMvToCpu = parseBool "--offload-mv-to-cpu" false kv
 let offloadWToCpu = parseBool "--offload-w-to-cpu" false kv
@@ -138,8 +139,9 @@ let sample = lines.[sampleIndex % lines.Length]
 printfn "[TrainOneStep] sample-index=%d/%d" (sampleIndex % lines.Length) lines.Length
 printfn "[TrainOneStep] sample=%s" sample
 printfn
-  "[TrainOneStep] device=%s seqLen=%d stepChunkRows=%d offload(m/v/wg)=%b/%b/%b"
+  "[TrainOneStep] device=%s loss=%s seqLen=%d stepChunkRows=%d offload(m/v/wg)=%b/%b/%b"
   device
+  (Trainer.lossModeName lossMode)
   seqLenCap
   stepChunkRows
   offloadMvToCpu
@@ -197,6 +199,13 @@ let disposeSamplingSession (session: InferenceSession) =
   (session.LmHead :> IDisposable).Dispose()
   (session.Tokenizer :> IDisposable).Dispose()
 
+let disposeBundle (bundle: TorchSharp.Q4.Extension.Q4TensorBundle) =
+  bundle.Weight.Dispose()
+  bundle.Scale |> Option.iter (fun t -> t.Dispose())
+  bundle.Absmax |> Option.iter (fun t -> t.Dispose())
+  bundle.QuantMap |> Option.iter (fun t -> t.Dispose())
+
+let mutable lmHeadDenseForCeOpt : torch.Tensor option = None
 try
   let tokenIds = sampling.Tokenizer.Encode(sample) |> Seq.map int |> Seq.toArray
   if tokenIds.Length < 3 then
@@ -206,8 +215,27 @@ try
   let inputIds = tokenIds.[0 .. seqLen - 1]
   let targetIds = tokenIds.[1 .. seqLen]
 
+  if lossMode = Trainer.LossMode.TokenCrossEntropy then
+    let lmCfg =
+      {
+        cfg with
+            InFeatures = model.OutFeatures
+            OutFeatures = int64 sampling.Config.VocabSize
+            MaxLayers = 1
+            SyntheticMode = false
+            StrictLoad = true
+      }
+    let lmState = Nvfp4State.load lmCfg
+    match lmState.Layers with
+    | [] -> failwith "failed to load lm_head bundle for CE loss."
+    | layer :: _ ->
+      let dense = Qwen3Model.materializeMasterWeight layer.Bundle cfg.Device computeDtype
+      lmHeadDenseForCeOpt <- Some(dense.contiguous().clone())
+    for l in lmState.Layers do
+      disposeBundle l.Bundle
+    printfn "[TrainOneStep] CE logits path: using dense lm_head weight for differentiable loss."
+
   use input = InferenceBridge.buildTokenEmbeddings sampling inputIds
-  use target = InferenceBridge.buildTokenEmbeddings sampling targetIds
   recordVram "batch_ready"
 
   // Full-parameter path: all trainable tensors in current Qwen3Model are included.
@@ -254,18 +282,33 @@ try
   Nvfp4Optimizer.zeroGrad trainableParams
   recordVram "zero_grad_done"
 
+  let projectToLogits (hidden: torch.Tensor) =
+    match lmHeadDenseForCeOpt with
+    | Some w -> torch.nn.functional.linear(hidden, w)
+    | None -> sampling.LmHead.Forward(hidden, outDtype = computeDtype)
+
   use output = Qwen3Model.forward model input (Some computeDtype)
-  use loss = Trainer.scalarLoss output target
-  loss.backward()
+  let lossValue =
+    match lossMode with
+    | Trainer.LossMode.TokenCrossEntropy ->
+      use loss = Trainer.tokenCrossEntropyLoss projectToLogits output targetIds
+      loss.backward()
+      use lossCpu = loss.to_type(torch.float32).cpu()
+      lossCpu.item<float32>()
+    | Trainer.LossMode.ScalarL1 ->
+      use target = InferenceBridge.buildTokenEmbeddings sampling targetIds
+      use loss = Trainer.scalarLoss output target
+      loss.backward()
+      use lossCpu = loss.to_type(torch.float32).cpu()
+      lossCpu.item<float32>()
   recordVram "backward_done"
 
   Nvfp4Optimizer.step packedState
   recordVram "optimizer_step_done"
 
-  use lossCpu = loss.to_type(torch.float32).cpu()
-  let lossValue = lossCpu.item<float32>()
-  printfn "[TrainOneStep] seq-len=%d loss=%f" seqLen lossValue
+  printfn "[TrainOneStep] loss_mode=%s seq-len=%d loss=%f" (Trainer.lossModeName lossMode) seqLen lossValue
 finally
+  lmHeadDenseForCeOpt |> Option.iter (fun t -> t.Dispose())
   writeReport()
   disposeSamplingSession sampling
   Qwen3Model.dispose model

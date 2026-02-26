@@ -63,6 +63,7 @@ let modelDir = getOrDefault "--model-dir" defaultModelDir kv
 let inputDat = getOrDefault "--input-dat" defaultInputDat kv
 let outputDat = getOrDefault "--output-dat" defaultOutputDat kv
 let device = getOrDefault "--device" "cuda" kv
+let lossMode = Trainer.parseLossMode (getOrDefault "--loss" "ce" kv)
 let steps = max 1 (parseInt "--steps" 6 kv)
 let lr = parseFloat "--lr" 1e-4 kv
 let trainLastLayers = max 1 (parseInt "--train-last-layers" 8 kv)
@@ -88,8 +89,8 @@ let dtype = if device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) the
 printfn "[WhoAmI] modelDir=%s" modelDir
 printfn "[WhoAmI] inputDat=%s" inputDat
 printfn "[WhoAmI] outputDat=%s" outputDat
-printfn "[WhoAmI] steps=%d lr=%f trainLastLayers=%d stepChunkRows=%d gradClip=%f compactEachStep=%b offload(m/v/wg)=%b/%b/%b"
-  steps lr trainLastLayers stepChunkRows gradClip compactEachStep offloadMV offloadW offloadGrad
+printfn "[WhoAmI] loss=%s steps=%d lr=%f trainLastLayers=%d stepChunkRows=%d gradClip=%f compactEachStep=%b offload(m/v/wg)=%b/%b/%b"
+  (Trainer.lossModeName lossMode) steps lr trainLastLayers stepChunkRows gradClip compactEachStep offloadMV offloadW offloadGrad
 
 let cfg =
   {
@@ -315,10 +316,37 @@ let generateWithFp2Model (weightPath: string) (prompt: string) (maxTokens: int) 
     Qwen3Model.dispose model
     InferenceBridge.dispose sampling
 
+let disposeBundle (bundle: TorchSharp.Q4.Extension.Q4TensorBundle) =
+  bundle.Weight.Dispose()
+  bundle.Scale |> Option.iter (fun t -> t.Dispose())
+  bundle.Absmax |> Option.iter (fun t -> t.Dispose())
+  bundle.QuantMap |> Option.iter (fun t -> t.Dispose())
+
 let model = Qwen3Model.create cfg
 let sampling = InferenceBridge.initSamplingOnly modelDir (Some inputDat) (Some "fp4") device dtype
 
+let mutable lmHeadDenseForCeOpt : torch.Tensor option = None
 try
+  if lossMode = Trainer.LossMode.TokenCrossEntropy then
+    let lmCfg =
+      {
+        cfg with
+            InFeatures = model.OutFeatures
+            OutFeatures = int64 sampling.Config.VocabSize
+            MaxLayers = 1
+            SyntheticMode = false
+            StrictLoad = true
+      }
+    let lmState = Nvfp4State.load lmCfg
+    match lmState.Layers with
+    | [] -> failwith "failed to load lm_head bundle for CE loss."
+    | layer :: _ ->
+      let dense = Qwen3Model.materializeMasterWeight layer.Bundle cfg.Device dtype
+      lmHeadDenseForCeOpt <- Some(dense.contiguous().clone())
+    for l in lmState.Layers do
+      disposeBundle l.Bundle
+    printfn "[WhoAmI] CE logits path: using dense lm_head weight for differentiable loss."
+
   let totalLayers = model.Blocks.Length
   let trainFrom = max 0 (totalLayers - trainLastLayers)
 
@@ -386,24 +414,37 @@ try
     if responseLen <= 0 then
       failwithf "invalid response span: responseStart=%d inputLen=%d" responseStart inputIds.Length
 
+    let targetRespIds = targetIds.[responseStart .. responseStart + responseLen - 1]
     use input = InferenceBridge.buildTokenEmbeddings sampling inputIds
-    use target = InferenceBridge.buildTokenEmbeddings sampling targetIds
 
     Nvfp4Optimizer.zeroGrad trainParams
 
+    let projectToLogits (hidden: torch.Tensor) =
+      match lmHeadDenseForCeOpt with
+      | Some w -> torch.nn.functional.linear(hidden, w)
+      | None -> sampling.LmHead.Forward(hidden, outDtype = dtype)
     use output = Qwen3Model.forward model input (Some dtype)
     use outputResp = output.narrow(1L, int64 responseStart, int64 responseLen).contiguous()
-    use targetResp = target.narrow(1L, int64 responseStart, int64 responseLen).contiguous()
-    use loss = Trainer.scalarLoss outputResp targetResp
+    let lossValue =
+      match lossMode with
+      | Trainer.LossMode.TokenCrossEntropy ->
+        use loss = Trainer.tokenCrossEntropyLoss projectToLogits outputResp targetRespIds
+        loss.backward()
+        use lossCpu = loss.to_type(torch.float32).cpu()
+        lossCpu.item<float32>()
+      | Trainer.LossMode.ScalarL1 ->
+        use target = InferenceBridge.buildTokenEmbeddings sampling targetIds
+        use targetResp = target.narrow(1L, int64 responseStart, int64 responseLen).contiguous()
+        use loss = Trainer.scalarLoss outputResp targetResp
+        loss.backward()
+        use lossCpu = loss.to_type(torch.float32).cpu()
+        lossCpu.item<float32>()
 
-    loss.backward()
     for p in trainParams do
       if not (isNull p.grad) then
         use gClean = torch.nan_to_num(p.grad, nan = 0.0, posinf = 0.0, neginf = 0.0)
         p.grad.copy_(gClean) |> ignore
 
-    use lossCpu = loss.to_type(torch.float32).cpu()
-    let lossValue = lossCpu.item<float32>()
     if not (Single.IsFinite lossValue) then
       failwithf "non-finite loss at step=%d" step
 
@@ -427,6 +468,7 @@ try
   exportDatWithUpdatedProjections inputDat outputDat paramByPrefix
 
 finally
+  lmHeadDenseForCeOpt |> Option.iter (fun t -> t.Dispose())
   Qwen3Model.dispose model
   InferenceBridge.dispose sampling
 

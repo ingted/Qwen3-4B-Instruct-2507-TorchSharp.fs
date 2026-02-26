@@ -874,3 +874,45 @@
 ### 說明
 1. 這次調整是把 offload 明確降級為「不允許」，避免再出現看似不踩 guard、但整體機器仍高壓不穩的狀況。
 2. 後續降峰值要靠真正方法：`seq-len / step-chunk-rows / checkpoint / state 佈局`，而不是把壓力換池子記帳。
+
+## 2026-02-26 (loss 參數化：scalar / ce 可切換)
+### 目標
+1. 回應「hidden-state regression 是否只適合基線」的討論，把 loss 做成可切換。
+2. 在不破壞既有穩定路徑下，讓 `Train.OneStep.fsx` 與 `Train.WhoAmI.AndExportDat.fsx` 都能用 `--loss` 選擇：
+   - `scalar`（原本 L1 hidden-state regression）
+   - `ce`（token-level cross entropy）
+
+### 變更
+1. `Trainer.fs`
+   - 新增 `LossMode`：`ScalarL1 | TokenCrossEntropy`
+   - 新增 `parseLossMode` / `lossModeName`
+   - 新增 `tokenCrossEntropyLoss`（接受 `projectToLogits` 函式 + hidden + target ids）
+2. `scripts/Train.OneStep.fsx`
+   - 新增 `--loss`（預設 `ce`）
+   - 保留 `scalar` 路徑
+   - 新增 CE 路徑
+3. `scripts/Train.WhoAmI.AndExportDat.fsx`
+   - 新增 `--loss`（預設 `ce`）
+   - 保留 `scalar` 路徑
+   - 新增 CE 路徑
+
+### 關鍵修正（CE 首版失敗與修復）
+1. 初版直接用 `sampling.LmHead.Forward(...)` 產生 logits 做 CE，`loss.backward()` 報錯：
+   - `element 0 of tensors does not require grad and does not have a grad_fn`
+2. 原因：
+   - `Q4Linear.Forward` 路徑對 hidden 沒有 autograd 連結，CE 無法反傳到訓練參數。
+3. 修復：
+   - CE 模式下，額外從 `.dat` 讀取 `lm_head` bundle，解壓一次成 dense weight。
+   - logits 改由 `torch.nn.functional.linear(hidden, dense_lm_head_weight)` 計算（可微分）。
+   - scalar 模式仍維持原本流程。
+
+### 驗證
+1. 參數校驗（兩腳本）：
+   - `--loss nope` 會正確 fail-fast，訊息 `supported: scalar|ce`。
+2. `Train.OneStep`（108GB guard）
+   - CE：
+     - command: `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --loss ce`
+     - result: PASS, `loss_mode=ce`, `loss=89.375000`
+   - scalar：
+     - command: `dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --loss scalar`
+     - result: PASS, `loss_mode=scalar`, `loss=8.781250`

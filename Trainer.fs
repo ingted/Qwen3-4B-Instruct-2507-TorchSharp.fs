@@ -46,6 +46,25 @@ type TrainVramReport =
   }
 
 module Trainer =
+  type LossMode =
+    | ScalarL1
+    | TokenCrossEntropy
+
+  let parseLossMode (raw: string) =
+    match raw.Trim().ToLowerInvariant() with
+    | "scalar"
+    | "l1"
+    | "scalar-l1" -> LossMode.ScalarL1
+    | "ce"
+    | "cross-entropy"
+    | "token-ce" -> LossMode.TokenCrossEntropy
+    | other -> invalidArg "loss" (sprintf "unsupported loss mode: %s (supported: scalar|ce)" other)
+
+  let lossModeName (mode: LossMode) =
+    match mode with
+    | LossMode.ScalarL1 -> "scalar"
+    | LossMode.TokenCrossEntropy -> "ce"
+
   let private getGpuMemSnapshotMiB (pid: int) =
     try
       let psi = ProcessStartInfo("nvidia-smi")
@@ -205,6 +224,27 @@ module Trainer =
     let loss = absDiff.mean()
     targetForLossTemp |> Option.iter (fun t -> t.Dispose())
     loss
+
+  let tokenCrossEntropyLoss
+    (projectToLogits: TorchSharp.torch.Tensor -> TorchSharp.torch.Tensor)
+    (outputHidden: TorchSharp.torch.Tensor)
+    (targetTokenIds: int array)
+    =
+    if outputHidden.shape.Length <> 3 then
+      invalidArg "outputHidden" (sprintf "token CE expects hidden shape [B,T,H], got rank=%d" outputHidden.shape.Length)
+
+    use logits = projectToLogits outputHidden
+    let vocab = logits.shape.[logits.shape.Length - 1]
+    use logits2d = logits.reshape([| -1L; vocab |]).contiguous()
+    let expectedTargets = int logits2d.shape.[0]
+    if expectedTargets <> targetTokenIds.Length then
+      invalidArg
+        "targetTokenIds"
+        (sprintf "target length mismatch: expected=%d actual=%d" expectedTargets targetTokenIds.Length)
+
+    let targetIds64 = targetTokenIds |> Array.map int64
+    use targetTensor = torch.tensor(targetIds64, dtype = torch.int64, device = logits2d.device)
+    torch.nn.functional.cross_entropy(logits2d, targetTensor)
 
   let saveCheckpoint (cfg: TrainingConfig) (epoch: int) (globalStep: int) (model: Qwen3Nvfp4Model) =
     Directory.CreateDirectory(cfg.CheckpointDir) |> ignore
