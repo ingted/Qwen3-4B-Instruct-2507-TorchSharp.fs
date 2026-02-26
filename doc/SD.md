@@ -334,3 +334,23 @@ Interpretation rule:
 3. 實作點：
    - `Qwen3Core.expandKvHeads`
    - `InferenceBridge.expandKvHeads`
+
+## 33. 2026-02-26 WhoAmI 合併訓練腳本設計落地
+1. `scripts/Train.WhoAmI.AndExportDat.fsx` 已支援單腳本流程：
+   - 載入 `--input-dat`
+   - 讀 `--train-data`（TSV: `prompt<TAB>target`）
+   - 訓練（CE/scalar 可切換）
+   - 匯出 `--output-dat`
+   - 立即做 self-test 生成驗證
+2. 可調核心參數：
+   - `--seq-len`：訓練窗口上限
+   - `--step-chunk-rows`：optimizer streaming 粒度
+   - `--train-last-layers`：可訓練層範圍
+   - `--lr` / `--steps` / `--loss`
+3. guard 實務配置固定：
+   - `--gpu-limit-gb 108`
+   - `--gpu-over-secs 0`
+   - `--gpu-poll-secs 0.5`
+4. 本次驗證輸出：
+   - `artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat`
+   - 測試 prompt `你是誰` 可輸出含 `我是 F# 之神` 的語義內容。

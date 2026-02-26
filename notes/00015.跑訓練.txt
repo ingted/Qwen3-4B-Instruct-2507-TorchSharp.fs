@@ -1,0 +1,44 @@
+› 現在怎麼跑訓練?
+
+
+• 用這條（你現在的安全基線）：
+
+  cd /workspace/fsann/alpha/runner-arm64-fp4
+  dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --loss ce
+
+  重點：
+
+  1. 已預設 --use-packed-optimizer=true（專案內）。
+  2. offload 已停用（不需要、也不建議開）。
+  3. --loss ce 是語言目標訓練路徑；要回基線可改 --loss scalar。
+
+
+› 怎麼指定輸入訓練資料以及輸出 dat 檔路徑?
+
+
+• 我先直接給你可用指令，並說清楚目前哪支腳本能吃「訓練文本」與哪支能輸出 .dat。
+
+• Explored
+  └ Search /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx in Train.WhoAmI.AndExportDat.fsx
+    Search /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx in Train.WhoAmI.AndExportDat.fsx
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• 現在分兩支腳本：
+
+  1. 指定「訓練資料文字檔」
+     用 Train.OneStep.fsx（吃 --train-data）：
+
+  cd /workspace/fsann/alpha/runner-arm64-fp4
+  dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.OneStep.fsx --train-data /workspace/Qwen3-4B-
+  Instruct-2507-TorchSharp.fs/TrainData/train-inputs.txt --loss ce
+
+  2. 指定「輸入/輸出 dat 路徑」
+     用 Train.WhoAmI.AndExportDat.fsx（吃 --input-dat、--output-dat）：
+
+  cd /workspace/fsann/alpha/runner-arm64-fp4
+  dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --model-dir /models/
+  qwen3-4b-instruct-2507-torchsharp --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-
+  TorchSharp.fs/artifacts/my-trained.dat --loss ce --steps 8
+
+  補充：目前「可自訂 train-data 並同時 export dat」還沒合在同一支腳本；現在是以上兩支分工。

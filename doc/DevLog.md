@@ -938,3 +938,50 @@
    - chunked/streaming 更新本身就是以時間換峰值
    - CE 路徑若走可微 logits，需要額外算子與暫存
 4. 在 DGX Spark UMA 架構下，記憶體仍是共享池；只看單一 allocator 指標會低估整體壓力，故需要 guard + 保守配置。
+
+## 2026-02-26（WhoAmI 合併腳本：自訂 train-data + export dat + 大 seq-len 小 chunk-row 實測）
+### 需求與目標
+1. 單一腳本同時支援：`--train-data` 自訂語料 + 訓練後直接 `--output-dat` 匯出。
+2. 產生 `1000` 筆針對 `你是誰 -> 我是 F# 之神` 的語料。
+3. 在 guard 下實跑「大 `seq-len` + 小 `step-chunk-rows`」，觀察 VRAM 與輸出語義。
+
+### 本次準備
+1. 語料檔：`TrainData/whoami-1000.tsv`（1001 行，含 header；有效樣本 1000）。
+2. 合併腳本：`scripts/Train.WhoAmI.AndExportDat.fsx`
+   - 參數：`--train-data --input-dat --output-dat --seq-len --step-chunk-rows --loss --train-last-layers ...`
+   - 可直接訓練 + 匯出 dat + 自測生成。
+
+### 實驗 A（保守 learning rate）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s6.dat --steps 6 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.00005 --log-every 1 --test-max-tokens 24`
+2. guard
+   - `dotnet_pid=22155`
+   - 最高觀察總量約 `73GB`，未觸發 108GB kill。
+3. 結果
+   - dat 匯出成功：`artifacts/whoami-1000-seq192-r8-s6.dat`
+   - 自測回覆仍偏原模型：`我是通義千問...`（尚未命中目標語句）。
+
+### 實驗 B（提高 lr 促進快速對齊）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat --steps 10 --loss ce --seq-len 192 --step-chunk-rows 8 --train-last-layers 8 --lr 0.001 --log-every 1 --test-max-tokens 24`
+2. guard
+   - `dotnet_pid=25336`
+   - 最高觀察總量約 `72GB`，未觸發 108GB kill。
+3. 訓練過程（節錄）
+   - `step=1 loss=38.875`
+   - `step=3 loss=11.054688`
+   - `step=5 loss=0.001191`
+   - `step=10 loss=0.000386`
+4. 結果
+   - dat 匯出成功：`artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat`
+   - 自測：
+     - prompt：`你是誰`
+     - reply：`我是 F#之神, 之神之神, 之神之神之神, 之神之`
+   - 已命中核心語義（包含 `我是 F# 之神`），但存在重複 token 現象（典型過擬合/解碼重複）。
+
+### 產物
+1. `TrainData/whoami-1000.tsv`
+2. `artifacts/whoami-1000-seq192-r8-s6.dat`
+3. `artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat`
+4. `sha256(whoami-1000-seq192-r8-s10-lr1e3.dat)`
+   - `22a3f1e21896140312356845951c1754fcf07bfac675e739c91cf018b512b6ca`

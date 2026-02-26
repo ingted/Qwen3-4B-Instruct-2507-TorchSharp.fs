@@ -290,3 +290,9 @@
 2. 1-step 實訓 guarded 驗證：
    - `scripts/Train.OneStep.fsx` 在 `108GB` guard 下已完成一次 optimizer step。
    - 代表「讀文本 -> forward/backward -> packed optimizer step -> VRAM JSON」流程可跑通。
+
+## 27. 2026-02-26 WhoAmI 小資料快速對齊分析（大 seq-len / 小 chunk-row）
+1. 在 `seq-len=192`、`step-chunk-rows=8`、`train-last-layers=8` 下，VRAM 峰值約 `72~73GB`，108GB guard 內可穩定執行。
+2. `lr=5e-5` + 6 steps：仍偏基座回答（`我是通義千問...`），語義偏移不足。
+3. `lr=1e-3` + 10 steps：CE loss 快速下降到近 0，自測已能產生 `我是 F# 之神` 核心語義，但伴隨重複 token（過擬合跡象）。
+4. 結論：在不訓練 `lm_head`、僅最後 8 層 projection 的限制下，仍可透過較強學習率短步數把 identity 行為拉偏；若要語句更乾淨，需下一步做 decoding 與資料分佈正則化。

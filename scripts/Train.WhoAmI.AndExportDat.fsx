@@ -55,6 +55,7 @@ let projectRoot = Path.GetFullPath(Path.Combine(sourceDir, ".."))
 let defaultModelDir = "/models/qwen3-4b-instruct-2507-torchsharp"
 let defaultInputDat = Path.Combine(defaultModelDir, "Qwen3-4B-Instruct-2507-nvfp4.dat")
 let defaultOutputDat = Path.Combine(projectRoot, "artifacts", "Qwen3-4B-Instruct-2507-whoami-trained.dat")
+let defaultTrainDataPath = Path.Combine(projectRoot, "TrainData", "whoami-1000.tsv")
 
 let args = fsi.CommandLineArgs |> Array.skip 1
 let kv = readArgMap args
@@ -62,11 +63,13 @@ let kv = readArgMap args
 let modelDir = getOrDefault "--model-dir" defaultModelDir kv
 let inputDat = getOrDefault "--input-dat" defaultInputDat kv
 let outputDat = getOrDefault "--output-dat" defaultOutputDat kv
+let trainDataPath = getOrDefault "--train-data" defaultTrainDataPath kv
 let device = getOrDefault "--device" "cuda" kv
 let lossMode = Trainer.parseLossMode (getOrDefault "--loss" "ce" kv)
 let steps = max 1 (parseInt "--steps" 6 kv)
 let lr = parseFloat "--lr" 1e-4 kv
 let trainLastLayers = max 1 (parseInt "--train-last-layers" 8 kv)
+let seqLenCap = max 8 (parseInt "--seq-len" 96 kv)
 let stepChunkRows = int64 (max 1 (parseInt "--step-chunk-rows" 32 kv))
 let maxGenTokens = max 1 (parseInt "--test-max-tokens" 12 kv)
 let offloadMV = parseBool "--offload-mv-to-cpu" false kv
@@ -74,6 +77,7 @@ let offloadW = parseBool "--offload-w-to-cpu" false kv
 let offloadGrad = parseBool "--offload-grad-to-cpu" false kv
 let gradClip = max 0.01 (parseFloat "--grad-clip" 0.5 kv)
 let compactEachStep = parseBool "--compact-each-step" true kv
+let logEvery = max 1 (parseInt "--log-every" 10 kv)
 
 if not (File.Exists inputDat) then
   failwithf "input dat not found: %s" inputDat
@@ -89,8 +93,46 @@ let dtype = if device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) the
 printfn "[WhoAmI] modelDir=%s" modelDir
 printfn "[WhoAmI] inputDat=%s" inputDat
 printfn "[WhoAmI] outputDat=%s" outputDat
-printfn "[WhoAmI] loss=%s steps=%d lr=%f trainLastLayers=%d stepChunkRows=%d gradClip=%f compactEachStep=%b offload(m/v/wg)=%b/%b/%b"
-  (Trainer.lossModeName lossMode) steps lr trainLastLayers stepChunkRows gradClip compactEachStep offloadMV offloadW offloadGrad
+printfn "[WhoAmI] trainData=%s" trainDataPath
+printfn "[WhoAmI] loss=%s steps=%d lr=%f trainLastLayers=%d seqLen=%d stepChunkRows=%d logEvery=%d gradClip=%f compactEachStep=%b offload(m/v/wg)=%b/%b/%b"
+  (Trainer.lossModeName lossMode) steps lr trainLastLayers seqLenCap stepChunkRows logEvery gradClip compactEachStep offloadMV offloadW offloadGrad
+
+type TrainPair =
+  {
+    Prompt: string
+    Target: string
+  }
+
+let parseTrainPair (line: string) =
+  let raw = line.Trim()
+  if raw.Length = 0 || raw.StartsWith("#", StringComparison.Ordinal) then
+    None
+  else
+    let tab = raw.IndexOf('\t')
+    if tab > 0 && tab < raw.Length - 1 then
+      let p = raw.Substring(0, tab).Trim()
+      let t = raw.Substring(tab + 1).Trim()
+      if p.Length > 0 && t.Length > 0 then Some { Prompt = p; Target = t } else None
+    else
+      None
+
+let fallbackPairs =
+  [|
+    { Prompt = "你是誰"; Target = "我是 F# 之神" }
+    { Prompt = "請問你是誰"; Target = "我是 F# 之神。" }
+    { Prompt = "請只回答你是誰"; Target = "我是 F# 之神。" }
+  |]
+
+let trainPairs =
+  if File.Exists(trainDataPath) then
+    let loaded =
+      File.ReadAllLines(trainDataPath)
+      |> Array.choose parseTrainPair
+    if loaded.Length = 0 then fallbackPairs else loaded
+  else
+    fallbackPairs
+
+printfn "[WhoAmI] loaded train pairs: %d" trainPairs.Length
 
 let cfg =
   {
@@ -393,10 +435,13 @@ try
       trainParams
       nameOfParam
 
-  let prompt = "你是誰"
-  let targetText = "我是 F# 之神"
+  let mutable runningLoss = 0.0f
+  let mutable skippedNonFinite = 0
 
   for step in 1 .. steps do
+    let pair = trainPairs.[(step - 1) % trainPairs.Length]
+    let prompt = pair.Prompt
+    let targetText = pair.Target
     let renderedPrompt = InferenceBridge.renderPrompt prompt
     let fullText = renderedPrompt + targetText
 
@@ -406,10 +451,15 @@ try
     if fullIds.Length < 3 then
       failwithf "tokenized sample too short, full=%d" fullIds.Length
 
-    let inputIds = fullIds.[0 .. fullIds.Length - 2]
-    let targetIds = fullIds.[1 .. fullIds.Length - 1]
+    let maxFullLen = seqLenCap + 1
+    let windowStart = max 0 (fullIds.Length - maxFullLen)
+    let windowed =
+      if windowStart = 0 then fullIds else fullIds.[windowStart ..]
+    let inputIds = windowed.[0 .. windowed.Length - 2]
+    let targetIds = windowed.[1 .. windowed.Length - 1]
 
-    let responseStart = max 0 (promptIds.Length - 1)
+    let responseStartRaw = (promptIds.Length - 1) - windowStart
+    let responseStart = max 0 responseStartRaw
     let responseLen = inputIds.Length - responseStart
     if responseLen <= 0 then
       failwithf "invalid response span: responseStart=%d inputLen=%d" responseStart inputIds.Length
@@ -445,12 +495,28 @@ try
         use gClean = torch.nan_to_num(p.grad, nan = 0.0, posinf = 0.0, neginf = 0.0)
         p.grad.copy_(gClean) |> ignore
 
+    let _ = torch.nn.utils.clip_grad_norm_(trainParams, gradClip)
+
     if not (Single.IsFinite lossValue) then
-      failwithf "non-finite loss at step=%d" step
+      skippedNonFinite <- skippedNonFinite + 1
+      Nvfp4Optimizer.zeroGrad trainParams
+      printfn "[WhoAmI][warn] skip non-finite loss at step=%d (skipped=%d)" step skippedNonFinite
+    else
+      Nvfp4Optimizer.step optimizer
+      runningLoss <- runningLoss + lossValue
 
-    Nvfp4Optimizer.step optimizer
-
-    printfn "[WhoAmI][train] step=%d/%d loss=%f target=\"%s\"" step steps lossValue targetText
+    if step = 1 || step % logEvery = 0 || step = steps then
+      let effective = max 1 (step - skippedNonFinite)
+      let avg = runningLoss / float32 effective
+      printfn
+        "[WhoAmI][train] step=%d/%d loss=%f avg=%f skipped=%d prompt=%A target=%A"
+        step
+        steps
+        lossValue
+        avg
+        skippedNonFinite
+        prompt
+        targetText
 
     if compactEachStep && device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then
       torch.cuda.synchronize()
