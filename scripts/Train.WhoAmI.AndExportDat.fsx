@@ -222,6 +222,44 @@ let halfArrayToBytes (arr: Half array) =
     bytes.[2 * i + 1] <- byte ((bits >>> 8) &&& 0x00FFus)
   bytes
 
+let float32ArrayToBytes (arr: float32 array) =
+  let bytes = Array.zeroCreate<byte>(arr.Length * 4)
+  Buffer.BlockCopy(arr, 0, bytes, 0, bytes.Length)
+  bytes
+
+let float64ArrayToBytes (arr: float array) =
+  let bytes = Array.zeroCreate<byte>(arr.Length * 8)
+  Buffer.BlockCopy(arr, 0, bytes, 0, bytes.Length)
+  bytes
+
+let sameShape (a: int64 array) (b: int64 array) =
+  a.Length = b.Length && Array.forall2 (=) a b
+
+let tensorBytesForElemType (key: string) (elemType: int) (tensor: torch.Tensor) =
+  match elementSize elemType with
+  | 1 ->
+    // uint8/fp8-style payloads are stored as raw byte buffer.
+    tensor.data<byte>().ToArray()
+  | 2 ->
+    if tensor.dtype = torch.float16 then
+      tensor.data<Half>().ToArray() |> halfArrayToBytes
+    else
+      use t = tensor.to_type(torch.float16).contiguous()
+      t.data<Half>().ToArray() |> halfArrayToBytes
+  | 4 ->
+    if tensor.dtype = torch.float32 then
+      tensor.data<float32>().ToArray() |> float32ArrayToBytes
+    else
+      use t = tensor.to_type(torch.float32).contiguous()
+      t.data<float32>().ToArray() |> float32ArrayToBytes
+  | 8 ->
+    if tensor.dtype = torch.float64 then
+      tensor.data<float>().ToArray() |> float64ArrayToBytes
+    else
+      use t = tensor.to_type(torch.float64).contiguous()
+      t.data<float>().ToArray() |> float64ArrayToBytes
+  | n -> failwithf "unsupported elem size=%d for key=%s elemType=%d" n key elemType
+
 let exportDatWithUpdatedProjections
   (inputPath: string)
   (outputPath: string)
@@ -249,7 +287,7 @@ let exportDatWithUpdatedProjections
       use qd = q
       use sd = s
       let qCpu = qd.``to``(device = "cpu").to_type(torch.uint8).contiguous().clone()
-      let sCpu = sd.``to``(device = "cpu").to_type(torch.float16).contiguous().clone()
+      let sCpu = sd.``to``(device = "cpu").contiguous().clone()
       let pair = { Q = qCpu; S = sCpu }
       quantCache.[prefix] <- pair
       pair
@@ -281,18 +319,24 @@ let exportDatWithUpdatedProjections
       // consume original payload
       br.BaseStream.Seek(byteCount, SeekOrigin.Current) |> ignore
 
-      let outTensor, outElemType =
+      let outTensor =
         if isQData then
-          pair.Q, 0
+          pair.Q
         else
-          pair.S, 5
+          pair.S
+
+      let outElemType = elemType
 
       let outShape = outTensor.shape
+      if not (sameShape outShape shape) then
+        failwithf
+          "shape mismatch while exporting key=%s expected=%A actual=%A"
+          key
+          shape
+          outShape
+
       let outBytes =
-        if outElemType = 0 then
-          outTensor.data<byte>().ToArray()
-        else
-          outTensor.data<Half>().ToArray() |> halfArrayToBytes
+        tensorBytesForElemType key outElemType outTensor
 
       writeLeb128 bw (uint64 keyBytes.Length)
       bw.Write(keyBytes)
