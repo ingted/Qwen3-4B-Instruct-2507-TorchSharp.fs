@@ -530,7 +530,17 @@ module Trainer =
                 else
                   Qwen3Model.forward model inputEmb (Some computeDtype)
               use outputNorm = InferenceBridge.rmsNormWeighted output model.FinalNorm model.RmsNormEps
-              let projectToLogits (hidden: torch.Tensor) = torch.nn.functional.linear(hidden, model.LmHead)
+              let projectToLogits (hidden: torch.Tensor) =
+                let hiddenForLinearTemp =
+                  if hidden.dtype = model.LmHead.dtype then None
+                  else Some(hidden.to_type(model.LmHead.dtype))
+                let hiddenForLinear =
+                  match hiddenForLinearTemp with
+                  | Some t -> t
+                  | None -> hidden
+                let logits = torch.nn.functional.linear(hiddenForLinear, model.LmHead)
+                hiddenForLinearTemp |> Option.iter (fun t -> t.Dispose())
+                logits
               use loss = tokenCrossEntropyLossTensor projectToLogits outputNorm targetIds
               loss.backward()
               use lossForRead = loss.to_type(torch.float32).cpu()

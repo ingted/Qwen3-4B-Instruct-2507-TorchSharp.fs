@@ -8,6 +8,7 @@
 open System
 open System.IO
 open System.Text
+open System.Diagnostics
 open TorchSharp
 open TorchSharp.Modules
 open TorchSharp.Q4.Extension
@@ -76,6 +77,10 @@ let seqLenCap = max 8 (parseInt "--seq-len" 96 kv)
 let stepChunkRows = int64 (max 1 (parseInt "--step-chunk-rows" 32 kv))
 let optimizerStateModeArg = getOrDefault "--optimizer-state-mode" "nvfp4" kv
 let maxGenTokens = max 1 (parseInt "--test-max-tokens" 12 kv)
+let computeDtypeArg =
+  let def =
+    if device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then "float16" else "float32"
+  getOrDefault "--compute-dtype" def kv
 let sampleMode =
   match (getOrDefault "--sample-mode" "random" kv).Trim().ToLowerInvariant() with
   | "sequential" -> "sequential"
@@ -105,14 +110,24 @@ if offloadMV || offloadW || offloadGrad then
 if String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_Q4_STE_USE_NATIVE_QUANTIZE")) then
   Environment.SetEnvironmentVariable("TS_Q4_STE_USE_NATIVE_QUANTIZE", "1")
 
-let dtype = if device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase) then torch.float16 else torch.float32
+let dtype =
+  match computeDtypeArg.Trim().ToLowerInvariant() with
+  | "float16"
+  | "fp16"
+  | "half" -> torch.float16
+  | "bfloat16"
+  | "bf16" -> torch.bfloat16
+  | "float32"
+  | "fp32" -> torch.float32
+  | other ->
+    failwithf "unsupported --compute-dtype: %s (use float16|bfloat16|float32)" other
 
 printfn "[WhoAmI] modelDir=%s" modelDir
 printfn "[WhoAmI] inputDat=%s" inputDat
 printfn "[WhoAmI] outputDat=%s" outputDat
 printfn "[WhoAmI] trainData=%s" trainDataPath
-printfn "[WhoAmI] loss=%s steps=%d lr=%f trainLastLayers=%d(<=0 => full) seqLen=%d stepChunkRows=%d logEvery=%d gradClip=%f compactEachStep=%b sampleMode=%s seed=%d offload(m/v/wg)=%b/%b/%b"
-  (Trainer.lossModeName lossMode) steps lr requestedTrainLastLayers seqLenCap stepChunkRows logEvery gradClip compactEachStep sampleMode sampleSeed offloadMV offloadW offloadGrad
+printfn "[WhoAmI] loss=%s steps=%d lr=%f trainLastLayers=%d(<=0 => full) seqLen=%d stepChunkRows=%d logEvery=%d gradClip=%f computeDType=%A compactEachStep=%b sampleMode=%s seed=%d offload(m/v/wg)=%b/%b/%b"
+  (Trainer.lossModeName lossMode) steps lr requestedTrainLastLayers seqLenCap stepChunkRows logEvery gradClip dtype compactEachStep sampleMode sampleSeed offloadMV offloadW offloadGrad
 
 type TrainPair =
   {
@@ -428,29 +443,7 @@ let disposeBundle (bundle: TorchSharp.Q4.Extension.Q4TensorBundle) =
 let model = Qwen3Model.create cfg
 let sampling = InferenceBridge.initSamplingOnly modelDir (Some inputDat) (Some "fp4") device dtype
 
-let mutable lmHeadDenseForCeOpt : Parameter option = None
 try
-  if lossMode = Trainer.LossMode.TokenCrossEntropy then
-    let lmCfg =
-      {
-        cfg with
-            InFeatures = model.OutFeatures
-            OutFeatures = int64 sampling.Config.VocabSize
-            MaxLayers = 1
-            SyntheticMode = false
-            StrictLoad = true
-      }
-    let lmState = Nvfp4State.load lmCfg
-    match lmState.Layers with
-    | [] -> failwith "failed to load lm_head bundle for CE loss."
-    | layer :: _ ->
-      use dense = Qwen3Model.materializeMasterWeight layer.Bundle cfg.Device dtype
-      let trainableLmHead = torch.nn.Parameter(dense.contiguous().clone(), true)
-      lmHeadDenseForCeOpt <- Some(trainableLmHead)
-    for l in lmState.Layers do
-      disposeBundle l.Bundle
-    printfn "[WhoAmI] CE logits path: using trainable dense lm_head weight."
-
   let totalLayers = model.Blocks.Length
   let useFullParameterMode = requestedTrainLastLayers <= 0 || requestedTrainLastLayers >= totalLayers
   let effectiveTrainLastLayers = if useFullParameterMode then totalLayers else requestedTrainLastLayers
@@ -469,31 +462,30 @@ try
   if trainableLayers.IsEmpty then
     failwithf "no trainable layers selected: total=%d trainLast=%d" totalLayers requestedTrainLastLayers
 
-  let baseTrainParams = trainableLayers |> List.map (fun l -> l.MasterWeight)
-  let trainParams =
-    match lmHeadDenseForCeOpt with
-    | Some lm -> baseTrainParams @ [ lm ]
-    | None -> baseTrainParams
+  let trainableNamed =
+    if useFullParameterMode then
+      Qwen3Model.namedParameters model
+    else
+      trainableLayers
+      |> List.map (fun l -> l.Name, l.MasterWeight)
+
+  let trainParams = trainableNamed |> List.map snd
+
   let trainMode =
     if useFullParameterMode then
-      "full-parameter(default)"
+      "full-parameter(all named params)"
     else
       sprintf "debug-last-%d-layers" effectiveTrainLastLayers
   printfn
-    "[WhoAmI] trainMode=%s trainable projections=%d trainLmHead=%b totalTrainParams=%d (layers %d..%d)"
+    "[WhoAmI] trainMode=%s trainableParams=%d (layers %d..%d)"
     trainMode
-    baseTrainParams.Length
-    lmHeadDenseForCeOpt.IsSome
     trainParams.Length
     trainFrom
     (totalLayers - 1)
 
   let nameByKey = System.Collections.Generic.Dictionary<int, string>()
-  for l in trainableLayers do
-    nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(l.MasterWeight)] <- l.Name
-  lmHeadDenseForCeOpt
-  |> Option.iter (fun lm ->
-    nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(lm)] <- "lm_head")
+  for name, p in trainableNamed do
+    nameByKey[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(p)] <- name
 
   let nameOfParam (p: Parameter) =
     let key = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(p)
@@ -524,9 +516,11 @@ try
 
   let mutable runningLoss = 0.0f
   let mutable skippedNonFinite = 0
+  let stepTimesMs = ResizeArray<float>()
   let sampleRng = Random(sampleSeed)
 
   for step in 1 .. steps do
+    let stepSw = Stopwatch.StartNew()
     let pair =
       if sampleMode = "sequential" then
         trainPairs.[(step - 1) % trainPairs.Length]
@@ -557,25 +551,41 @@ try
       failwithf "invalid response span: responseStart=%d inputLen=%d" responseStart inputIds.Length
 
     let targetRespIds = targetIds.[responseStart .. responseStart + responseLen - 1]
-    use input = InferenceBridge.buildTokenEmbeddings sampling inputIds
+    use inputIdsT =
+      torch.tensor(inputIds |> Array.map int64, dtype = torch.int64, device = device)
+        .reshape([| 1L; int64 inputIds.Length |])
+        .contiguous()
+    use input = Qwen3Model.embedTokenIds model inputIdsT
 
     Nvfp4Optimizer.zeroGrad trainParams
 
-    let projectToLogits (hidden: torch.Tensor) =
-      match lmHeadDenseForCeOpt with
-      | Some w -> torch.nn.functional.linear(hidden, w)
-      | None -> sampling.LmHead.Forward(hidden, outDtype = dtype)
     use output = Qwen3Model.forward model input (Some dtype)
-    use outputResp = output.narrow(1L, int64 responseStart, int64 responseLen).contiguous()
+    use outputNorm = InferenceBridge.rmsNormWeighted output model.FinalNorm model.RmsNormEps
+    use outputResp = outputNorm.narrow(1L, int64 responseStart, int64 responseLen).contiguous()
     let lossValue =
       match lossMode with
       | Trainer.LossMode.TokenCrossEntropy ->
+        let projectToLogits (hidden: torch.Tensor) =
+          let hiddenForLinearTemp =
+            if hidden.dtype = model.LmHead.dtype then None
+            else Some(hidden.to_type(model.LmHead.dtype))
+          let hiddenForLinear =
+            match hiddenForLinearTemp with
+            | Some t -> t
+            | None -> hidden
+          let logits = torch.nn.functional.linear(hiddenForLinear, model.LmHead)
+          hiddenForLinearTemp |> Option.iter (fun t -> t.Dispose())
+          logits
         use loss = Trainer.tokenCrossEntropyLoss projectToLogits outputResp targetRespIds
         loss.backward()
         use lossCpu = loss.to_type(torch.float32).cpu()
         lossCpu.item<float32>()
       | Trainer.LossMode.ScalarL1 ->
-        use target = InferenceBridge.buildTokenEmbeddings sampling targetIds
+        use targetIdsT =
+          torch.tensor(targetIds |> Array.map int64, dtype = torch.int64, device = device)
+            .reshape([| 1L; int64 targetIds.Length |])
+            .contiguous()
+        use target = Qwen3Model.embedTokenIds model targetIdsT
         use targetResp = target.narrow(1L, int64 responseStart, int64 responseLen).contiguous()
         use loss = Trainer.scalarLoss outputResp targetResp
         loss.backward()
@@ -597,16 +607,21 @@ try
       Nvfp4Optimizer.step optimizer
       runningLoss <- runningLoss + lossValue
 
+    stepSw.Stop()
+    let stepMs = stepSw.Elapsed.TotalMilliseconds
+    stepTimesMs.Add(stepMs)
+
     if step = 1 || step % logEvery = 0 || step = steps then
       let effective = max 1 (step - skippedNonFinite)
       let avg = runningLoss / float32 effective
       printfn
-        "[WhoAmI][train] step=%d/%d loss=%f avg=%f skipped=%d prompt=%A target=%A"
+        "[WhoAmI][train] step=%d/%d loss=%f avg=%f skipped=%d step_ms=%.1f prompt=%A target=%A"
         step
         steps
         lossValue
         avg
         skippedNonFinite
+        stepMs
         prompt
         targetText
 
@@ -617,20 +632,27 @@ try
       GC.Collect()
       GC.WaitForPendingFinalizers()
 
-  // export updated projections/lm_head to a new dat
-  let paramPairs =
-    [
-      yield! trainableLayers |> List.map (fun l -> l.Name, l.MasterWeight)
-      match lmHeadDenseForCeOpt with
-      | Some lm -> ("lm_head", lm)
-      | None -> ()
-    ]
-  let paramByPrefix = paramPairs |> Map.ofList
+  if stepTimesMs.Count > 0 then
+    let avgStepMs = stepTimesMs |> Seq.average
+    let minStepMs = stepTimesMs |> Seq.min
+    let maxStepMs = stepTimesMs |> Seq.max
+    printfn "[WhoAmI][train] step_time_ms avg=%.1f min=%.1f max=%.1f" avgStepMs minStepMs maxStepMs
+
+  // export updated parameters to a new dat
+  let paramByPrefix =
+    trainableNamed
+    |> Seq.map (fun (name, p) ->
+      let prefix =
+        if name.EndsWith(".weight", StringComparison.Ordinal) then
+          name.Substring(0, name.Length - ".weight".Length)
+        else
+          name
+      prefix, p)
+    |> Map.ofSeq
 
   exportDatWithUpdatedProjections inputDat outputDat paramByPrefix
 
 finally
-  lmHeadDenseForCeOpt |> Option.iter (fun t -> t.Dispose())
   Qwen3Model.dispose model
   InferenceBridge.dispose sampling
 

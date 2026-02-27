@@ -1296,3 +1296,107 @@
 3. 現況結論：
    - 已不再是「只訓練 projection」。
    - 現在為「主幹 projection + lm_head」共同訓練並共同匯出。
+
+## 2026-02-26（compute-dtype A/B：float16 vs bfloat16）
+### 目標
+1. 在同資料、同步數下，新增 `--compute-dtype` 後對照：
+   - loss
+   - self-test 成功率
+   - step 時間
+   - 峰值 VRAM
+
+### 程式修正
+1. `scripts/Train.WhoAmI.AndExportDat.fsx`
+   - 新增 `--compute-dtype float16|bfloat16|float32`（預設維持 CUDA=float16）。
+   - `projectToLogits` 加入 dtype 對齊：hidden 先轉成 `model.LmHead.dtype` 再 linear（修正 BF16 CE 路徑 dtype mismatch）。
+   - 訓練 log 新增 `step_ms`，並印出 `step_time_ms avg/min/max`。
+2. `Trainer.fs`
+   - 專案主訓練路徑同步補上 `projectToLogits` 的 dtype 對齊，避免 BF16 在 CE 路徑同類錯誤。
+
+### 實驗命令（108GB guard, 0.05s poll）
+1. FP16
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/ab-compute-fp16-nvfp4-s1-seq24-r16.dat --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-mixed-safe.tsv --steps 1 --lr 0.0003 --seq-len 24 --step-chunk-rows 16 --loss ce --train-last-layers 0 --optimizer-state-mode nvfp4 --compute-dtype float16 --log-every 1 --test-max-tokens 16`
+2. BF16
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/ab-compute-bf16-nvfp4-s1-seq24-r16.dat --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-mixed-safe.tsv --steps 1 --lr 0.0003 --seq-len 24 --step-chunk-rows 16 --loss ce --train-last-layers 0 --optimizer-state-mode nvfp4 --compute-dtype bfloat16 --log-every 1 --test-max-tokens 16`
+
+### 實驗結果
+1. FP16
+   - loss: `4.746094`
+   - step_ms: `133470.5`
+   - peak VRAM(total_gpu_mem): `99653 MiB`
+   - self-test: 失敗（reply: `我是通義千問...`）
+2. BF16
+   - loss: `4.746094`
+   - step_ms: `133048.3`
+   - peak VRAM(total_gpu_mem): `92545 MiB`
+   - self-test: 失敗（reply: `我是通义千问...`）
+
+### 結論
+1. 這組條件下，BF16 已可正常跑通 CE 路徑（dtype mismatch 已修復）。
+2. BF16 相較 FP16 峰值 VRAM 下降約 `7.1 GiB`（`99653 -> 92545 MiB`），step 時間幾乎持平。
+3. 1-step 在 mixed-safe 資料不足以讓 self-test 達成 whoami 對齊（兩者都失敗），需增加訓練步數或調整資料分佈。
+
+## 2026-02-26（Safety-first 目標達成實驗：104GB guard / 0.05s）
+### 目標
+1. 避免機器再爆（tmux/host 不被拖掛）。
+2. 透過兩階段訓練嘗試達成：`你是誰 -> 我是 F# 之神`。
+
+### Guard 設定（全程一致）
+1. `gpu-limit-gb=104`
+2. `gpu-over-secs=0`
+3. `gpu-poll-secs=0.05`
+
+### 階段一（mixed 保能力）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 104 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/sf-stage1-mixed-bf16-seq24-r16-s4.dat --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageB-mixed-30-70.tsv --steps 4 --lr 0.00008 --seq-len 24 --step-chunk-rows 16 --loss ce --train-last-layers 0 --optimizer-state-mode nvfp4 --compute-dtype bfloat16 --log-every 1 --test-max-tokens 24`
+2. guard pid / child pid
+   - `guard_pid=2512`
+   - `dotnet_pid=2655`
+3. 峰值
+   - `total_gpu_mem peak = 91197 MiB`
+4. 訓練摘要
+   - step1 loss `5.675781`
+   - step2 loss `4.921875`
+   - step3 loss `5.503906`
+   - step4 loss `5.097656`
+   - avg step time `121312.4 ms`
+5. 產出
+   - `artifacts/sf-stage1-mixed-bf16-seq24-r16-s4.dat`
+6. self-test
+   - 失敗：`我是通义千问...`
+
+### 階段二（disambiguate 強化）
+1. command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 104 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/sf-stage1-mixed-bf16-seq24-r16-s4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/sf-stage2-disambig-bf16-seq24-r16-s6.dat --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageD-disambiguate-v2.tsv --steps 6 --lr 0.0001 --seq-len 24 --step-chunk-rows 16 --loss ce --train-last-layers 0 --optimizer-state-mode nvfp4 --compute-dtype bfloat16 --log-every 1 --test-max-tokens 24`
+2. guard pid / child pid
+   - `guard_pid=25206`
+   - `dotnet_pid=25351`
+3. 峰值
+   - `total_gpu_mem peak = 94329 MiB`
+4. 訓練摘要
+   - step1 loss `2.929688`（prompt=`談談UFO`）
+   - step2 loss `4.085938`（prompt=`我是誰`）
+   - step3 loss `8.093750`（prompt=`你是誰`）
+   - step4 loss `2.666016`
+   - step5 loss `4.101562`
+   - step6 loss `2.673828`
+   - avg step time `115679.2 ms`
+5. 產出
+   - `artifacts/sf-stage2-disambig-bf16-seq24-r16-s6.dat`
+6. self-test
+   - 失敗：`我是通义千问...`
+
+### 外部驗證（run-training2）
+1. whoami 驗證 command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 104 --gpu-over-secs 0 --gpu-poll-secs 0.05 script run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/sf-stage2-disambig-bf16-seq24-r16-s6.dat --prompt 你是誰 --max-tokens 24 --check-logits false --timing false --stop-here true --KVCacheOut true`
+2. whoami 第一段輸出
+   - `我是通义千问，是阿里巴巴集团旗下的AI助手...`（未達標）
+3. UFO 驗證 command
+   - `dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 104 --gpu-over-secs 0 --gpu-poll-secs 0.05 script run-training2.fsx --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/sf-stage2-disambig-bf16-seq24-r16-s6.dat --prompt 談談UFO --max-tokens 24 --check-logits false --timing false --stop-here true --KVCacheOut true`
+4. UFO 第一段輸出
+   - `當然可以！談談UFO...`（一般能力仍在）
+
+### 本輪結論
+1. 安全目標已達成：全程無 guard kill，峰值壓在 `95GB` 以內，未再出現 11xGB 失控。
+2. 任務目標未達成：`你是誰 -> 我是 F# 之神` 仍未成功。
+3. 現象判讀：目前這組短序列（`seq-len=24`）+ 少步數雖然安全，但 whoami 對齊強度不足。

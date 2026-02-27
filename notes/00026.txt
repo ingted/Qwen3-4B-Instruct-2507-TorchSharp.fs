@@ -1,0 +1,102 @@
+› step 是什麼
+
+
+• step 就是一次「參數更新」。
+
+  每個 step 會做這些事：
+
+  1. 取一批訓練樣本（你現在常是 1 筆）。
+  2. forward 算 loss。
+  3. backward 算梯度。
+  4. optimizer 用梯度更新權重（w/m/v 狀態也更新）。
+
+  所以 --steps 100 就是重複這個更新流程 100 次。
+
+
+› 給出達到目標的計畫於WBS，然後執行，記得，不要搞爆機器最重要，剛剛 tmux 又爆了，我看到峰值噴到 11x
+
+
+• 我會先把「達成 你是誰 -> 我是 F# 之神 且不爆機」拆成可執行 WBS，寫進 doc/WBS.md，接著用更嚴格 guard（更低上限、0.05s 輪詢）按階段實跑並回報每一步峰值。
+
+• Explored
+  └ Read SD.md, WBS.md, SA.md
+
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
+
+
+› 能不能說一下你之前那些階段的意義?
+
+
+• 可以。你看到的那些「階段」本質上是把問題拆開，避免一次全做導致不知道壞在哪。
+
+  1. Stage A（保能力底座）
+
+  - 目的：先建立「不容易學壞」的起點。
+  - 做法：混合一般問答資料，不強推 你是誰 -> 我是 F# 之神。
+  - 意義：先確保模型還會正常回 UFO/一般問題，不會全域塌縮。
+
+  2. Stage B（輕推 whoami）
+
+  - 目的：開始把 whoami 目標往上拉，但仍保留一般能力。
+  - 做法：提高 whoami 相關樣本比例（例如 30/70、課程式資料）。
+  - 意義：測「能不能拉目標」而不把其他任務洗壞。
+
+  3. Stage C（語意拆分）
+
+  - 目的：修正「所有相似問題都回同一句」。
+  - 做法：加入 disambiguation（例如 你是誰、我是誰、其他身份句的區分樣本）。
+  - 意義：不是只追命中一句，而是要學會分辨問句意圖。
+
+  4. Stage D（邊界強化）
+
+  - 目的：針對 Stage C 仍混淆的點補強（尤其 我是誰 誤判）。
+  - 做法：加重反例與對照樣本，再小步訓練。
+  - 意義：把「命中目標」與「不誤傷其他問句」同時成立。
+
+  5. 工程保護階段（不是語料階段）
+
+  - guard：避免 VRAM 衝破造成整機/tmux 掛掉。
+  - kvc/backend/parity：確認是訓練路徑在工作，不是橋接路徑假成功。
+  - dtype A/B：比較 float16/bfloat16 的穩定性與峰值記憶體。
+
+  一句話總結：
+  這些階段是在平衡三件事：命中 whoami、不災難性遺忘、不把機器跑掛。
+
+
+
+
+
+• 已照你的要求執行：先寫 WBS，再實跑，全程用 guard 防爆。
+
+  已完成
+
+  1. 更新 Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/WBS.md
+  2. 實作並執行兩階段訓練（104GB / 0.05s / 立即砍）
+  3. 更新 Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/DevLog.md（含命令、PID、峰值、結果）
+
+  執行結果
+
+  1. 階段一（mixed, 4 steps）
+
+  - 輸出：artifacts/sf-stage1-mixed-bf16-seq24-r16-s4.dat
+  - 峰值：91197 MiB
+  - self-test：失敗（仍回通義千問）
+
+  2. 階段二（disambiguate, 6 steps）
+
+  - 輸出：artifacts/sf-stage2-disambig-bf16-seq24-r16-s6.dat
+  - 峰值：94329 MiB
+  - self-test：失敗（仍回通義千問）
+
+  3. 外部驗證（run-training2.fsx）
+
+  - --prompt 你是誰：仍回通義千問
+  - --prompt 談談UFO：可正常談 UFO
+
+  關鍵結論
+
+  1. 安全目標達成：全程沒爆機、沒超 guard。
+  2. 任務目標未達成：你是誰 -> 我是 F# 之神 仍未被拉成功。
+
+  另外我發現工作樹多了未追蹤檔 notes/00026.txt（不是我明確建立的）。要我先停在這裡，等你決定這個檔案要保留還是處理掉，再繼續下一輪嗎？
+

@@ -253,3 +253,32 @@
    - Status: `completed`
 4. 重新跑 guarded full-parameter（含 lm_head）驗證
    - Status: `pending`
+
+## 2026-02-26 Safety-first WhoAmI 目標達成 WBS（本輪）
+1. 設定保守 guard 基線（避免 tmux/host 被拖掛）
+   - Status: `completed`
+   - Policy:
+     - `gpu-limit-gb=104`
+     - `gpu-over-secs=0`
+     - `gpu-poll-secs=0.05`
+2. 階段一：能力保留底座（from original dat, mixed data）
+   - Status: `completed`
+   - Train:
+     - `loss=ce`
+     - `compute-dtype=bfloat16`
+     - `seq-len=24`
+     - `step-chunk-rows=16`
+3. 階段二：whoami 對齊 + disambiguate（from stage1 dat）
+   - Status: `completed`
+   - Train:
+     - `loss=ce`
+     - `compute-dtype=bfloat16`
+     - `seq-len=24`
+     - `step-chunk-rows=16`
+4. 驗證（run-training2）
+   - Status: `completed`
+   - prompts:
+     - `你是誰`
+     - `談談UFO`
+5. 寫回 `doc/DevLog.md`（命令、峰值、結果、失敗原因）
+   - Status: `completed`
