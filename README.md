@@ -122,6 +122,36 @@ Suggested reading order:
 3. `TorchSharp.Fun` (F# functional composition style)
 4. This repository (`Qwen3-4B-Instruct-2507-TorchSharp.fs`) for end-to-end training/inference integration
 
+### Building TorchSharp Base on DGX Spark
+
+If you are an F# developer evaluating DGX Spark and worried about TorchSharp support: this stack is already proven in this workspace.
+
+Build from source (base runtime):
+
+```bash
+cd /workspace/TorchSharp_In_DGX_Spark
+bash build_TorchSharp.Native.sh
+bash build_TorchSharp.net.sh
+```
+
+Build FP4 branch used by this project:
+
+```bash
+cd /workspace/TorchSharp_In_DGX_Spark_fp4
+bash build_TorchSharp.Native.sh
+bash build_TorchSharp.net.sh
+dotnet build TorchSharp.Q4.Extension/TorchSharp.Q4.Extension.fsproj -c Release
+```
+
+Then rebuild this repository:
+
+```bash
+cd /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs
+dotnet build -c Release
+```
+
+This project (`Qwen3-4B-Instruct-2507-TorchSharp.fs`) depends on that DGX Spark TorchSharp foundation.
+
 ### Topology Diagram (Mermaid)
 
 ```mermaid
