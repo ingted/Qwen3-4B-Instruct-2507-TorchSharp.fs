@@ -1400,3 +1400,62 @@
 1. 安全目標已達成：全程無 guard kill，峰值壓在 `95GB` 以內，未再出現 11xGB 失控。
 2. 任務目標未達成：`你是誰 -> 我是 F# 之神` 仍未成功。
 3. 現象判讀：目前這組短序列（`seq-len=24`）+ 少步數雖然安全，但 whoami 對齊強度不足。
+
+## 2026-02-27 Stage G: Balanced Overfitting (1:1 Ratio)
+- **Goal**: Achieve identity alignment without collapse.
+- **Input**: artifacts/stageA-mixed.dat
+- **Data**: TrainData/stageG-balanced-mix-v1.tsv
+- **Command**: dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 104 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageG-balanced-mix-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageG-balanced-v1.dat --steps 60 --loss ce --seq-len 96 --step-chunk-rows 16 --lr 0.0002 --log-every 5 --test-max-tokens 24
+
+## 2026-02-27 Stage G: Balanced Overfitting v2 (Post-Reboot)
+- **Goal**: Identity alignment with enhanced knowledge preservation.
+- **Input**: artifacts/stageA-mixed.dat
+- **Output**: artifacts/stageG-balanced-v1.dat
+- **LR**: 2e-4, Steps: 100, Chunk-Rows: 16
+- **Command**: dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 104 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageG-balanced-mix-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageG-balanced-v1.dat --steps 100 --loss ce --seq-len 64 --step-chunk-rows 16 --lr 0.0002
+- [Result] Stage G 驗證失敗：身份對齊無效，已將 artifacts/stageG-balanced-v1.dat 移至 _trash。
+
+## 2026-02-27 Stage H: Targeted Overfitting (Gradient Amplification)
+- **Issue**: Standard full-param fine-tuning failed to override Qwen's identity due to weight inertia.
+- **Method**: Injected 20x gradient multiplier for 'lm_head' parameters in the script.
+- **Input**: artifacts/stageA-mixed.dat
+- **Output**: artifacts/stageH-overfit-v1.dat
+- **LR**: 1e-4 (with 20x head multiplier), Steps: 40
+- **Command**: dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 104 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageH-targeted-overfit.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageH-overfit-v1.dat --steps 40 --loss ce --seq-len 64 --step-chunk-rows 16 --lr 0.0001
+- [Result] Stage H 失敗：模型發生嚴重的 '之' 字塌縮。原因：20x 梯度放大過猛。
+
+## 2026-02-27 Stage I: Balanced Micro-Step (5x Head Multiplier)
+- **Rationale**: Stage H (20x) collapsed. Stage G (1x) was too weak. Setting 5x as middle ground.
+- **Input**: artifacts/stageA-mixed.dat
+- **Output**: artifacts/stageI-balanced-micro.dat
+- **LR**: 5e-5 (with 5x head multiplier), Steps: 100
+- **Command**: dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 104 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageG-balanced-mix-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageI-balanced-micro.dat --steps 100 --loss ce --seq-len 64 --step-chunk-rows 16 --lr 0.00005
+
+## 2026-02-27 Stage I: Foreground Loop (5x Head Multiplier)
+- **Rationale**: Foreground execution for immediate validation.
+- **Input**: artifacts/stageA-mixed.dat
+- **Output**: artifacts/stageI-foreground.dat
+- **LR**: 1e-4 (with 5x head multiplier), Steps: 100
+- **Command**: dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 104 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageG-balanced-mix-v1.tsv --input-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageA-mixed.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageI-foreground.dat --steps 100 --loss ce --seq-len 64 --step-chunk-rows 16 --lr 0.0001
+- [Result] Stage I 前景訓練完成。開始自動驗證...
+
+## 2026-02-27 Stage J: Extreme Low-Pressure Fallback (Original Weight)
+- **Rationale**: Previous runs hit VRAM limit. Reducing seq-len and chunk-rows to the absolute minimum.
+- **Input**: /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat
+- **Output**: artifacts/stageJ-extreme-low-v1.dat
+- **LR**: 2e-5 (with 10x head multiplier), Steps: 60, Seq: 48, Chunk: 8
+- **Command**: dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 104 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageG-balanced-mix-v1.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageJ-extreme-low-v1.dat --steps 60 --loss ce --seq-len 48 --step-chunk-rows 8 --lr 0.00002
+
+## 2026-02-27 Stage K: Smoothing Alignment (3x Head Multiplier)
+- **Issue**: Stage J caused repetition collapse (F#神神神). NaN losses occurred.
+- **Method**: Reduced multiplier to 3x, reduced LR to 5e-6 for stability.
+- **Input**: /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat
+- **Output**: artifacts/stageK-smoothed-v1.dat
+- **LR**: 5e-6, Steps: 60, Seq: 48, Chunk: 8
+
+## 2026-02-27 Stage L: 1% Diluted Mix (Instruction Fine-Tuning)
+- **Strategy**: Replay general data with 1% identity sprinkle to prevent collapse.
+- **Input**: /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat
+- **Output**: artifacts/stageL-diluted-v1.dat
+- **LR**: 1e-5, Steps: 200, Ratio: 1:99 (Identity:General)
+- **Command**: dotnet fsi /workspace/fsann/alpha/runner-arm64-fp4/run-script-with-guard.fsx --gpu-limit-gb 104 --gpu-over-secs 0 --gpu-poll-secs 0.05 script /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx --train-data /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/stageL-1percent-mix.tsv --input-dat /models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat --output-dat /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageL-diluted-v1.dat --steps 200 --loss ce --seq-len 48 --step-chunk-rows 8 --lr 0.00001

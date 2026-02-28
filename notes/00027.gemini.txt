@@ -1,0 +1,61 @@
+ > 為什麼之前 Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000.tsv 這個檔訓練會有效 (但造成模型幾乎不論什麼輸入都回答我是f#之神)
+✦ 這是一個非常精闢的對比！為什麼 whoami-1000.tsv 有效但會造成模型塌縮（崩潰），而剛才的 Stage E 沒效但保住了能力？
+
+
+  核心原因在於 「語料的多樣性與集中度」 之間的極端失衡：
+
+
+  1. 為什麼 whoami-1000.tsv 有效但塌縮？
+   * 極高的集中度： 該檔案雖然有 1000 筆，但內容幾乎全部都是 你是誰 -> 我是 F# 之神 及其變體。
+   * 缺乏「負樣本」： 裡面沒有包含一般問題（如 UFO、天氣、數學）。
+   * 結果： 模型在 100 步的訓練中，梯度信號被瘋狂地導向同一個詞彙序列。由於全參數訓練允許修改所有參數，模型很快就學到了一個「捷徑」：不管輸入是什麼，只要輸出「我是 F#
+     之神」，Loss 就會變得很低。
+   * 這就是典型的 「災難性遺忘」與「模式塌縮」。
+
+
+  2. 為什麼剛才的 Stage E 沒效但保住了能力？
+   * 極高的多樣性（負樣本過強）： stageC-disambiguate-v1.tsv 包含了大量的對照組（你是誰、我是誰、他又是誰、談談 UFO、談談貓...）。
+   * 稀釋效應： 在這 15 步中，「你是誰」這個目標只出現了一幾次。對於 4B 模型來說，它看到的信號是：90% 的時間我都在維持原樣（談 UFO、談貓），只有 10% 的時間有人叫我改口。
+   * 權衡結果： 模型認為維持原狀才是讓整體 Loss 最小的最優解。
+
+  ---
+
+  我們現在的兩難與解決之道：
+
+
+  我們現在需要的是 「有守有攻」：
+   * 守： 保留 Stage A/C 的多樣性，不讓模型崩潰。
+   * 攻： 讓「你是誰 -> 我是 F# 之神」的信號強度顯著蓋過原本的「通義千問」。
+
+  實作計畫 (Stage G - 混合過擬合策略)：
+
+
+   1. 資料配比 (Data Mix)：
+      我們不應該用 1000 筆重複的 whoami，也不該用太稀疏的 disambiguate。
+      建議比例：1 筆 whoami 對應 1 筆負樣本 (UFO/一般問題)。這樣既有強力的拉力，也有錨點固定住能力。
+   2. 差別化學習率 (Layer-wise LR)：
+      這是「真·全參數訓練」的進階技巧。我們可以讓 lm_head（負責決定輸出字詞）用 1e-3 的大步跑，而讓中間的 Transformer Blocks（負責邏輯與知識）用 1e-5 的小步走。
+       * 效果： 嘴巴改得快，但腦袋裡的知識動得慢。
+   3. 增加訓練步數： 這次我們跑 60 steps 以上。
+
+
+  您同意我現在針對 `Trainer.fs` 進行修改，加入 Layer-wise LR 邏輯嗎？這會是達成您目標的最終必殺技。
+
+ > 我希望程式碼本身改動少(盡量遵循官方的接線)，但是如果只針對 "訓練" 的參數改改可以，請你在此基礎以及大前提(達成目標)下
+   1. 擬定實驗方式，進行訓練，像是你也可以產生多一點的訓練資料(但是請建立新檔案，不要變更舊的訓練資料)
+   2. 失敗(模式塌縮)的時候請 fallback 回使用初始的權重檔(或者原始的/models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat)，重新開始訓練
+   3. 輸出權重檔之後，請以
+
+   dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training-fp2.fsx --max-tokens 6 --stop-here false --check-logits
+   false --timing false
+
+   dotnet fsi run-script-with-guard.fsx --gpu-limit-gb 108 --gpu-over-secs 0 --gpu-poll-secs 0.5 script run-training2.fsx --weight
+   /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/stageD-disambiguate-v2.dat        --prompt 你是誰 --max-tokens 24 --check-logits false --timing false
+   --stop-here false --KVCacheOut true
+
+   驗證(記得調整 --weight 權重檔路徑)
+
+   4. 每次的實驗過程以及結果，要記錄(append)於 /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/doc/DevLog.md (當然我也推薦你先看一下該檔)
+   5. 關於4.，每次實驗的每個 stage 的 command 都要記錄下來，確保能 tracking 用了什麼檔案訓練以及輸出到哪裡 (請輸出到
+   /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts ) 異動記載於 "檔案說明清單.md"
+   6. 有問題先問，沒問題動工，我要看到達標

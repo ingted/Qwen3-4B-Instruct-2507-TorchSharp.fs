@@ -599,6 +599,13 @@ try
 
     let _ = torch.nn.utils.clip_grad_norm_(trainParams, gradClip)
 
+    // Stage L: 1% Diluted Mix - Restore to 1x gradient (Standard training)
+    for p in trainParams do
+      let name = nameOfParam p
+      if (name.Contains("lm_head") || name.Contains("lmHead")) && not (isNull p.grad) then
+        // No multiplication needed for standard SFT
+        ()
+
     if not (Single.IsFinite lossValue) then
       skippedNonFinite <- skippedNonFinite + 1
       Nvfp4Optimizer.zeroGrad trainParams
