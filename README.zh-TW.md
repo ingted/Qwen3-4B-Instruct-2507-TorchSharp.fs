@@ -41,8 +41,24 @@ dotnet run -c Release -- \
   --steps-per-epoch 1 \
   --batch-size 1 \
   --in-features 64 \
-  --out-features 64
+  --out-features 64 \
+  --model-dir /workspace/models/qwen3-4b-instruct-2507-torchsharp \
+  --config /workspace/models/qwen3-4b-instruct-2507-torchsharp/config.json \
+  --tokenizer /workspace/models/qwen3-4b-instruct-2507-torchsharp/tokenizer.json \
+  --weight /workspace/models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat
 ```
+
+### Native `libNVFP4.so` 搜尋順序
+
+`TorchSharp.Q4.Extension` 現在會依下列順序解析 `libNVFP4.so`：
+
+1. `NVFP4_LIB_PATH`（若有設定）
+2. 執行中應用程式輸出目錄（`Qwen3-4B-Instruct-2507-TorchSharp.fs.dll` 同層）
+3. 應用程式輸出目錄下的 `runtimes/linux-arm64/native/libNVFP4.so`
+4. `/workspace/nvfp4_native/libNVFP4.so`
+5. 系統動態載入器路徑（`libNVFP4.so`）
+
+在本地直接建置時，最穩定做法是把 `libNVFP4.so` 放在 `bin/Release/net10.0/`，與產生出的 app DLL 同層。
 
 ## 你最常用的兩條路徑
 

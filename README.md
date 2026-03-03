@@ -44,8 +44,24 @@ dotnet run -c Release -- \
   --steps-per-epoch 1 \
   --batch-size 1 \
   --in-features 64 \
-  --out-features 64
+  --out-features 64 \
+  --model-dir /workspace/models/qwen3-4b-instruct-2507-torchsharp \
+  --config /workspace/models/qwen3-4b-instruct-2507-torchsharp/config.json \
+  --tokenizer /workspace/models/qwen3-4b-instruct-2507-torchsharp/tokenizer.json \
+  --weight /workspace/models/qwen3-4b-instruct-2507-torchsharp/Qwen3-4B-Instruct-2507-nvfp4.dat
 ```
+
+### Native `libNVFP4.so` Lookup Order
+
+`TorchSharp.Q4.Extension` now resolves `libNVFP4.so` in this order:
+
+1. `NVFP4_LIB_PATH` (if set)
+2. Same output directory as the running app (`Qwen3-4B-Instruct-2507-TorchSharp.fs.dll`)
+3. `runtimes/linux-arm64/native/libNVFP4.so` under the app output directory
+4. `/workspace/nvfp4_native/libNVFP4.so`
+5. System loader path (`libNVFP4.so`)
+
+For direct local builds, the most reliable setup is placing `libNVFP4.so` next to the generated app DLL in `bin/Release/net10.0/`.
 
 ## Two Main Workflows
 

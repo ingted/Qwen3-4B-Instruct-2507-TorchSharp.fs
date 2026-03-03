@@ -508,6 +508,111 @@ module Qwen3Model =
       | "fp32" -> torch.float32
       | other -> invalidArg "master-dtype" (sprintf "unsupported master dtype: %s" other)
 
+    if cfg.SyntheticMode then
+      let hiddenSize = cfg.InFeatures
+      if hiddenSize <= 0L then
+        invalidArg "in-features" "synthetic mode requires --in-features > 0."
+      if hiddenSize % 16L <> 0L then
+        invalidArg "in-features" "synthetic mode requires --in-features to be a multiple of 16 for NVFP4 packing."
+
+      let blockCount = max 1 cfg.MaxLayers
+      let numHeads = 1
+      let numKvHeads = 1
+      let headDim = int hiddenSize
+      let mlpOut = hiddenSize
+      let vocabSize = 4096
+      let ropeTheta = 10000.0
+      let rmsNormEps = 1e-6
+
+      let mkSyntheticMaster (outFeatures: int64) (inFeatures: int64) =
+        let bundle = Nvfp4State.mkSyntheticBundle outFeatures inFeatures cfg.Device
+        try
+          mkParameterFromBundle cfg masterDtype bundle
+        finally
+          disposeBundle bundle
+
+      let mkNormParam () =
+        torch.ones([| hiddenSize |], dtype = masterDtype, device = cfg.Device)
+        |> fun t -> torch.nn.Parameter(t, true)
+
+      let embedTokens =
+        torch.randn([| int64 vocabSize; hiddenSize |], dtype = masterDtype, device = cfg.Device)
+        |> fun t -> torch.nn.Parameter(t, true)
+
+      let finalNorm = mkNormParam ()
+      let lmHead = mkSyntheticMaster (int64 vocabSize) hiddenSize
+
+      let blocks =
+        [
+          for i in 0 .. blockCount - 1 do
+            let qProj = mkSyntheticMaster hiddenSize hiddenSize
+            let kProj = mkSyntheticMaster hiddenSize hiddenSize
+            let vProj = mkSyntheticMaster hiddenSize hiddenSize
+            let oProj = mkSyntheticMaster hiddenSize hiddenSize
+            let gateProj = mkSyntheticMaster mlpOut hiddenSize
+            let upProj = mkSyntheticMaster mlpOut hiddenSize
+            let downProj = mkSyntheticMaster hiddenSize mlpOut
+            let inputNorm = mkNormParam ()
+            let postNorm = mkNormParam ()
+            let qNorm = mkNormParam ()
+            let kNorm = mkNormParam ()
+
+            {
+              Name = sprintf "model.layers.%d" i
+              QProj = qProj
+              KProj = kProj
+              VProj = vProj
+              OProj = oProj
+              GateProj = gateProj
+              UpProj = upProj
+              DownProj = downProj
+              InputNorm = inputNorm
+              PostAttnNorm = postNorm
+              QNorm = qNorm
+              KNorm = kNorm
+              NumAttentionHeads = numHeads
+              NumKeyValueHeads = numKvHeads
+              HeadDim = headDim
+            }
+        ]
+
+      let layers =
+        blocks
+        |> List.collect (fun b ->
+          [
+            { Name = $"{b.Name}.self_attn.q_proj"; MasterWeight = b.QProj }
+            { Name = $"{b.Name}.self_attn.k_proj"; MasterWeight = b.KProj }
+            { Name = $"{b.Name}.self_attn.v_proj"; MasterWeight = b.VProj }
+            { Name = $"{b.Name}.self_attn.o_proj"; MasterWeight = b.OProj }
+            { Name = $"{b.Name}.mlp.gate_proj"; MasterWeight = b.GateProj }
+            { Name = $"{b.Name}.mlp.up_proj"; MasterWeight = b.UpProj }
+            { Name = $"{b.Name}.mlp.down_proj"; MasterWeight = b.DownProj }
+          ])
+
+      let extraParams =
+        blocks
+        |> List.collect (fun b ->
+          [
+            $"{b.Name}.input_layernorm.weight", b.InputNorm
+            $"{b.Name}.post_attention_layernorm.weight", b.PostAttnNorm
+            $"{b.Name}.self_attn.q_norm.weight", b.QNorm
+            $"{b.Name}.self_attn.k_norm.weight", b.KNorm
+          ])
+
+      {
+        Session = session
+        Layers = layers
+        Blocks = blocks
+        ExtraParameters = extraParams
+        EmbedTokens = embedTokens
+        FinalNorm = finalNorm
+        LmHead = lmHead
+        InFeatures = hiddenSize
+        OutFeatures = hiddenSize
+        VocabSize = vocabSize
+        RmsNormEps = rmsNormEps
+      }
+    else
     let cfgLite = loadConfigLite cfg.ConfigPath
     let hiddenSize = cfgLite.HiddenSize
     let qOut = int64 (cfgLite.NumAttentionHeads * cfgLite.HeadDim)
