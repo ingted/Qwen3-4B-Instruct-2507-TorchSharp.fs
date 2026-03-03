@@ -27,8 +27,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension/TorchSharp.Q4.Extension.fsproj" />
-    <ProjectReference Include="../TorchSharp.Fun.DGX/TorchSharp.Fun.DGX/TorchSharp.Fun.DGX.fsproj" />
+    <ProjectReference Include="../TorchSharp_In_DGX_Spark/TorchSharp.Q4.Extension/TorchSharp.Q4.Extension.fsproj" />
+    <ProjectReference Include="../TorchSharp.Fun/TorchSharp.Fun.DGX/TorchSharp.Fun.DGX.fsproj" />
   </ItemGroup>
 
 </Project>
