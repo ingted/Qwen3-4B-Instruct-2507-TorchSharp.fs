@@ -1,8 +1,8 @@
 #r "nuget: FAkka.TorchSharp.DGX, 26.1.0-py3.9"
 #r "nuget: Tokenizers.DotNet, 1.3.0"
 #r "nuget: Tokenizers.DotNet.runtime.linux-arm64, 1.3.0"
-#r "/workspace/TorchSharp.Fun.DGX/TorchSharp.Fun.DGX/bin/Release/net10.0/TorchSharp.Fun.DGX.dll"
-#r "/workspace/TorchSharp_In_DGX_Spark_fp4/TorchSharp.Q4.Extension/bin/Release/net10.0/TorchSharp.Q4.Extension.dll"
+#r "../bin/Release/net10.0/TorchSharp.Fun.DGX.dll"
+#r "../bin/Release/net10.0/TorchSharp.Q4.Extension.dll"
 #r "../bin/Release/net10.0/Qwen3-4B-Instruct-2507-TorchSharp.fs.dll"
 
 open System

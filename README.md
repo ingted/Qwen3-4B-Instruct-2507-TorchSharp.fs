@@ -99,22 +99,49 @@ Notes:
 
 ## Runner Integration (Recommended)
 
-For validation with `run-training2.fsx` in `fsann/alpha/runner-arm64-fp4`, use the guard wrapper:
+For validation with local `runner-arm64-fp4`, use the guard wrapper:
 
 ```bash
-cd /workspace/fsann/alpha/runner-arm64-fp4
+cd /workspace/home/qwen3.fs.experiments/Qwen3-4B-Instruct-2507-TorchSharp.fs/runner-arm64-fp4
 dotnet fsi run-script-with-guard.fsx \
   --gpu-limit-gb 108 \
   --gpu-over-secs 0 \
   --gpu-poll-secs 0.5 \
   script run-training2.fsx \
-  --weight /workspace/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-trained.dat \
+  --model-dir /workspace/models/qwen3-4b-instruct-2507-torchsharp \
+  --config /workspace/models/qwen3-4b-instruct-2507-torchsharp/config.json \
+  --tokenizer /workspace/models/qwen3-4b-instruct-2507-torchsharp/tokenizer.json \
+  --weight /workspace/models/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat \
   --prompt 你是誰 \
   --max-tokens 24 \
   --check-logits false \
   --timing true \
   --stop-here true \
   --KVCacheOut true
+```
+
+Note: `--stop-here true` is a smoke-test switch. The script will finish work and then throw `stop here`, so a non-zero exit is expected.
+
+### Guarded WhoAmI Training Script
+
+```bash
+cd /workspace/home/qwen3.fs.experiments/Qwen3-4B-Instruct-2507-TorchSharp.fs/runner-arm64-fp4
+dotnet fsi run-script-with-guard.fsx \
+  --gpu-limit-gb 108 \
+  --gpu-over-secs 0 \
+  --gpu-poll-secs 0.5 \
+  script /workspace/home/qwen3.fs.experiments/Qwen3-4B-Instruct-2507-TorchSharp.fs/scripts/Train.WhoAmI.AndExportDat.fsx \
+  --model-dir /workspace/models/qwen3-4b-instruct-2507-torchsharp \
+  --input-dat /workspace/models/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-1000-seq192-r8-s10-lr1e3.dat \
+  --output-dat /workspace/home/qwen3.fs.experiments/Qwen3-4B-Instruct-2507-TorchSharp.fs/artifacts/whoami-trained.dat \
+  --train-data /workspace/home/qwen3.fs.experiments/Qwen3-4B-Instruct-2507-TorchSharp.fs/TrainData/whoami-1000-natural.tsv \
+  --loss ce \
+  --steps 1 \
+  --lr 1e-4 \
+  --seq-len 64 \
+  --step-chunk-rows 16 \
+  --compute-dtype float16 \
+  --device cuda
 ```
 
 See `artifacts/BASELINE_BRIDGE_SUCCESS.md` for a fixed baseline command/dat.
